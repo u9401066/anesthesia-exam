@@ -18,6 +18,9 @@
       ".github/copilot-instructions.md",
       "SPEC.md",
       "CONSTITUTION.md"
+    ],
+    "skills_paths": [
+      ".claude/skills"
     ]
   }
 }

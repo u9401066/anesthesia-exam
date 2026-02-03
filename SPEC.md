@@ -586,7 +586,162 @@ opencode -p "prompt" -f json -q -c /path/to/project
 }
 ```
 
-### 5.4 MCP Tools 完整設計
+### 5.4 三欄式 UI 佈局
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                          Streamlit Web Application                           │
+├──────────────────┬─────────────────────────────┬────────────────────────────┤
+│     Sidebar      │        Main Area            │       Right Panel          │
+│  ┌────────────┐  │  ┌───────────────────────┐  │  ┌──────────────────────┐  │
+│  │ 功能切換   │  │  │   考題作答區          │  │  │   Crush 對話區       │  │
+│  │ ─ 生成考卷 │  │  │   ─ 流式生成顯示      │  │  │   ─ 即時對話         │  │
+│  │ ─ 題庫瀏覽 │  │  │   ─ 題庫題目顯示      │  │  │   ─ 出題指令         │  │
+│  │ ─ 考古題   │  │  │   ─ 作答互動          │  │  │   ─ 問答互動         │  │
+│  ├────────────┤  │  ├───────────────────────┤  │  │   ─ 來源查詢         │  │
+│  │ 出題設定   │  │  │   對答案/詳解區       │  │  └──────────────────────┘  │
+│  │ ─ 題型     │  │  │   ─ 批改結果          │  │                            │
+│  │ ─ 難度     │  │  │   ─ 詳解展開          │  │                            │
+│  │ ─ 範圍     │  │  │   ─ 來源引用          │  │                            │
+│  │ ─ 題數     │  │  └───────────────────────┘  │                            │
+│  └────────────┘  │                              │                            │
+└──────────────────┴─────────────────────────────┴────────────────────────────┘
+```
+
+#### 各區域功能
+
+| 區域 | 功能 | 組件 |
+| ---- | ---- | ---- |
+| **Left Sidebar** | 功能切換 + 出題設定 | `st.sidebar`, `st.radio`, `st.selectbox` |
+| **Main Area** | 考題顯示 + 作答 + 詳解 | `st.container`, `st.columns` |
+| **Right Panel** | Crush Agent 對話 | 自訂 Chat UI, SSE streaming |
+
+### 5.5 Question Source 模組（題目來源）
+
+支援兩種題目來源，統一介面：
+
+```python
+class QuestionProvider(Protocol):
+    """統一題目來源介面"""
+    def get_questions(self, config: ExamConfig) -> Iterator[Question]: ...
+```
+
+#### 5.5.1 Streaming Source（流式來源）
+
+```python
+class StreamingQuestionSource:
+    """Crush Agent 即時生成題目"""
+    
+    async def generate(self, config: ExamConfig) -> AsyncGenerator[Question, None]:
+        """流式生成題目，逐題 yield"""
+        async for chunk in self.crush_client.stream(prompt):
+            question = self.parser.parse_streaming(chunk)
+            if question.is_complete:
+                yield question
+```
+
+**特點**：
+- Crush Agent 即時調用
+- SSE 串流輸出
+- 可顯示生成進度
+- 適合：即時出題、個人化需求
+
+#### 5.5.2 Batch Source（批次來源）
+
+```python
+class BatchQuestionSource:
+    """從題庫批次取得題目"""
+    
+    def fetch(self, filters: QuestionFilters, limit: int) -> List[Question]:
+        """一次取得所有題目"""
+        return self.repository.find_by_filters(filters, limit)
+```
+
+**特點**：
+- JSON 檔案 / SQLite / PostgreSQL
+- 隨機/篩選取題
+- 一次載入全部
+- 適合：練習模式、快速測驗
+
+### 5.6 大型 PDF 處理架構
+
+> ⚠️ **挑戰**: Miller's Anesthesia 9th (~3500頁, ~500MB+)
+
+#### 5.6.1 處理流程
+
+```
+Input: 2020 Miller's Anesthesia 9th.pdf (~500MB)
+       │
+       ▼
+Phase 1: Chunked Extraction (分批解析)
+       │  ─ 每次處理 50-100 頁
+       │  ─ 記錄處理進度 (checkpoint)
+       │  ─ 可暫停/續傳
+       ▼
+Phase 2: Content Extraction (內容提取)
+       │  ─ 文字提取
+       │  ─ 圖片擷取
+       │  ─ 表格解析
+       │  ─ 公式識別
+       ▼
+Phase 3: Atomic Chunking (原子化切分)
+       │  ─ 每個 chunk 保留: page, line_start, line_end
+       │  ─ 圖片關聯: figure_id, caption, page
+       │  ─ Chunk 大小: 512-1024 tokens
+       ▼
+Phase 4: Embedding & Indexing
+       ─ OpenAI / Local embedding model
+       ─ Vector DB: Chroma / pgvector
+       ─ Metadata 索引
+```
+
+#### 5.6.2 分批處理策略
+
+```python
+class LargeFileProcessor:
+    """處理超大型 PDF 檔案"""
+    
+    BATCH_SIZE = 50  # 每批處理頁數
+    CHECKPOINT_FILE = "processing_checkpoint.json"
+    
+    def process(self, pdf_path: Path) -> Generator[ProcessedChunk, None, None]:
+        """分批處理，支援斷點續傳"""
+        
+        # 1. 讀取或建立 checkpoint
+        checkpoint = self._load_checkpoint(pdf_path)
+        start_page = checkpoint.get("last_processed", 0)
+        
+        # 2. 取得總頁數
+        total_pages = self._get_page_count(pdf_path)
+        
+        # 3. 分批處理
+        for batch_start in range(start_page, total_pages, self.BATCH_SIZE):
+            batch_end = min(batch_start + self.BATCH_SIZE, total_pages)
+            
+            # 處理這批頁面
+            chunks = self._process_pages(pdf_path, batch_start, batch_end)
+            
+            for chunk in chunks:
+                yield chunk
+            
+            # 更新 checkpoint
+            self._save_checkpoint(pdf_path, {"last_processed": batch_end})
+            
+            # 記憶體清理
+            gc.collect()
+```
+
+#### 5.6.3 輸出結構
+
+```
+data/
+├── chunks/{doc_id}/*.json    # 文字 chunks
+├── images/{doc_id}/*.png     # 提取的圖片
+├── index/{doc_id}.db         # 向量索引
+└── metadata/{doc_id}.json    # 文檔元數據
+```
+
+### 5.7 MCP Tools 完整設計
 
 #### 5.4.1 Tools 清單
 
