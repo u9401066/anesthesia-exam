@@ -47,3 +47,11 @@ htmlcov/
 *.pem
 *.key
 secrets/
+
+# 教材 PDF (版權保護)
+*.pdf
+
+# 生成的資料 (不追蹤)
+data/jobs/
+data/exams/
+data/questions/

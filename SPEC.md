@@ -930,7 +930,47 @@ class ExamGenerator:
 | PDF（備案） | PyMuPDF | https://github.com/pymupdf/PyMuPDF |
 | Vector DB | pgvector | https://github.com/pgvector/pgvector |
 
-### 8.2 名詞解釋
+### 8.2 考題生成 (Question Generation) 開源參考
+
+> 💡 **不要重造輪子**：以下專案可直接複用或作為參考
+
+#### 8.2.1 開發框架與合成數據
+
+適合將考題生成功能整合進自己的 Agent 或應用：
+
+| 專案 | 特點 | 適用場景 | Repo |
+| ---- | ---- | -------- | ---- |
+| **Ragas** | AI 評測領域熱門庫，有 TestsetGenerator 模組，可從文件生成「合成測試資料集」 | 生成多種難度考題（Simple, Reasoning, Multi-Context） | [explodinggradients/ragas](https://github.com/explodinggradients/ragas) |
+| **Synthetic Questions Generation** | 批量生成多樣化風格考題，支援多種模型後端 | 自定義 System Prompt 控制格式 | [mkurman/synthetic-questions-generation](https://github.com/mkurman/synthetic-questions-generation) |
+
+#### 8.2.2 開箱即用的應用
+
+適合快速原型或 Hackathon 展示：
+
+| 專案 | 特點 | 功能 | Repo |
+| ---- | ---- | ---- | ---- |
+| **ExamGenerator** | 完整 Web 應用，上傳 PDF 使用 Gemini 生成試卷 | MCQ、是非題、填充題、登入系統 | [mertcaliskan34/ExamGenerator](https://github.com/mertcaliskan34/ExamGenerator) |
+| **QuizCrafter / PDFQuizzer** | 輕量級 PDF 轉 Quiz 工具 | Streamlit / React + FastAPI | 搜尋 `QuizCrafter` 或 `PDFQuizzer` |
+
+#### 8.2.3 LMS 整合（特定格式轉換）
+
+適合生成的考題需要匯入學校系統（Canvas、Moodle）：
+
+| 專案 | 特點 | 用法 | Repo |
+| ---- | ---- | ---- | ---- |
+| **text2qti** | Markdown 轉換為 QTI 格式（標準考試交換格式） | LLM 生成 Markdown → 此工具轉檔 → 匯入 LMS | [gpoore/text2qti](https://github.com/gpoore/text2qti) |
+
+#### 8.2.4 可複用模組評估
+
+| 需求 | 推薦方案 | 理由 |
+| ---- | -------- | ---- |
+| 考題難度分級 | Ragas TestsetGenerator | 內建 Simple/Reasoning/Multi-Context 分類 |
+| 多題型支援 | ExamGenerator 參考 | 已有 MCQ/是非/填充實作 |
+| Streamlit UI | QuizCrafter 參考 | 輕量、流式輸出範例 |
+| LMS 匯出 | text2qti 整合 | 標準格式，相容性高 |
+| 批量生成 | Synthetic Questions Generation | 支援自定義 prompt + 多後端 |
+
+### 8.3 名詞解釋
 
 | 術語 | 說明 |
 | ---- | ---- |
@@ -940,8 +980,10 @@ class ExamGenerator:
 | Sub-agent | 主 Agent 下的子代理，負責特定任務 |
 | RAG | Retrieval-Augmented Generation，檢索增強生成 |
 | MCP | Model Context Protocol，模型上下文協議 |
+| QTI | Question & Test Interoperability，標準考試交換格式 |
+| LMS | Learning Management System，學習管理系統 |
 
-### 8.3 更新記錄
+### 8.4 更新記錄
 
 | 日期 | 更新內容 |
 | ---- | -------- |
@@ -950,6 +992,7 @@ class ExamGenerator:
 | 2026-02-03 | 釐清行號追蹤責任（RAG/grep 層） |
 | 2026-02-03 | 新增作答練習、PDF 下載模組 |
 | 2026-02-03 | 整合所有文件為單一 SPEC |
+| 2026-02-03 | 新增考題生成 (QG) 開源參考資源 (8.2 節) |
 
 ---
 

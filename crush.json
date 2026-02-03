@@ -1,0 +1,23 @@
+{
+  "$schema": "https://charm.land/crush.json",
+  "agents": {
+    "coder": {
+      "model": "copilot/gpt-5-mini",
+      "maxTokens": 8000
+    }
+  },
+  "mcp": {
+    "exam-generator": {
+      "type": "stdio",
+      "command": "uv",
+      "args": ["run", "python", "-m", "src.infrastructure.mcp.exam_server"]
+    }
+  },
+  "options": {
+    "context_paths": [
+      ".github/copilot-instructions.md",
+      "SPEC.md",
+      "CONSTITUTION.md"
+    ]
+  }
+}
