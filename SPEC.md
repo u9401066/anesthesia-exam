@@ -16,6 +16,7 @@
 6. [討論議題追蹤](#6-討論議題追蹤)
 7. [待驗證項目](#7-待驗證項目)
 8. [附錄](#8-附錄)
+9. [實作狀態追蹤](#9-實作狀態追蹤)
 
 ---
 
@@ -1148,6 +1149,198 @@ class ExamGenerator:
 | 2026-02-03 | 新增作答練習、PDF 下載模組 |
 | 2026-02-03 | 整合所有文件為單一 SPEC |
 | 2026-02-03 | 新增考題生成 (QG) 開源參考資源 (8.2 節) |
+| 2026-02-03 | 新增實作狀態追蹤 (Section 9)、PDF 解析架構設計 |
+
+---
+
+## 9. 實作狀態追蹤
+
+### 9.1 當前實作狀態
+
+> **⚠️ 重要警告**：目前來源追蹤是 AI 編造的假資料，尚未串接真正的 PDF 解析工具。
+
+| 功能 | 狀態 | 說明 |
+| ---- | ---- | ---- |
+| SQLite 持久化 | ✅ 已完成 | `data/questions.db` |
+| Repository Pattern | ✅ 已完成 | `SqliteQuestionRepository` |
+| Audit 追蹤 | ✅ 已完成 | `created_at`, `updated_at`, `version` |
+| MCP Server | ✅ 已完成 | 13 個工具 |
+| Streamlit 三欄布局 | ✅ 已完成 | Sidebar + Main(2/3) + Chat(1/3) |
+| 來源追蹤結構 | ✅ 已完成 | `Source` + `SourceLocation` 資料結構 |
+| PDF 解析 MCP | ❌ 未實作 | 需要建立 |
+| 真正的來源追蹤 | ❌ 未實作 | 需要串接 PDF 工具 |
+| 來源驗證機制 | ❌ 未實作 | 需要實作 |
+
+### 9.2 真正的出題流程設計
+
+#### 9.2.1 目標
+
+生成考題時，每個選項、題幹概念都必須有**可驗證的來源追蹤**：
+
+```
+題幹概念來源: 教科書第 5 章, 第 156 頁, 行 12-15
+原文: "Propofol 的誘導劑量為 1.5-2.5 mg/kg..."
+
+正確選項來源: 教科書第 5 章, 第 156 頁, 行 18-20
+原文: "相較於 Thiopental，Propofol 較少引起術後噁心嘔吐..."
+
+錯誤選項來源: 故意設計的干擾項（無原文）
+```
+
+#### 9.2.2 技術選型
+
+| 工具 | 用途 | 選擇理由 |
+| ---- | ---- | -------- |
+| **PyMuPDF (fitz)** | PDF 解析 | `get_text("words")` 原生提供 `line_no` |
+| **FastMCP** | MCP Server 框架 | 輕量、Python 原生 |
+| **pdf-reader-mcp** | 快速驗證原型 | 現成可用 |
+
+#### 9.2.3 PDF 解析 MCP Server 設計
+
+```python
+# src/infrastructure/mcp/pdf_server.py (待實作)
+
+@mcp.tool()
+def extract_text_with_positions(
+    pdf_path: str,
+    page_start: int = 1,
+    page_end: int | None = None
+) -> list[TextBlock]:
+    """
+    抽取 PDF 文字並保留位置資訊
+    
+    Returns:
+        list[TextBlock]: 每個 block 包含:
+            - text: str
+            - page: int
+            - line_start: int
+            - line_end: int
+            - bbox: tuple[x0, y0, x1, y1]
+    """
+    pass
+
+@mcp.tool()
+def search_source_location(
+    pdf_path: str,
+    query: str,
+    semantic: bool = False
+) -> list[SourceMatch]:
+    """
+    搜尋文字在 PDF 中的精確位置
+    
+    Returns:
+        list[SourceMatch]: 每個 match 包含:
+            - text: str (原文)
+            - page: int
+            - line_start: int
+            - line_end: int
+            - bbox: tuple
+            - score: float (相似度)
+    """
+    pass
+
+@mcp.tool()
+def extract_images_with_context(
+    pdf_path: str,
+    page: int
+) -> list[ImageInfo]:
+    """
+    抽取頁面圖片及其上下文標題
+    
+    Returns:
+        list[ImageInfo]: 每個 image 包含:
+            - image_id: str
+            - caption: str
+            - page: int
+            - bbox: tuple
+            - nearby_text: str
+    """
+    pass
+```
+
+#### 9.2.4 出題流程（帶來源追蹤）
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                     真正的出題流程                               │
+└─────────────────────────────────────────────────────────────────┘
+
+1. [PDF 解析階段]
+   ├── 使用 pdf_mcp.extract_text_with_positions()
+   ├── 建立文字索引 (page, line, bbox)
+   └── 快取解析結果 (hash-based)
+
+2. [概念擷取階段]
+   ├── LLM 分析範圍內的重要概念
+   ├── 每個概念記錄來源位置
+   └── 輸出: ConceptWithSource[]
+
+3. [題目生成階段]
+   ├── LLM 根據概念生成題目
+   ├── 要求 LLM 輸出時標注來源
+   └── 結構化輸出包含 SourceLocation
+
+4. [來源驗證階段]
+   ├── 使用 pdf_mcp.search_source_location() 驗證原文
+   ├── 比對 LLM 輸出與實際 PDF 內容
+   ├── 標記 is_verified = True/False
+   └── 記錄 pdf_hash 確保一致性
+
+5. [品質控制階段]
+   ├── 驗證失敗的題目標記為「待審核」
+   ├── 無法追蹤來源的選項標記為「AI 生成」
+   └── 輸出最終 Question 物件
+```
+
+#### 9.2.5 Source 實體結構（已實作）
+
+```python
+@dataclass
+class SourceLocation:
+    """精確的來源位置"""
+    page: int                    # 頁碼
+    line_start: int              # 起始行號
+    line_end: int                # 結束行號
+    bbox: tuple[float, ...] | None  # 邊界框 (x0, y0, x1, y1)
+    original_text: str           # 原文
+
+@dataclass
+class Source:
+    """來源資訊（含精確位置追蹤）"""
+    document: str                # 文件名稱
+    chapter: str | None          # 章節名稱
+    section: str | None          # 小節名稱
+    
+    # 精確來源追蹤
+    stem_source: SourceLocation | None      # 題幹概念來源
+    answer_source: SourceLocation | None    # 正確選項來源
+    explanation_sources: list[SourceLocation]  # 詳解參考來源
+    
+    # 圖片來源
+    figure_id: str | None
+    figure_caption: str | None
+    figure_page: int | None
+    
+    # 驗證狀態
+    is_verified: bool            # 是否已驗證
+    pdf_hash: str | None         # PDF 檔案 hash
+    
+    # 向後相容
+    page: int | None             # (deprecated)
+    lines: tuple[int, int] | None  # (deprecated)
+    original_text: str | None    # (deprecated)
+```
+
+### 9.3 待實作清單
+
+| 優先級 | 項目 | 預估工時 |
+| ------ | ---- | -------- |
+| P0 | 建立 PDF 解析 MCP Server | 4h |
+| P0 | 串接 PDF 工具到出題流程 | 4h |
+| P1 | 實作來源驗證機制 | 2h |
+| P1 | 更新 Question 儲存格式 | 2h |
+| P2 | 建立快取機制 (hash-based) | 2h |
+| P2 | 圖片題來源追蹤 | 4h |
 
 ---
 

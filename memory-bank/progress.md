@@ -21,22 +21,26 @@
 - [x] JSON → SQLite 資料遷移 (9 題)
 - [x] Streamlit 三欄佈局 (側邊選單 + 操作區 + 常駐 Chat)
 - [x] Port 8501 標準化 (bylaws)
+- [x] PDF 解析與來源追蹤架構設計 (SPEC Section 9)
+- [x] Source/SourceLocation 實體重新設計
+- [x] decisionLog 記錄 (PyMuPDF, FastMCP 選型)
 
 ## Doing
 
-- [ ] PDF 解析與來源追蹤架構設計
+- [ ] 建立 PDF 解析 MCP Server (pdf_server.py)
 
 ## Next
 
 - [ ] Phase 1 MVP 開發
-  - [ ] PDF 上傳與解析 (asset-aware-mcp)
+  - [ ] 串接 PDF 工具到出題流程
+  - [ ] 實作來源驗證機制
+  - [ ] PDF 上傳與解析
   - [ ] 原子化索引 (LightRAG)
-  - [ ] 來源追蹤強化 (頁碼、行號、原文引用)
-  - [ ] 真正的出題流程（基於真實 PDF 來源）
   - [ ] 詳解品質優化
 
 ## Blocked
 
-- [ ] 真正的來源追蹤 - 需要 PDF 解析工具串接
-  - 目前來源是 AI 編造的假資料
-  - 需要: asset-aware-mcp 或類似 PDF 工具
+- [ ] 真正的來源追蹤 - 架構已設計，待實作 PDF MCP Server
+  - 目前來源仍是 AI 編造的假資料
+  - 已選定: PyMuPDF + FastMCP
+  - 待實作: `src/infrastructure/mcp/pdf_server.py`
