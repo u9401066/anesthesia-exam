@@ -1,0 +1,3 @@
+[submodule "libs/asset-aware-mcp"]
+	path = libs/asset-aware-mcp
+	url = https://github.com/u9401066/asset-aware-mcp.git
