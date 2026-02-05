@@ -14,5 +14,6 @@
     "chat.promptFilesLocations": {
         ".github/prompts": true
     },
-    "chat.useAgentSkills": true
+    "chat.useAgentSkills": true,
+    "lineCountExplorer.enabled": false
 }

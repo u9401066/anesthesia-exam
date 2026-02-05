@@ -11,6 +11,14 @@
       "type": "stdio",
       "command": "uv",
       "args": ["run", "python", "-m", "src.infrastructure.mcp.exam_server"]
+    },
+    "asset-aware": {
+      "type": "stdio",
+      "command": "uv",
+      "args": ["--directory", "libs/asset-aware-mcp", "run", "python", "-m", "src.presentation.server"],
+      "env": {
+        "DATA_DIR": "../../data"
+      }
     }
   },
   "options": {

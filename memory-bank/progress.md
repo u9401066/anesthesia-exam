@@ -24,10 +24,18 @@
 - [x] PDF 解析與來源追蹤架構設計 (SPEC Section 9)
 - [x] Source/SourceLocation 實體重新設計
 - [x] decisionLog 記錄 (PyMuPDF, FastMCP 選型)
+- [x] **流式生成實作完成 (2026-02-05)**
+  - 移除 st.spinner() 阻塞
+  - 使用 st.empty() + st.container() 即時 UI 更新
+  - parse_mcp_result() 即時解析 MCP 工具結果
+  - render_question_card_inline() 即時顯示題目
+  - 完整 logging 追蹤
+- [x] 修復 source.get() NoneType 錯誤
 
 ## Doing
 
 - [ ] 建立 PDF 解析 MCP Server (pdf_server.py)
+- [ ] 設計來源顯示格式 (文件/頁碼/行號)
 
 ## Next
 

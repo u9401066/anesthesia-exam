@@ -257,9 +257,17 @@ uv add --dev pytest ruff mypy bandit vulture
 
 ## 常用指令
 
+### 啟動服務
+
+```bash
+# 啟動 Streamlit 應用 (port 8501)
+uv run streamlit run src/presentation/streamlit/app.py --server.port 8501
+```
+
 ### 開發相關
 
 ```
+「啟動 streamlit」    → 啟動 Web 介面 (port 8501)
 「準備 commit」       → 執行完整提交流程
 「快速 commit」       → 只同步 Memory Bank
 「建立新功能 X」      → 生成 DDD 結構

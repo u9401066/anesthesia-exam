@@ -2,9 +2,16 @@
 
 ## Current Focus
 
-**🚨 重大架構問題：來源追蹤是假的！**
+**✅ 流式生成已完成！下一步：來源追蹤顯示設計**
 
-目前的考題來源 (如「麻醉學教科書 P.156」) 是 AI 編造的，沒有真正連接到 PDF 解析工具。這違反了系統的核心價值：「精準來源追蹤」。
+流式生成題目已正常工作：
+- AI 輸出即時顯示（不再等到最後才一次性顯示）
+- 每儲存一題就即時在右側顯示題目卡片
+- 完整 logging 追蹤每個步驟
+
+目前待討論：
+- 來源如何顯示？(文件名、頁碼、行號)
+- Source entity 格式如何映射到 UI？
 
 ## 已完成
 
@@ -13,6 +20,7 @@
 - SQLite 資料庫 + Repository Pattern + Audit 追蹤
 - Streamlit UI (三欄佈局：側邊選單 + 操作區 + 常駐 Chat)
 - Domain 實體 (Question, Exam, Source, Audit)
+- **流式生成 (2026-02-05)**：stream_crush_generate() + 即時 UI 更新
 
 ## Key Files
 
