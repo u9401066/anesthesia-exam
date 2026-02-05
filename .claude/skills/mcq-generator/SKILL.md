@@ -1,28 +1,28 @@
 ````skill
 ---
 name: mcq-generator
-description: 選擇題生成器，支援單選、多選、複合選項等格式，參考 Ragas 難度分類。Triggers: 選擇題, 單選題, 多選題, MCQ, multiple choice, 四選一, 五選一, 選項題.
-version: 1.0.0
+description: 選擇題生成器，使用 MCP 工具查詢知識庫並生成有真實來源的選擇題。Triggers: 選擇題, 單選題, 多選題, MCQ, multiple choice, 四選一, 五選一, 選項題.
+version: 2.0.0
 category: question-generation
 compatibility:
   - crush
   - claude-code
 allowed-tools:
-  - source_lookup
-  - source_cite
+  - consult_knowledge_graph
+  - search_source_location
+  - get_section_content
   - exam_save_question
+  - exam_validate_question
 ---
 
 # 選擇題生成器 (MCQ Generator)
 
 ## 描述
 
-專門生成選擇題（Multiple Choice Questions），支援：
-- 單選題 (4選1, 5選1)
-- 多選題 (選出所有正確答案)
-- 複合選項 (如 ab, cde, 以上皆是)
-
-參考 Ragas 的難度分類：Simple, Reasoning, Multi-Context
+專門生成選擇題（Multiple Choice Questions），使用 MCP 工具確保：
+- **先查詢知識庫**，不編造內容
+- **精確來源追蹤**，包含頁碼、行號、原文
+- 支援單選題、多選題、複合選項
 
 ## 觸發條件
 
@@ -32,139 +32,111 @@ allowed-tools:
 
 ---
 
+## 🚨 重要：正確的出題流程
+
+### ❌ 錯誤流程（會產生幻覺）
+
+```
+用戶: "出 5 題選擇題"
+Agent: 從記憶中編造題目 + 編造來源
+→ 來源是假的！
+```
+
+### ✅ 正確流程（使用 MCP 工具）
+
+```mermaid
+flowchart TD
+    A[用戶: 出題] --> B[consult_knowledge_graph]
+    B --> C{有相關內容?}
+    C -->|是| D[search_source_location]
+    C -->|否| E[告知用戶需要先索引教材]
+    D --> F[根據真實內容生成題目]
+    F --> G[exam_validate_question]
+    G -->|通過| H[exam_save_question + 真實來源]
+    G -->|失敗| F
+```
+
+---
+
 ## 🔧 生成流程
 
-### Step 1: 查詢相關內容
+### Step 1: 查詢知識庫（必須！）
 
 ```python
-# 從索引中查詢相關教材內容
-contexts = source_lookup(
-    query=topic,
-    scope=scope,
-    top_k=5
+# 使用 asset-aware-mcp 的 RAG 查詢
+result = consult_knowledge_graph(
+    query="propofol pharmacology mechanism",
+    mode="hybrid"
+)
+# 返回: 相關知識內容 + 來源文件
+```
+
+### Step 2: 精確定位來源
+
+```python
+# 取得精確的頁碼和位置
+source = search_source_location(
+    doc_id="miller9",
+    query="GABA-A receptor",
+    block_types=["Text"]
+)
+# 返回:
+# - page: 156
+# - bbox: [72, 340, 520, 380]
+# - snippet: "Propofol exerts its effects primarily through..."
+```
+
+### Step 3: 根據真實內容生成題目
+
+```python
+# 基於查詢結果生成題目
+question = {
+    "question_text": "Propofol 的主要作用機轉是？",
+    "options": [
+        "A. 阻斷 NMDA 受體",
+        "B. 增強 GABA-A 受體活性",  # 正確 - 來自文獻
+        "C. 活化鈉離子通道",
+        "D. 抑制多巴胺釋放"
+    ],
+    "correct_answer": "B",
+    "explanation": "Propofol 主要透過增強 GABA-A 受體活性..."
+}
+```
+
+### Step 4: 驗證並儲存
+
+```python
+# 驗證格式
+exam_validate_question(
+    question_text=question["question_text"],
+    options=question["options"],
+    correct_answer=question["correct_answer"]
+)
+
+# 儲存（包含真實來源）
+exam_save_question(
+    question_text=question["question_text"],
+    options=question["options"],
+    correct_answer=question["correct_answer"],
+    explanation=question["explanation"],
+    source_doc="Miller's Anesthesia 9th Ed",
+    source_page=156,
+    source_lines="12-18",
+    source_text="Propofol exerts its effects primarily through...",
+    difficulty="medium",
+    topics=["藥理學", "Propofol", "GABA"]
 )
 ```
 
-### Step 2: 決定複雜度
-
-```python
-# 根據難度配置決定問題類型
-complexity_map = {
-    "easy": "single_hop_specific",    # 單一事實
-    "medium": "single_hop_abstract",  # 需要理解
-    "hard": "multi_hop_reasoning"     # 多來源推理
-}
-```
-
-### Step 3: 生成題目
-
-```python
-prompt = f"""
-根據以下教材內容生成一道{difficulty}難度的選擇題：
-
-【教材內容】
-{contexts}
-
-【要求】
-- 題型: {options_count}選1
-- 難度: {difficulty}
-- 複雜度: {complexity}
-- 必須有明確來源依據
-
-【輸出格式】
-{{
-  "question": "題目內容",
-  "options": ["A. ...", "B. ...", "C. ...", "D. ..."],
-  "answer": "A",
-  "distractor_rationale": {{
-    "B": "為何 B 是錯誤的",
-    "C": "為何 C 是錯誤的",
-    "D": "為何 D 是錯誤的"
-  }},
-  "source": {{
-    "page": 42,
-    "lines": "15-20",
-    "original_text": "..."
-  }}
-}}
-"""
-```
-
-### Step 4: 驗證與儲存
-
-```python
-# 驗證選項不重複、答案正確
-validate_mcq(question)
-# 儲存
-exam_save_question(question)
-```
-
 ---
 
-## 📊 題目類型
+## 📊 難度控制（Ragas 分類）
 
-### 單選題 (Single Choice)
-
-```json
-{
-  "type": "single_choice",
-  "question": "Propofol 最常見的副作用是？",
-  "options": [
-    "A. 低血壓",
-    "B. 心搏過速",
-    "C. 高血壓",
-    "D. 心室頻脈"
-  ],
-  "answer": "A",
-  "difficulty": "easy"
-}
-```
-
-### 多選題 (Multiple Choice)
-
-```json
-{
-  "type": "multiple_choice",
-  "question": "下列哪些是 Propofol 的特性？(選出所有正確答案)",
-  "options": [
-    "A. 水溶性",
-    "B. 快速起效",
-    "C. 無痛注射",
-    "D. 快速恢復",
-    "E. 具有抗嘔吐作用"
-  ],
-  "answer": ["B", "D", "E"],
-  "difficulty": "medium"
-}
-```
-
-### 複合選項題
-
-```json
-{
-  "type": "compound_choice",
-  "question": "關於 Propofol 的敘述，正確的是？",
-  "options": [
-    "A. 快速起效",
-    "B. 具有鎮痛作用",
-    "C. 可能造成低血壓",
-    "D. AC",
-    "E. ABC"
-  ],
-  "answer": "D",
-  "difficulty": "hard"
-}
-```
-
----
-
-## 📈 難度控制
-
-| 難度 | 複雜度 | 特徵 |
-| ---- | ------ | ---- |
-| Easy | Single-hop Specific | 單一事實記憶，答案明確 |
-| Medium | Single-hop Abstract | 需要理解概念，可能有陷阱選項 |
-| Hard | Multi-hop Reasoning | 需要連結多個概念，推理得出答案 |
+| 難度 | 類型 | 特徵 | MCP 查詢模式 |
+| ---- | ---- | ---- | ------------ |
+| Easy | Single-hop Specific | 單一事實記憶 | `mode="local"` |
+| Medium | Single-hop Abstract | 需要理解概念 | `mode="hybrid"` |
+| Hard | Multi-hop Reasoning | 連結多個概念 | `mode="global"` + 多次查詢 |
 
 ---
 
@@ -174,16 +146,27 @@ exam_save_question(question)
 📝 選擇題生成完成
 
 題目 #1 [Medium] ━━━━━━━━━━━━━━━━━━━━━━━━━━
-Propofol 的 context-sensitive half-time 特性意味著：
+Propofol 的主要作用機轉是？
 
-A. 輸注時間越長，藥效越強
-B. 輸注時間越長，恢復時間不會顯著延長 ✓
-C. 輸注時間與恢復時間成正比
-D. 與其他藥物無關
+A. 阻斷 NMDA 受體
+B. 增強 GABA-A 受體活性 ✓
+C. 活化鈉離子通道
+D. 抑制多巴胺釋放
 
-📚 來源: Miller's Anesthesia, P.542, L.12-18
-💡 說明: Context-sensitive half-time 較短表示...
+📚 來源: Miller's Anesthesia 9th Ed
+   📄 P.156, L.12-18
+   📝 "Propofol exerts its effects primarily through..."
+   ✅ 已驗證
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 ```
+
+---
+
+## ⚠️ 注意事項
+
+1. **永遠先查詢**：不要跳過 `consult_knowledge_graph`
+2. **確認來源存在**：用 `search_source_location` 驗證
+3. **如果查不到相關內容**：告知用戶需要先索引教材
+4. **不要編造**：如果知識庫沒有相關內容，就不要出那個主題的題目
 
 ````

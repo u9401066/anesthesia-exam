@@ -1,240 +1,227 @@
 ````skill
 ---
 name: source-tracker
-description: 來源追蹤器，追蹤題目出處並驗證來源存在性。Triggers: 來源追蹤, 追蹤出處, source, 出處, citation, 引用, 來源驗證.
-version: 1.0.0
+description: 來源追蹤器，使用 MCP 工具驗證題目來源真實性。Triggers: 來源追蹤, 追蹤出處, source, 出處, citation, 引用, 來源驗證.
+version: 2.0.0
 category: quality-control
 compatibility:
   - crush
   - claude-code
 allowed-tools:
-  - source_lookup
-  - source_verify
-  - get_question
-  - update_question
+  - search_source_location
+  - get_section_content
+  - fetch_document_asset
+  - inspect_document_manifest
+  - exam_get_question
+  - exam_update_question
+  - exam_mark_validated
 ---
 
 # 來源追蹤器 (Source Tracker)
 
 ## 描述
 
-精準追蹤題目的出處資訊，包含：
-- 教材/文獻名稱
-- 頁碼和行號
-- 原文引用
-- 來源驗證
+使用 MCP 工具精準追蹤和驗證題目的出處資訊：
+- 驗證頁碼和行號是否真實存在
+- 比對原文引用與 PDF 內容
+- 標記驗證狀態
 
-這是本系統的核心功能，確保每道題目都有可追溯的依據。
+**重要：本工具用於驗證已存在的題目，不用於生成題目時的來源追蹤。**
 
 ## 觸發條件
 
 - 「來源追蹤」「追蹤出處」
-- 「source」「出處」
-- 「citation」「引用」
+- 「source」「出處」「citation」
+- 「來源驗證」「驗證來源」
 
 ---
 
-## 🔧 追蹤流程
+## 🔧 驗證流程
 
-### Step 1: 來源結構定義
+### Step 1: 取得題目資訊
+
+```python
+# 取得題目詳情
+question = exam_get_question(question_id="abc123")
+
+# 取得來源資訊
+source = question["source"]
+# {
+#   "document": "Miller's Anesthesia 9th Ed",
+#   "page": 156,
+#   "lines": "12-18",
+#   "original_text": "Propofol exerts..."
+# }
+```
+
+### Step 2: 驗證來源存在
+
+```python
+# 使用 asset-aware-mcp 搜尋來源位置
+result = search_source_location(
+    doc_id="miller9",
+    query=source["original_text"][:50],  # 用原文片段搜尋
+    block_types=["Text"]
+)
+
+# 檢查返回結果
+if result["matches"]:
+    match = result["matches"][0]
+    # 比對頁碼
+    if match["page"] == source["page"]:
+        verified = True
+```
+
+### Step 3: 取得完整內容比對
+
+```python
+# 如果需要更詳細的比對
+content = get_section_content(
+    doc_id="miller9",
+    section_id="sec_chapter15"
+)
+
+# 檢查原文是否存在於該章節
+if source["original_text"] in content:
+    text_verified = True
+```
+
+### Step 4: 更新驗證狀態
+
+```python
+# 標記驗證結果
+exam_mark_validated(
+    question_id="abc123",
+    passed=True,
+    notes="來源已驗證：P.156 內容正確"
+)
+```
+
+---
+
+## 📊 來源結構
+
+### Source Entity（Domain 層定義）
 
 ```python
 @dataclass
-class Source:
-    document: str           # 文件名稱
-    document_id: str        # 文件唯一 ID
-    page: int              # 頁碼
-    lines: tuple[int, int] # (起始行, 結束行)
+class SourceLocation:
+    page: int              # 頁碼 (1-based)
+    line_start: int        # 起始行號
+    line_end: int          # 結束行號
+    bbox: tuple | None     # 位置 (x0, y0, x1, y1)
     original_text: str     # 原文引用
-    confidence: float      # 來源信心度
-    verified: bool         # 是否已驗證
-```
 
-### Step 2: 來源擷取
-
-```python
-def extract_source(question, contexts):
-    """從生成上下文中擷取來源資訊"""
+@dataclass
+class Source:
+    document: str          # 教材名稱
+    chapter: str | None    # 章節編號
+    section: str | None    # 小節標題
     
-    sources = []
-    for ctx in contexts:
-        source = Source(
-            document=ctx.metadata['document'],
-            document_id=ctx.metadata['doc_id'],
-            page=ctx.metadata['page'],
-            lines=(ctx.metadata['start_line'], ctx.metadata['end_line']),
-            original_text=ctx.content[:500],  # 擷取前500字
-            confidence=ctx.similarity_score,
-            verified=False
-        )
-        sources.append(source)
+    stem_source: SourceLocation | None      # 題幹來源
+    answer_source: SourceLocation | None    # 答案依據
+    explanation_sources: list[SourceLocation]  # 詳解來源
     
-    return sources
-```
-
-### Step 3: 來源驗證
-
-```python
-def verify_source(source):
-    """驗證來源資訊是否正確"""
-    
-    # 1. 檢查文件存在
-    doc_exists = check_document_exists(source.document_id)
-    
-    # 2. 檢查頁碼範圍
-    page_valid = check_page_valid(source.document_id, source.page)
-    
-    # 3. 對照原文
-    text_match = verify_text_match(
-        source.document_id,
-        source.page,
-        source.lines,
-        source.original_text
-    )
-    
-    return doc_exists and page_valid and text_match
-```
-
-### Step 4: 生成引用格式
-
-```python
-def format_citation(source, style="APA"):
-    """生成標準引用格式"""
-    
-    if style == "APA":
-        return f"{source.document}, p.{source.page}, L.{source.lines[0]}-{source.lines[1]}"
-    elif style == "IEEE":
-        return f"[{source.document_id}] p.{source.page}"
+    is_verified: bool = False   # 驗證狀態
+    pdf_hash: str | None = None # PDF hash
 ```
 
 ---
 
-## 📊 來源報告
+## 📝 驗證報告輸出
 
-```json
-{
-  "question_id": "q_20260203_001",
-  "sources": [
-    {
-      "type": "primary",
-      "document": "Miller's Anesthesia, 9th Ed",
-      "document_id": "miller9",
-      "page": 542,
-      "lines": [15, 28],
-      "original_text": "Propofol produces dose-dependent decreases in arterial blood pressure...",
-      "confidence": 0.95,
-      "verified": true,
-      "citation": "Miller's Anesthesia, 9th Ed, p.542, L.15-28"
-    },
-    {
-      "type": "supporting",
-      "document": "Miller's Anesthesia, 9th Ed",
-      "document_id": "miller9",
-      "page": 1823,
-      "lines": [5, 12],
-      "original_text": "Management of hypotension during anesthesia...",
-      "confidence": 0.78,
-      "verified": true,
-      "citation": "Miller's Anesthesia, 9th Ed, p.1823, L.5-12"
-    }
-  ],
-  "verification_status": "VERIFIED",
-  "coverage": 0.92
+```
+📚 來源驗證報告
+
+題目 ID: abc123
+"Propofol 的主要作用機轉是?"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+🔍 驗證項目
+
+✅ 文件存在
+   doc_id: miller9
+   title: Miller's Anesthesia 9th Ed
+
+✅ 頁碼正確
+   聲明: P.156
+   實際: P.156
+
+✅ 原文比對
+   聲明: "Propofol exerts its effects primarily..."
+   實際: "Propofol exerts its effects primarily through..."
+   匹配度: 100%
+
+✅ 行號範圍
+   聲明: L.12-18
+   BBox: [72, 340, 520, 380]
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+📋 驗證結果: ✅ VERIFIED
+
+已更新 exam_mark_validated(passed=True)
+```
+
+---
+
+## ⚠️ 驗證失敗處理
+
+```
+❌ 來源驗證失敗
+
+題目 ID: xyz789
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+⚠️ 問題發現:
+
+1. 頁碼不符
+   聲明: P.156
+   搜尋結果: 內容位於 P.158
+
+2. 原文不匹配
+   聲明: "Propofol is water soluble..."
+   實際: 找不到相符內容
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+📋 建議動作:
+- [ ] 修正來源頁碼
+- [ ] 重新查詢正確來源
+- [ ] 標記為待人工審核
+
+已更新 exam_mark_validated(passed=False, notes="...")
+```
+
+---
+
+## 🔍 批次驗證
+
+```python
+# 批次驗證所有題目
+questions = exam_list_questions(limit=100)
+
+results = {
+    "verified": [],
+    "failed": [],
+    "no_source": []
 }
-```
 
----
-
-## 📝 輸出格式
-
-```
-📚 來源追蹤報告
-
-題目: q_20260203_001
-"Propofol 造成低血壓的主要機制是?"
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-🔗 主要來源 (Primary)
-
-📖 Miller's Anesthesia, 9th Ed
-├── 📄 頁碼: P.542
-├── 📍 行號: L.15-28
-├── 📝 原文: "Propofol produces dose-dependent 
-│          decreases in arterial blood pressure
-│          primarily through vasodilation..."
-├── 📊 信心度: 95%
-└── ✅ 驗證: 已確認
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-🔗 輔助來源 (Supporting)
-
-📖 Miller's Anesthesia, 9th Ed
-├── 📄 頁碼: P.1823
-├── 📍 行號: L.5-12
-├── 📝 原文: "Management of hypotension during
-│          anesthesia requires understanding..."
-├── 📊 信心度: 78%
-└── ✅ 驗證: 已確認
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-📋 引用格式:
-APA: Miller's Anesthesia (9th ed.), p.542, L.15-28
-IEEE: [Miller9] p.542
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-```
-
----
-
-## 🎯 來源品質指標
-
-| 指標 | 說明 | 目標值 |
-| ---- | ---- | ------ |
-| 信心度 | 來源與答案的相關性 | >80% |
-| 驗證狀態 | 是否通過驗證 | ✅ VERIFIED |
-| 覆蓋率 | 答案被來源支持的比例 | >90% |
-| 來源數 | 支持該題的來源數量 | ≥1 |
-
----
-
-## 🔍 批次來源驗證
-
-```python
-def batch_verify_sources(questions):
-    """批次驗證所有題目的來源"""
+for q in questions:
+    if not q.get("source"):
+        results["no_source"].append(q["id"])
+        continue
     
-    results = {
-        "verified": [],
-        "unverified": [],
-        "missing_source": []
-    }
-    
-    for q in questions:
-        if not q.sources:
-            results["missing_source"].append(q.id)
-        elif all(verify_source(s) for s in q.sources):
-            results["verified"].append(q.id)
-        else:
-            results["unverified"].append(q.id)
-    
-    return results
-```
+    # 執行驗證流程...
+    if verified:
+        results["verified"].append(q["id"])
+    else:
+        results["failed"].append(q["id"])
 
-輸出：
-```
-📊 批次來源驗證報告
-
-總題數: 50
-
-✅ 已驗證: 42 (84%)
-⚠️ 待驗證: 5 (10%)
-❌ 無來源: 3 (6%)
-
-需要處理:
-├── q_20260203_015 - 來源頁碼錯誤
-├── q_20260203_023 - 原文不匹配
-└── q_20260203_044 - 缺少來源資訊
+# 輸出統計
+print(f"✅ 已驗證: {len(results['verified'])}")
+print(f"❌ 驗證失敗: {len(results['failed'])}")
+print(f"⚠️ 無來源: {len(results['no_source'])}")
 ```
 
 ````

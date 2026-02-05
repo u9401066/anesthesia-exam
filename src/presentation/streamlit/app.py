@@ -48,6 +48,21 @@ DATA_DIR = PROJECT_DIR / "data"
 QUESTIONS_DIR = DATA_DIR / "questions"
 EXAMS_DIR = DATA_DIR / "exams"
 CRUSH_CONFIG_PATH = PROJECT_DIR / "crush.json"
+SOURCES_MANIFEST = DATA_DIR / "sources" / "manifest.json"
+
+
+def load_indexed_documents() -> list[dict]:
+    """載入已索引的文件列表"""
+    if not SOURCES_MANIFEST.exists():
+        return []
+    
+    try:
+        with open(SOURCES_MANIFEST, "r", encoding="utf-8") as f:
+            manifest = json.load(f)
+        return manifest.get("sources", [])
+    except Exception as e:
+        logger.warning(f"載入 manifest 失敗: {e}")
+        return []
 
 
 @dataclass
@@ -293,6 +308,82 @@ def stream_crush_generate(
     return full_response, saved_questions
 
 
+def render_source_info(source: dict | None, expanded: bool = False):
+    """渲染來源資訊（可展開式）"""
+    if not source:
+        return
+    
+    # 檢查是否有任何來源資訊
+    has_info = source.get("document") or source.get("stem_source") or source.get("page")
+    if not has_info:
+        return
+    
+    with st.expander("📚 來源資訊", expanded=expanded):
+        # 基本資訊
+        doc = source.get("document", "未知文件")
+        st.markdown(f"**📖 教材:** {doc}")
+        
+        if source.get("chapter"):
+            chapter_str = source.get("chapter")
+            if source.get("section"):
+                chapter_str += f" - {source.get('section')}"
+            st.markdown(f"**📑 章節:** {chapter_str}")
+        
+        # 精確來源（新格式）
+        if source.get("stem_source"):
+            st.markdown("---")
+            _render_source_location("📍 題幹來源", source["stem_source"])
+        
+        if source.get("answer_source"):
+            _render_source_location("📍 答案依據", source["answer_source"])
+        
+        if source.get("explanation_sources"):
+            for i, src in enumerate(source["explanation_sources"]):
+                _render_source_location(f"📍 詳解來源 {i+1}", src)
+        
+        # 向後相容（舊格式）
+        elif source.get("page") and not source.get("stem_source"):
+            st.markdown("---")
+            page_info = f"**P.{source['page']}**"
+            if source.get("lines"):
+                page_info += f", 第 {source['lines']} 行"
+            st.markdown(page_info)
+            
+            if source.get("original_text"):
+                text = source["original_text"]
+                if len(text) > 200:
+                    text = text[:200] + "..."
+                st.markdown(f"> _{text}_")
+        
+        # 驗證狀態
+        if source.get("is_verified"):
+            st.success("✅ 來源已驗證")
+
+
+def _render_source_location(label: str, loc: dict):
+    """渲染單一來源位置"""
+    if not loc:
+        return
+    
+    page = loc.get("page", 0)
+    line_start = loc.get("line_start", 0)
+    line_end = loc.get("line_end", 0)
+    original_text = loc.get("original_text", "")
+    
+    # 位置資訊
+    loc_str = f"**{label}:** P.{page}"
+    if line_start and line_end:
+        loc_str += f", 第 {line_start}-{line_end} 行"
+    st.markdown(loc_str)
+    
+    # 原文引用
+    if original_text:
+        text = original_text
+        if len(text) > 200:
+            text = text[:200] + "..."
+        st.markdown(f"> _{text}_")
+
+
 def render_question_card_inline(question: dict, index: int):
     """在容器內渲染題目卡片（用於流式生成時）"""
     st.markdown(f"---")
@@ -318,6 +409,11 @@ def render_question_card_inline(question: dict, index: int):
     if question.get("explanation"):
         with st.expander("📖 查看詳解"):
             st.write(question.get("explanation"))
+    
+    # 顯示來源資訊
+    source = question.get("source")
+    if source:
+        render_source_info(source)
     
     st.caption(f"🆔 {question.get('id', 'N/A')}")
 
@@ -351,6 +447,11 @@ def render_question_card(question: dict, index: int, show_answer: bool = False):
             topics = question.get("topics", [])
             if topics:
                 st.caption(f"🏷️ {', '.join(topics)}")
+        
+        # 顯示來源資訊（可展開）
+        source = question.get("source")
+        if source:
+            render_source_info(source)
         
         st.markdown("---")
 
@@ -509,10 +610,47 @@ with main_col:
                 
                 st.markdown("---")
                 
-                source_doc = st.text_input(
-                    "參考教材（可選）",
-                    placeholder="如：Miller's Anesthesia 第9版",
-                )
+                # 載入已索引的文件
+                indexed_docs = load_indexed_documents()
+                
+                if indexed_docs:
+                    # 有已索引文件，顯示下拉選單
+                    doc_options = ["（不指定教材）"] + [
+                        f"{d.get('title', d.get('doc_id', '未知'))} - {d.get('doc_id', '')}"
+                        for d in indexed_docs
+                    ]
+                    selected_doc = st.selectbox(
+                        "📚 參考教材（已索引）",
+                        options=doc_options,
+                        help="選擇已索引的教材可獲得精確的來源追蹤",
+                    )
+                    
+                    if selected_doc == "（不指定教材）":
+                        source_doc = ""
+                        selected_doc_id = None
+                    else:
+                        # 解析選項取得 doc_id
+                        for d in indexed_docs:
+                            title = d.get('title', d.get('doc_id', ''))
+                            doc_id = d.get('doc_id', '')
+                            if f"{title} - {doc_id}" == selected_doc:
+                                source_doc = title
+                                selected_doc_id = doc_id
+                                break
+                        else:
+                            source_doc = selected_doc
+                            selected_doc_id = None
+                    
+                    st.info("💡 選擇已索引教材後，AI 會使用 RAG 查詢真實內容並記錄精確來源")
+                else:
+                    # 無已索引文件，顯示提示
+                    st.warning("⚠️ 尚無已索引教材。請與 AI 對話使用 `ingest_documents` 工具索引 PDF。")
+                    source_doc = st.text_input(
+                        "參考教材（可選，無來源追蹤）",
+                        placeholder="如：Miller's Anesthesia 第9版",
+                        help="手動輸入的教材名稱無法進行精確來源追蹤",
+                    )
+                    selected_doc_id = None
                 
                 additional_instructions = st.text_area(
                     "額外指示（可選）",
@@ -549,10 +687,86 @@ with main_col:
                         prompt += f"- 知識點範圍: {', '.join(topics)}\n"
                     if source_doc:
                         prompt += f"- 參考教材: {source_doc}\n"
+                        if selected_doc_id:
+                            prompt += f"- 文件 ID (doc_id): {selected_doc_id}\n"
                     if additional_instructions:
                         prompt += f"- 額外要求: {additional_instructions}\n"
                     
-                    prompt += """
+                    # 根據是否有已索引教材來選擇不同的生成流程
+                    if source_doc and selected_doc_id:
+                        # 有已索引文件，使用完整的 RAG 流程
+                        prompt += f"""
+## 🚨 正確出題流程（必須遵守！）
+
+已選擇已索引教材，**必須**使用 MCP 工具查詢真實內容！
+
+### Step 1: 查詢知識庫
+使用 `consult_knowledge_graph` 工具查詢相關知識：
+```
+consult_knowledge_graph(query="[知識點關鍵字]")
+```
+
+### Step 2: 取得精確來源
+使用 `search_source_location` 取得頁碼和原文：
+```
+search_source_location(doc_id="{selected_doc_id}", query="[概念關鍵字]")
+```
+⚠️ 返回結果包含：page（頁碼）、lines、original_text（原文引用）
+
+### Step 3: 根據真實內容生成題目
+根據 MCP 返回的**真實內容**生成題目，不可編造！
+
+### Step 4: 儲存題目（包含精確來源）
+使用 `exam_save_question` 儲存，**必須填入真實來源**：
+```json
+{{
+  "question_text": "...",
+  "options": [...],
+  "correct_answer": "A",
+  "explanation": "...",
+  "source_doc": "{source_doc}",
+  "source_chapter": "[章節]",
+  "stem_source": {{
+    "page": [MCP返回的頁碼],
+    "line_start": [起始行],
+    "line_end": [結束行],
+    "original_text": "[MCP返回的原文]"
+  }},
+  "difficulty": "{diff_en}",
+  "topics": {json.dumps(topics if topics else ["麻醉學"], ensure_ascii=False)}
+}}
+```
+
+## ⚠️ 禁止事項
+- ❌ 不查詢就直接生成題目
+- ❌ 編造頁碼或原文引用
+- ❌ 使用「根據記憶」生成內容
+
+請從 Step 1 開始，查詢第一個知識點。"""
+                    elif source_doc:
+                        # 有手動輸入的教材名稱，但未索引（提醒需要先索引）
+                        prompt += f"""
+## ⚠️ 注意：教材未索引
+
+你指定了參考教材「{source_doc}」，但此教材**尚未索引**，無法使用 RAG 查詢精確來源。
+
+### 兩種處理方式：
+
+**方式 A：先索引教材（推薦）**
+請用戶上傳 PDF 檔案，然後使用 `ingest_documents` 工具索引：
+```
+ingest_documents(file_path="path/to/pdf", title="{source_doc}")
+```
+索引完成後，重新開始生成流程。
+
+**方式 B：直接生成（無來源追蹤）**
+如果用戶確認要繼續，可以直接生成題目，但：
+- ⚠️ 來源資訊將不完整
+- ⚠️ 無法進行來源驗證
+
+請詢問用戶選擇哪種方式。"""
+                    else:
+                        prompt += """
 ## 重要指示
 1. 每生成一題，**立即**使用 `exam_save_question` MCP 工具儲存
 2. 儲存後繼續生成下一題
@@ -575,8 +789,8 @@ exam_save_question 需要：
 - options: ["選項A", "選項B", "選項C", "選項D"]
 - correct_answer: "A" (或 B/C/D)
 - explanation: 詳解
-- difficulty: "{diff_en}"
-- topics: {json.dumps(topics if topics else ["麻醉學"], ensure_ascii=False)}
+- difficulty: \"""" + diff_en + """\"
+- topics: """ + json.dumps(topics if topics else ["麻醉學"], ensure_ascii=False) + """
 
 請開始生成第 1 題。"""
                     

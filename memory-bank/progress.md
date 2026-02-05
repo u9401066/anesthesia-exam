@@ -31,24 +31,40 @@
   - render_question_card_inline() 即時顯示題目
   - 完整 logging 追蹤
 - [x] 修復 source.get() NoneType 錯誤
+- [x] **文檔與 Skills 更新 (2026-02-05)**
+  - copilot-instructions.md: 新增 MCP Server 架構表、正確出題流程
+  - decisionLog.md: DEC-006/007/008 (MCP 雙伺服器/先查後出/可展開來源)
+  - mcq-generator Skill v2.0.0: 使用 MCP 工具查詢來源
+  - source-tracker Skill v2.0.0: 使用 MCP 工具驗證來源
+  - question-crud Skill v2.0.0: 強調來源必須真實
+- [x] **P0 實作完成 (2026-02-05)**
+  - exam_save_question schema 升級支援完整 Source 結構
+  - Streamlit prompt 更新：有已索引教材時引導正確流程
+  - 可展開來源顯示 UI (render_source_info)
+  - asset-aware-mcp 整合：已索引文件下拉選單
+- [x] **Marker 整合到標準 ingest 流程 (2026-02-03)**
+  - `ingest_documents(use_marker=True)` 產出 blocks.json
+  - IngestResult 新增 `backend` 欄位追蹤使用的解析器
+  - 支援 lazy-load Marker extractor (避免啟動時載入重模型)
+  - 研究 Unstructured.io (13.9k stars) 作為未來備選方案
 
 ## Doing
 
-- [ ] 建立 PDF 解析 MCP Server (pdf_server.py)
-- [ ] 設計來源顯示格式 (文件/頁碼/行號)
+(目前無進行中任務)
 
 ## Next
 
-- [ ] Phase 1 MVP 開發
-  - [ ] 串接 PDF 工具到出題流程
-  - [ ] 實作來源驗證機制
-  - [ ] PDF 上傳與解析
-  - [ ] 原子化索引 (LightRAG)
-  - [ ] 詳解品質優化
+### P1 (重要)
+
+- [ ] 測試完整出題流程（需要先索引一份 PDF）
+- [ ] 優化來源顯示樣式
+
+### P2 (改善)
+
+- [ ] 實作互動式 PDF 跳轉（點擊來源開啟 PDF）
+- [ ] 詳解品質優化
+- [ ] 來源驗證機制自動化
 
 ## Blocked
 
-- [ ] 真正的來源追蹤 - 架構已設計，待實作 PDF MCP Server
-  - 目前來源仍是 AI 編造的假資料
-  - 已選定: PyMuPDF + FastMCP
-  - 待實作: `src/infrastructure/mcp/pdf_server.py`
+(目前無阻塞項目)

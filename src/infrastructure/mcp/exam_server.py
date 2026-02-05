@@ -15,7 +15,7 @@ from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import Tool, TextContent
 
-from src.domain.entities.question import Question, Difficulty, QuestionType, Source
+from src.domain.entities.question import Question, Difficulty, QuestionType, Source, SourceLocation
 from src.domain.value_objects.audit import ActorType
 from src.infrastructure.persistence.sqlite_question_repo import get_question_repository
 
@@ -48,7 +48,7 @@ def create_exam_mcp_server() -> Server:
         return [
             Tool(
                 name="exam_save_question",
-                description="儲存生成的考題到題庫",
+                description="儲存生成的考題到題庫。來源資訊必須來自 MCP 查詢結果（consult_knowledge_graph + search_source_location），不可 AI 編造。",
                 inputSchema={
                     "type": "object",
                     "properties": {
@@ -71,11 +71,67 @@ def create_exam_mcp_server() -> Server:
                         },
                         "source_doc": {
                             "type": "string",
-                            "description": "來源文件名稱"
+                            "description": "來源文件名稱（必須來自 MCP 查詢）"
+                        },
+                        "source_chapter": {
+                            "type": "string",
+                            "description": "章節編號（如 Ch.15）"
+                        },
+                        "source_section": {
+                            "type": "string",
+                            "description": "小節標題"
+                        },
+                        "stem_source": {
+                            "type": "object",
+                            "description": "題幹概念來源（必須來自 search_source_location）",
+                            "properties": {
+                                "page": {"type": "integer", "description": "頁碼 (1-based)"},
+                                "line_start": {"type": "integer", "description": "起始行號"},
+                                "line_end": {"type": "integer", "description": "結束行號"},
+                                "bbox": {
+                                    "type": "array",
+                                    "items": {"type": "number"},
+                                    "description": "位置 [x0, y0, x1, y1]"
+                                },
+                                "original_text": {"type": "string", "description": "原文引用"}
+                            }
+                        },
+                        "answer_source": {
+                            "type": "object",
+                            "description": "正確答案依據來源",
+                            "properties": {
+                                "page": {"type": "integer"},
+                                "line_start": {"type": "integer"},
+                                "line_end": {"type": "integer"},
+                                "bbox": {"type": "array", "items": {"type": "number"}},
+                                "original_text": {"type": "string"}
+                            }
+                        },
+                        "explanation_sources": {
+                            "type": "array",
+                            "description": "詳解參考來源列表",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "page": {"type": "integer"},
+                                    "line_start": {"type": "integer"},
+                                    "line_end": {"type": "integer"},
+                                    "bbox": {"type": "array", "items": {"type": "number"}},
+                                    "original_text": {"type": "string"}
+                                }
+                            }
                         },
                         "source_page": {
                             "type": "integer",
-                            "description": "來源頁碼"
+                            "description": "[DEPRECATED] 使用 stem_source.page"
+                        },
+                        "source_lines": {
+                            "type": "string",
+                            "description": "[DEPRECATED] 使用 stem_source.line_start/end"
+                        },
+                        "source_text": {
+                            "type": "string",
+                            "description": "[DEPRECATED] 使用 stem_source.original_text"
                         },
                         "difficulty": {
                             "type": "string",
@@ -86,6 +142,18 @@ def create_exam_mcp_server() -> Server:
                             "type": "array",
                             "items": {"type": "string"},
                             "description": "知識點標籤"
+                        },
+                        "user_prompt": {
+                            "type": "string",
+                            "description": "用戶原始請求"
+                        },
+                        "skill_used": {
+                            "type": "string",
+                            "description": "使用的 Skill 名稱"
+                        },
+                        "reasoning": {
+                            "type": "string",
+                            "description": "AI 推理過程"
                         }
                     },
                     "required": ["question_text", "options", "correct_answer"]
@@ -306,17 +374,46 @@ def create_exam_mcp_server() -> Server:
     return server
 
 
-def save_question(args: dict) -> dict:
-    """儲存考題到 SQLite"""
+def _parse_source_location(data: dict | None) -> SourceLocation | None:
+    """解析 SourceLocation 物件"""
+    if not data:
+        return None
     
-    # 建立來源
+    return SourceLocation(
+        page=data.get("page", 0),
+        line_start=data.get("line_start", 0),
+        line_end=data.get("line_end", 0),
+        bbox=tuple(data["bbox"]) if data.get("bbox") else None,
+        original_text=data.get("original_text", ""),
+    )
+
+
+def save_question(args: dict) -> dict:
+    """儲存考題到 SQLite（支援完整 Source 結構）"""
+    
+    # 建立來源（優先使用新結構）
     source = None
     if args.get("source_doc"):
+        # 解析精確來源
+        stem_source = _parse_source_location(args.get("stem_source"))
+        answer_source = _parse_source_location(args.get("answer_source"))
+        explanation_sources = [
+            _parse_source_location(s) 
+            for s in args.get("explanation_sources", [])
+            if s
+        ]
+        
         source = Source(
             document=args.get("source_doc", ""),
-            page=args.get("source_page"),
-            lines=args.get("source_lines"),
-            original_text=args.get("source_text"),
+            chapter=args.get("source_chapter"),
+            section=args.get("source_section"),
+            stem_source=stem_source,
+            answer_source=answer_source,
+            explanation_sources=explanation_sources,
+            # 向後相容：如果沒有新結構，使用舊欄位
+            page=args.get("source_page") if not stem_source else None,
+            lines=args.get("source_lines") if not stem_source else None,
+            original_text=args.get("source_text") if not stem_source else None,
         )
     
     # 建立 Question 實體
@@ -347,10 +444,21 @@ def save_question(args: dict) -> dict:
         generation_context=generation_context if any(generation_context.values()) else None,
     )
     
+    # 計算來源完整度
+    source_completeness = "none"
+    if source:
+        if source.stem_source and source.stem_source.original_text:
+            source_completeness = "full"  # 有精確來源
+        elif source.page:
+            source_completeness = "partial"  # 只有頁碼
+        else:
+            source_completeness = "doc_only"  # 只有文件名
+    
     return {
         "success": True,
         "question_id": question_id,
         "message": f"題目已儲存到 SQLite 資料庫",
+        "source_completeness": source_completeness,
     }
 
 

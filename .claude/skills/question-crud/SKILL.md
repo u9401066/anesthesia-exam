@@ -1,24 +1,44 @@
+````skill
 ---
-description: 題目 CRUD 操作 Skill - 透過 MCP 工具管理考題的完整生命週期
-triggers:
-  - 新增題目
-  - 修改題目
-  - 刪除題目
-  - 查詢題目
-  - 題目 CRUD
-  - 編輯題目
-  - 更新題目
-  - 還原題目
-  - 審計日誌
-  - 題目歷史
-  - 驗證題目
+name: question-crud
+description: 題目 CRUD 操作 - 透過 MCP 工具管理考題生命週期。Triggers: 新增題目, 修改題目, 刪除題目, 查詢題目, 題目CRUD, 編輯題目, 更新題目, 還原題目, 審計日誌.
+version: 2.0.0
+category: exam-generation
+compatibility:
+  - crush
+  - claude-code
+allowed-tools:
+  - exam_save_question
+  - exam_list_questions
+  - exam_get_question
+  - exam_update_question
+  - exam_delete_question
+  - exam_restore_question
+  - exam_validate_question
+  - exam_mark_validated
+  - exam_get_audit_log
+  - exam_search
+  - exam_create_exam
+  - exam_get_stats
 ---
 
 # Question CRUD Skill
 
 透過 MCP 工具管理考題的完整生命週期，包含建立、讀取、更新、刪除（軟刪除）、還原、驗證和審計追蹤。
 
-## 可用的 MCP 工具
+## ⚠️ 重要原則
+
+**來源資訊必須真實！**
+
+- `source_doc`、`source_page`、`source_lines`、`source_text` 必須來自 **MCP 查詢結果**
+- 不可憑記憶或 AI 幻覺填寫來源
+- 正確流程：`consult_knowledge_graph` → `search_source_location` → `exam_save_question`
+
+詳見：[mcq-generator Skill](../mcq-generator/SKILL.md)
+
+---
+
+## 🔧 可用的 MCP 工具
 
 ### 📝 建立題目
 
@@ -56,10 +76,12 @@ exam_save_question
   "explanation": "Propofol 是脂溶性藥物，具有快速起效（30-40秒）和快速恢復的特性...",
   "source_doc": "麻醉藥理學教材",
   "source_page": 125,
+  "source_lines": "12-18",
+  "source_text": "Propofol has a rapid onset of action...",
   "difficulty": "medium",
   "topics": ["藥理學", "靜脈麻醉藥", "Propofol"],
   "skill_used": "mcq-generator",
-  "reasoning": "根據教材第125頁對 Propofol 的描述..."
+  "reasoning": "根據 search_source_location 返回的 P.125 內容..."
 }
 ```
 
@@ -116,10 +138,8 @@ exam_update_question
 | explanation | string | | 新詳解 |
 | difficulty | enum | | 新難度 |
 | topics | array | | 新知識點標籤 |
-| actor_name | string | | 修改者名稱 (如 "question-validator") |
+| actor_name | string | | 修改者名稱 |
 | reason | string | | 修改原因 |
-
-**注意：** 只需提供要更新的欄位，未提供的欄位會保留原值。
 
 ### 🗑️ 刪除題目
 
@@ -158,15 +178,6 @@ exam_validate_question
 | correct_answer | string | ✅ | 正確答案 |
 | question_type | enum | | single_choice / multiple_choice / true_false |
 
-**回傳：**
-```json
-{
-  "valid": true/false,
-  "errors": ["錯誤訊息..."],
-  "warnings": ["警告訊息..."]
-}
-```
-
 ### ✅ 標記驗證結果
 
 ```
@@ -198,17 +209,20 @@ exam_get_stats
 
 無需參數，回傳題庫統計資訊。
 
-## 操作流程
+---
 
-### 新增題目流程
+## 📊 操作流程
+
+### 正確的新增題目流程
 
 ```mermaid
 flowchart TD
-    A[接收出題請求] --> B[使用出題 Skill 生成]
-    B --> C[exam_validate_question 驗證格式]
-    C -->|通過| D[exam_save_question 儲存]
-    C -->|失敗| E[修正後重新驗證]
-    D --> F[exam_mark_validated 標記已驗證]
+    A[用戶請求出題] --> B[consult_knowledge_graph 查詢知識]
+    B --> C[search_source_location 取得精確來源]
+    C --> D[根據真實內容生成題目]
+    D --> E[exam_validate_question 驗證格式]
+    E -->|通過| F[exam_save_question 儲存]
+    F --> G[exam_mark_validated 標記已驗證]
 ```
 
 ### 修改題目流程
@@ -222,7 +236,9 @@ flowchart TD
     E --> F[記錄修改原因]
 ```
 
-## 審計追蹤
+---
+
+## 📜 審計追蹤
 
 每次操作都會自動記錄：
 
@@ -236,21 +252,37 @@ flowchart TD
 | generation_context | 生成上下文 (僅 created) |
 | timestamp | 時間戳 |
 
-## 使用範例
+---
 
-### 範例 1: 生成並儲存題目
+## 📝 使用範例
+
+### 範例 1: 正確的生成並儲存流程
 
 ```
 用戶: 幫我出一題關於 Propofol 的選擇題
 
 Agent 操作:
-1. 使用 mcq-generator Skill 生成題目
-2. 呼叫 exam_validate_question 驗證格式
-3. 呼叫 exam_save_question 儲存，包含：
-   - 題目內容
-   - skill_used: "mcq-generator"
-   - reasoning: "根據..."
-4. 呼叫 exam_mark_validated 標記已驗證
+1. consult_knowledge_graph("propofol pharmacology")
+   → 取得知識內容
+   
+2. search_source_location(doc_id="textbook", query="propofol GABA")
+   → 取得 page=125, lines="12-18", original_text="..."
+   
+3. 根據真實內容生成題目
+   
+4. exam_validate_question 驗證格式
+   
+5. exam_save_question {
+     "question_text": "...",
+     "source_doc": "textbook",
+     "source_page": 125,
+     "source_lines": "12-18",
+     "source_text": "...(從 MCP 取得的原文)",
+     "skill_used": "mcq-generator",
+     "reasoning": "根據 search_source_location 返回的內容..."
+   }
+   
+6. exam_mark_validated 標記已驗證
 ```
 
 ### 範例 2: 修改已存在的題目
@@ -259,8 +291,8 @@ Agent 操作:
 用戶: 把題目 abc123 的答案改成 C
 
 Agent 操作:
-1. 呼叫 exam_get_question 取得題目詳情
-2. 呼叫 exam_update_question {
+1. exam_get_question 取得題目詳情
+2. exam_update_question {
      "question_id": "abc123",
      "correct_answer": "C",
      "actor_name": "user-request",
@@ -274,6 +306,8 @@ Agent 操作:
 用戶: 這題是怎麼出出來的？
 
 Agent 操作:
-1. 呼叫 exam_get_question 取得題目
+1. exam_get_question 取得題目
 2. 回傳 generation_context 和 audit_log
 ```
+
+````

@@ -1,5 +1,38 @@
 # Decision Log
 
+## 2026-02-05
+
+### DEC-006: 流式生成實作方案
+
+| 項目 | 內容 |
+|------|------|
+| **決策** | 使用 `st.empty()` + `st.container()` 取代 `st.spinner()` |
+| **問題** | `st.spinner()` 會阻塞 UI 更新，導致「轉完才一次顯示」 |
+| **解決方案** | 每 100ms 更新 `st.empty()` placeholder，實現即時顯示 |
+| **影響** | `stream_crush_generate()` 函數重寫 |
+
+### DEC-007: 出題流程架構 - 先查詢再出題
+
+| 項目 | 內容 |
+|------|------|
+| **決策** | Agent 必須先查詢 RAG 知識庫，再根據真實內容出題 |
+| **問題** | 直接讓 Agent 出題會產生幻覺（編造內容和來源） |
+| **正確流程** | `consult_knowledge_graph()` → `search_source_location()` → `exam_save_question()` |
+| **工具依賴** | asset-aware-mcp (RAG) + exam-generator (CRUD) |
+| **影響** | 需要更新 Streamlit prompt，指導 Agent 執行正確流程 |
+
+### DEC-008: 來源顯示方案 - 可展開詳情
+
+| 項目 | 內容 |
+|------|------|
+| **決策** | 採用方案 B：可展開的來源詳情 |
+| **備選方案** | A. 簡潔內嵌、C. 互動跳轉 PDF |
+| **選擇理由** | 不增加 UI 負擔，需要時可展開看詳細來源 |
+| **UI 元素** | `st.expander("📖 來源詳情")` |
+| **狀態** | 待實作（需先升級 exam_save_question schema） |
+
+---
+
 ## 2026-02-03
 
 ### DEC-001: PDF 解析工具選擇 PyMuPDF
