@@ -1,0 +1,44 @@
+{
+    // ═══════════════════════════════════════════════════════════════════════
+    // MCP Servers for VS Code Copilot Agent
+    // ═══════════════════════════════════════════════════════════════════════
+    // 
+    // ⚠️ 這是給 VS Code Copilot Agent 使用的 MCP 配置
+    //    與 vscode-extension/ 目錄下的 VSX 擴充功能是不同的東西：
+    //    - mcp.json: Copilot Agent 透過 stdio 呼叫 MCP tools
+    //    - vscode-extension: 獨立的 GUI 擴充功能
+    //
+    // 使用方式：在 Copilot Chat 中 @workspace 即可使用下列工具
+    // ═══════════════════════════════════════════════════════════════════════
+    "servers": {
+        // ─────────────────────────────────────────────────────────────────
+        // Asset-Aware MCP: PDF 解析、RAG、Section Navigation
+        // ─────────────────────────────────────────────────────────────────
+        "asset-aware": {
+            "type": "stdio",
+            "command": "uv",
+            "args": [
+                "run",
+                "--directory",
+                "${workspaceFolder}/libs/asset-aware-mcp",
+                "python",
+                "-m",
+                "src.server"
+            ],
+            "env": {
+                // LLM 後端設定 (ollama / openai / anthropic)
+                "LLM_BACKEND": "ollama",
+                "OLLAMA_HOST": "http://localhost:11434",
+                "OLLAMA_MODEL": "qwen2.5:7b",
+                "OLLAMA_EMBEDDING_MODEL": "nomic-embed-text",
+                
+                // RAG 功能開關
+                "ENABLE_LIGHTRAG": "true",
+                
+                // 資料目錄 (共用主專案的 data/)
+                "DATA_DIR": "${workspaceFolder}/data"
+            }
+        }
+    },
+    "inputs": []
+}
