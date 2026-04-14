@@ -2,9 +2,11 @@
 
 ## Current Goals
 
-- 已完成 asset-aware 子模組更新與 past-exam-extraction 端到端實作；目前重點轉為讓 UI / prompts / agents 正式消費新工具鏈。
+- 已完成 asset-aware 子模組更新、large-PDF/page-range ingestion 強化與 past-exam-extraction 端到端實作；目前重點轉為讓 UI / prompts / agents 正式消費新工具鏈。
 
 ## Current Focus
+
+**2026-04-14 補充：`libs/asset-aware-mcp` 已完成並發布 large-PDF ingestion 強化。Marker parse 現在會在頁數超過 800 頁時自動 chunk，遇到高圖片量 PDF 時自動停用 figure extraction；另外也新增真正的 `page_ranges` ingestion，會先 materialize `selected_pages.pdf` 再把 subset-local page number remap 回原始 PDF，避免來源頁碼失真，並用 page-range scope 避免 `doc_id` collision。子模組 commit 已推到 `7b1c6d5`，主 repo submodule pointer 已更新到 `841298d`。**
 
 **2026-04-14 補充：已完成 reviewed-only / exam_track / scope request / heartbeat 這條 Web 治理切片。題庫資料模型現在支援 `exam_track`、`is_validated`、`validation_notes`；Streamlit 已補上 `📋 出題需求` 頁、題庫審查按鈕，以及 heartbeat / backlog 統計。Heartbeat 採 file-based contract，會把補題工作寫到 `data/jobs/*.json` 供外部 agent / OpenClaw 讀取。**
 
@@ -26,6 +28,7 @@
 - pipeline run 可自動落地 `ingest_past_exams -> normalize_questions -> classify_patterns -> build_blueprint -> publish_reference_pack`
 
 目前待處理：
+- 讓上層 ingest / parse / UI 真正暴露 `page_ranges` 與新的 auto strategy，避免大 PDF 仍只能走整本 ingestion
 - 用真實 past exam PDF 再跑一輪，補 parser 對多欄/答案區格式的邊界案例
 - 讓上層 UI / prompt 直接呼叫 `exam_run_past_exam_extraction`
 - `create_exam` 仍讀取 JSON 檔，與 SQLite 主儲存路徑不一致
@@ -63,6 +66,7 @@
 ## Current Blockers
 
 - **生成頁仍是 prompt orchestration 為主**：雖然 preview / formal 切換 UX 已修正，但正式出題仍未完全收斂成穩定的服務層調用
+- **新 page-range / large-PDF 能力尚未上浮到使用者入口**：底層 asset-aware 已支援，但上層 ingest / Web / agent 尚未全面暴露這些控制項
 - **真實考古題格式仍未完全驗證**：目前規則已用 synthetic fixture 驗證，尚需真實 PDF 套跑
 - **上層 workflow 尚未全面切換**：部分 prompt / UI 仍停留在舊流程
 - **新治理切片雖已落地，但仍缺完整 smoke test**：目前已用 repository round-trip + heartbeat job emission 驗證，尚未做完整瀏覽器互動驗證
@@ -72,8 +76,9 @@
 
 ## Next Steps
 
-1. **用真實 past exam PDF 驗證**：直接跑 `exam_run_past_exam_extraction` 檢查抽題品質
-2. **重 ingest 正式教材**：用 `use_marker=True` 重新建立可精確追來源的 doc_id
-3. **補 browser smoke test**：驗證 `📋 出題需求`、題庫審查按鈕與統計頁 heartbeat 卡片的互動流程
-4. **補 UI / Agent 接線**：讓生成頁正式消費 pipeline tools，並保留目前已驗證的 source-ready gate / preview mode UX
-5. **把 template / past-exam 能力帶進 Web**：讓 backlog 補題不只靠 topic gap，也能用歷屆模式輔助
+1. **把 `page_ranges` 與 large-PDF 策略接到上層**：讓 ingest / parse UI 與 agent 能真正只處理指定頁段
+2. **用真實 past exam PDF 驗證**：直接跑 `exam_run_past_exam_extraction` 檢查抽題品質
+3. **重 ingest 正式教材**：用 `use_marker=True` 重新建立可精確追來源的 doc_id
+4. **補 browser smoke test**：驗證 `📋 出題需求`、題庫審查按鈕與統計頁 heartbeat 卡片的互動流程
+5. **補 UI / Agent 接線**：讓生成頁正式消費 pipeline tools，並保留目前已驗證的 source-ready gate / preview mode UX
+6. **把 template / past-exam 能力帶進 Web**：讓 backlog 補題不只靠 topic gap，也能用歷屆模式輔助

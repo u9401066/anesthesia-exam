@@ -2,6 +2,15 @@
 
 ## 2026-04-14
 
+### DEC-011: 大 PDF 採 subset + remap 策略，避免全本 ingestion 與頁碼失真
+
+| 項目 | 內容 |
+|------|------|
+| **決策** | `asset-aware-mcp` 的 page-range ingestion 先 materialize `selected_pages.pdf` 處理指定頁段，再把 markdown / toc / table / image / Marker 輸出頁碼 remap 回原始 PDF 頁碼；另外在 Marker parse 內建 large-PDF auto strategy |
+| **問題** | 直接 ingest 整本大型 PDF 容易造成記憶體與輸出量膨脹；若只做局部處理但不 remap 頁碼，來源追蹤會對不上原始 PDF；若 `doc_id` 不納入 page range，同一 PDF 不同頁段會 collision |
+| **解決方案** | 頁數超過 800 頁自動 chunk、圖片量過高時自動停用 figure extraction；page-range ingestion 時產生 page map、重寫輸出頁碼，並讓 `doc_id` 帶入 page-range scope |
+| **影響** | 之後上層 ingest / parse / UI 應優先暴露 `page_ranges`，並以 remapped original page numbers 作為精確來源顯示基準 |
+
 ### DEC-009: Heartbeat 改採 file-based job contract
 
 | 項目 | 內容 |

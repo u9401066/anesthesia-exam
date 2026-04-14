@@ -2,6 +2,10 @@
 
 ## Done
 
+- `libs/asset-aware-mcp` 已完成並發布大 PDF ingestion 強化：Marker 解析現在會在頁數超過 800 頁時自動啟用 chunking，遇到高圖片量 PDF 時自動關閉 figure extraction，避免大型文件解析時記憶體與輸出量失控
+- `libs/asset-aware-mcp` 已完成真正的 page-range ingestion：支援只 materialize 指定頁段的 `selected_pages.pdf`，並把 markdown / toc / table / image / marker 輸出頁碼 remap 回原始 PDF 頁碼，同時用 page-range scope 避免 `doc_id` collision
+- 上述 asset-aware 變更已提交並推送到子模組 repo `u9401066/asset-aware-mcp`（commit `7b1c6d5`），主 repo 也已更新 submodule pointer（commit `841298d`）
+
 - 完成題庫治理切片第一階段：`Question` 新增 `exam_track`、`is_validated`、`validation_notes`，`IQuestionRepository.list_all()` 與 SQLite repo 已支援 `validated_only` / `exam_track` 篩選
 - `database.py` 補上 migration runner，`questions` 表新增 `exam_track` migration，並新增 `scope_requests` table 與索引初始化
 - 新增 `ScopeRequest` 實體、repository 介面與 `SQLiteScopeRequestRepository`
@@ -36,6 +40,7 @@
 
 ## Doing
 
+- 準備把新的 asset-aware `page_ranges` / auto chunking 能力往上接到正式教材 ingest 與 Web / agent 工作流
 - 準備將生成頁從 prompt 編排式整合進一步收斂到服務層 / pipeline tool 接線
 - 準備重 ingest 真實教材，讓正式出題可取得精確來源
 - 持續補做 web smoke test，優先確認新增的需求頁 / 題庫審查 / heartbeat 統計與既有生成、練習、聊天頁面
@@ -43,6 +48,7 @@
 
 ## Next
 
+- 讓上層 ingest / parse 流程實際使用 `page_ranges`，驗證只 ingest 指定頁段時仍能維持精確來源顯示
 - 讓 Streamlit / Agent 直接消費新的 `exam_run_past_exam_extraction` 工具
 - 用 `use_marker=True` 重新 ingest 正式教材 PDF，打通 `search_source_location -> exam_save_question`
 - 補瀏覽器級 smoke test，確認 `📋 出題需求` 的提交 / 核准 / heartbeat job 產生流程
