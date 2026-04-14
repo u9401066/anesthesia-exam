@@ -8,7 +8,6 @@ Marker 會產生 blocks.json（含 bbox + section_hierarchy），
 同時也跑 PyMuPDF 路徑做比較。
 """
 
-import asyncio
 import json
 import sys
 import time
@@ -47,14 +46,14 @@ def print_section_report(sections, title: str):
     print("=" * 70)
 
     for i, sec in enumerate(sections, 1):
-        level = getattr(sec, 'level', 1)
-        page = getattr(sec, 'page', '?')
-        sec_title = getattr(sec, 'title', str(sec))
+        level = getattr(sec, "level", 1)
+        page = getattr(sec, "page", "?")
+        sec_title = getattr(sec, "title", str(sec))
         level_indent = "  " * (level - 1)
         print(f"  {i:2d}. {level_indent}{'#' * level} {sec_title}  (p.{page})")
 
     # 品質檢查
-    titles = [getattr(s, 'title', str(s)) for s in sections]
+    titles = [getattr(s, "title", str(s)) for s in sections]
 
     # 短標題
     short = [t for t in titles if len(t) < 15]
@@ -64,14 +63,14 @@ def print_section_report(sections, title: str):
     # 層級分佈
     levels = {}
     for s in sections:
-        lv = getattr(s, 'level', 1)
+        lv = getattr(s, "level", 1)
         levels[lv] = levels.get(lv, 0) + 1
     print(f"  📊 層級: {dict(sorted(levels.items()))}")
 
     # 預期比對
     found_titles_lower = [t.lower() for t in titles]
     matched = 0
-    print(f"\n  📋 預期 sections 比對:")
+    print("\n  📋 預期 sections 比對:")
     for exp in EXPECTED_SECTIONS:
         hit = any(exp.lower() in t for t in found_titles_lower)
         if hit:
@@ -116,9 +115,9 @@ def test_marker_direct():
     if result.toc:
         print(f"\n📑 Marker TOC ({len(result.toc)} items):")
         for i, item in enumerate(result.toc, 1):
-            title = item.get('title', '?')
-            page = item.get('page', '?')
-            level = item.get('level', 1)
+            title = item.get("title", "?")
+            page = item.get("page", "?")
+            level = item.get("level", 1)
             indent = "  " * (level - 1)
             print(f"  {i:2d}. {indent}{'#' * level} {title}  (p.{page})")
 
@@ -127,7 +126,7 @@ def test_marker_direct():
     if section_blocks:
         print(f"\n📑 Marker SectionHeader blocks ({len(section_blocks)}):")
         for i, b in enumerate(section_blocks, 1):
-            level = b.metadata.get('level', '?')
+            level = b.metadata.get("level", "?")
             print(f"  {i:2d}. [L{level}] {b.text[:80]}  (p.{b.page}, bbox={b.bbox})")
 
     # Block type 分佈
@@ -171,14 +170,18 @@ def test_marker_direct():
 
     # 預期比對
     print_section_report(
-        [type('S', (), {'title': item.get('title',''), 'level': item.get('level',1), 'page': item.get('page',0)})()
-         for item in result.toc],
-        "Marker TOC Sections"
+        [
+            type(
+                "S", (), {"title": item.get("title", ""), "level": item.get("level", 1), "page": item.get("page", 0)}
+            )()
+            for item in result.toc
+        ],
+        "Marker TOC Sections",
     )
 
     # 也看 markdown 頭 30 行
-    first_lines = result.markdown.split('\n')[:30]
-    print(f"\n📝 Marker Markdown 前 30 行:")
+    first_lines = result.markdown.split("\n")[:30]
+    print("\n📝 Marker Markdown 前 30 行:")
     for i, line in enumerate(first_lines, 1):
         if line.strip():
             print(f"  {i:3d}: {line[:120]}")
@@ -212,8 +215,8 @@ def test_pymupdf_with_merge():
     print_section_report(sections, "PyMuPDF + Merge Sections")
 
     # Markdown 頭 30 行
-    first_lines = markdown.split('\n')[:30]
-    print(f"\n📝 PyMuPDF Markdown 前 30 行:")
+    first_lines = markdown.split("\n")[:30]
+    print("\n📝 PyMuPDF Markdown 前 30 行:")
     for i, line in enumerate(first_lines, 1):
         if line.strip():
             print(f"  {i:3d}: {line[:120]}")
@@ -246,9 +249,11 @@ def main():
     print("📊 總結比較")
     print("=" * 70)
     if marker_result:
-        print(f"  Marker:  TOC={len(marker_result.toc)} items, "
-              f"SectionHeaders={sum(1 for b in marker_result.blocks if b.block_type == 'SectionHeader')}, "
-              f"blocks.json=✅")
+        print(
+            f"  Marker:  TOC={len(marker_result.toc)} items, "
+            f"SectionHeaders={sum(1 for b in marker_result.blocks if b.block_type == 'SectionHeader')}, "
+            f"blocks.json=✅"
+        )
     if pymupdf_sections:
         print(f"  PyMuPDF: Sections={len(pymupdf_sections)} (from markdown heading merge)")
 

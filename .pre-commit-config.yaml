@@ -1,0 +1,60 @@
+# Pre-commit hooks for Anesthesia Exam Generator
+# Install: .venv/bin/pre-commit install
+# Run all: .venv/bin/pre-commit run --all-files
+
+repos:
+  - repo: local
+    hooks:
+      # ── Ruff: lint ──
+      - id: ruff-lint
+        name: "Ruff lint"
+        language: system
+        entry: .venv/bin/ruff check --fix --exit-non-zero-on-fix
+        types: [python]
+
+      # ── Ruff: format ──
+      - id: ruff-format
+        name: "Ruff format"
+        language: system
+        entry: .venv/bin/ruff format --check
+        types: [python]
+
+      # ── YAML 語法 ──
+      - id: check-yaml
+        name: "檢查 YAML 語法"
+        language: system
+        entry: .venv/bin/python -c "import yaml, sys; yaml.safe_load(open(sys.argv[1]))"
+        types: [yaml]
+
+      # ── JSON 語法 ──
+      - id: check-json
+        name: "檢查 JSON 語法"
+        language: system
+        entry: .venv/bin/python -c "import json,sys;[json.load(open(f)) for f in sys.argv[1:]]"
+        types: [json]
+        exclude: (\.vscode/|tsconfig|data/)
+
+      # ── Structured Logger Lint ──
+      - id: no-fstring-logger
+        name: "禁止 f-string logger"
+        language: pygrep
+        entry: 'logger\.(info|warning|error|debug|critical)\(f["\x27]'
+        types: [python]
+        files: ^src/
+        exclude: ^src/infrastructure/crush/  # Crush 舊模組暫時豁免
+
+      - id: no-bare-logging-basicconfig
+        name: "禁止 logging.basicConfig（改用 configure_logging）"
+        language: pygrep
+        entry: 'logging\.basicConfig'
+        types: [python]
+        files: ^src/
+        exclude: ^src/infrastructure/crush/
+
+      - id: no-print-in-src
+        name: "禁止 src/ 中使用 print（改用 logger）"
+        language: pygrep
+        entry: '^\s*print\('
+        types: [python]
+        files: ^src/
+        exclude: (^tests/|__main__\.py)

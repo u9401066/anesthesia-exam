@@ -5,11 +5,59 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    "marker-pdf>=1.10.2",
     "mcp>=1.26.0",
     "pydantic>=2.12.5",
-    "pymupdf>=1.26.7",
-    "reportlab>=4.4.9",
-    "streamlit>=1.53.1",
-    "unstructured[pdf]>=0.18.31",
+    "structlog>=25.5.0",
 ]
+
+[project.optional-dependencies]
+# Web App (Streamlit + PDF export)
+webapp = [
+    "streamlit>=1.53.1",
+    "reportlab>=4.4.9",
+]
+# PDF 解析 (Streamlit 上傳後處理用，重型依賴)
+# ⚠️ 需要 Python 3.11 或手動安裝 - unstructured[pdf] 目前與 Python 3.12 不相容
+# pdf = [
+#     "marker-pdf>=1.10.2",
+#     "pymupdf>=1.26.7",
+#     "unstructured[pdf]>=0.18.31",
+# ]
+# 完整安裝 (webapp + pdf)
+# all = [
+#     "anesthesia-exam[webapp]",
+#     "anesthesia-exam[pdf]",
+# ]
+
+[dependency-groups]
+dev = [
+    "pre-commit>=4.0",
+    "ruff>=0.9.0",
+    "pytest>=8.0",
+]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 120
+src = ["src"]
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle errors
+    "W",    # pycodestyle warnings
+    "F",    # pyflakes
+    "I",    # isort
+    "G",    # flake8-logging-format (抓 f-string logger)
+    "LOG",  # flake8-logging
+    "T20",  # flake8-print (抓 print())
+]
+ignore = [
+    "E501",   # line too long (已有 line-length)
+    "T201",   # print found — 暫時只在 src/ 下啟用
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["T20"]         # 測試允許 print
+"scripts/**" = ["T20", "E402"]  # 腳本允許 print + sys.path hack
+"src/infrastructure/crush/**" = ["G"]  # Crush 舊模組暫時豁免
+"src/presentation/streamlit/**" = ["E402"]  # Streamlit 需要 sys.path hack

@@ -1,9 +1,10 @@
 """Domain Entities"""
 
-from .message import Message, MessageRole
 from .conversation import Conversation
-from .question import Question, QuestionType, Difficulty, Source
 from .exam import Exam, ExamConfig, ExamStatus
+from .message import Message, MessageRole
+from .past_exam import Concept, PastExam, PastExamQuestion, QuestionPattern
+from .question import Difficulty, Question, QuestionType, Source
 
 __all__ = [
     "Message",
@@ -16,4 +17,8 @@ __all__ = [
     "Exam",
     "ExamConfig",
     "ExamStatus",
+    "PastExam",
+    "PastExamQuestion",
+    "Concept",
+    "QuestionPattern",
 ]

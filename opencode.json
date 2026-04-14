@@ -1,0 +1,77 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "ollama": {
+      "api": "http://172.18.11.101:30133/v1",
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Ollama (Local)",
+      "options": {
+        "baseURL": "http://172.18.11.101:30133/v1",
+        "apiKey": "ollama"
+      },
+      "models": {
+        "gemma3:27b": {
+          "name": "Gemma 3 27B",
+          "tool_call": true,
+          "temperature": true,
+          "attachment": false,
+          "reasoning": false,
+          "cost": {
+            "input": 0,
+            "output": 0
+          },
+          "limit": {
+            "context": 131072,
+            "output": 8192
+          }
+        },
+        "gemma2:27b": {
+          "name": "Gemma 2 27B",
+          "tool_call": true,
+          "temperature": true,
+          "attachment": false,
+          "reasoning": false,
+          "cost": {
+            "input": 0,
+            "output": 0
+          },
+          "limit": {
+            "context": 8192,
+            "output": 4096
+          }
+        },
+        "llama3.3:70b": {
+          "name": "Llama 3.3 70B",
+          "tool_call": true,
+          "temperature": true,
+          "attachment": false,
+          "reasoning": false,
+          "cost": {
+            "input": 0,
+            "output": 0
+          },
+          "limit": {
+            "context": 131072,
+            "output": 8192
+          }
+        }
+      }
+    }
+  },
+  "model": "github-copilot/gemini-3-flash-preview",
+  "mcp": {
+    "exam-generator": {
+      "type": "local",
+      "command": ["uv", "run", "python", "-m", "src.infrastructure.mcp.exam_server"],
+      "timeout": 30000
+    },
+    "asset-aware": {
+      "type": "local",
+      "command": ["uv", "--directory", "libs/asset-aware-mcp", "run", "python", "-m", "src.presentation.server"],
+      "environment": {
+        "DATA_DIR": "../../data"
+      },
+      "timeout": 60000
+    }
+  }
+}

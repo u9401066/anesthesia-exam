@@ -61,6 +61,64 @@ uv sync
 uv run streamlit run main.py
 ```
 
+### 重要：初始化子模組（asset-aware-mcp）
+
+`asset-aware-mcp` 為 Git submodule，若未初始化會導致 `ingest_documents` 無法使用。
+
+```bash
+# 第一次 clone（建議）
+git clone --recursive <repo-url>
+
+# 已 clone 專案時
+git submodule update --init --recursive
+```
+
+## Agent Provider 切換（Crush / OpenCode / Copilot SDK）
+
+Streamlit 現在是 UI 包裝層，底層 Agent 可切換：
+
+- `crush`（預設）
+- `opencode`（CLI 模式）
+- `copilot-sdk`（HTTP API 模式）
+
+透過環境變數設定：
+
+```bash
+# 選擇 provider
+export EXAM_AGENT_PROVIDER=crush
+
+# 可選：Crush 路徑（未設會嘗試用 PATH 的 crush）
+export EXAM_CRUSH_PATH=/usr/local/bin/crush
+
+# 可選：OpenCode 命令模板（需包含 {prompt}）
+export EXAM_OPENCODE_COMMAND='opencode run "{prompt}"'
+
+# 可選：Copilot SDK API endpoint
+export EXAM_COPILOT_SDK_ENDPOINT='http://localhost:8080/generate'
+export EXAM_COPILOT_SDK_TOKEN='your-token'
+```
+
+說明：
+
+- `EXAM_AGENT_PROVIDER=opencode` 時，會呼叫 `EXAM_OPENCODE_COMMAND`。
+- `EXAM_AGENT_PROVIDER=copilot-sdk` 時，會 POST 到 `EXAM_COPILOT_SDK_ENDPOINT`。
+- Sidebar 可即時切換 provider，並顯示連線狀態。
+
+## MCP ETL 流程（PDF → 索引）
+
+在 `📝 生成考題` 頁面已加入 ETL 區塊：
+
+1. 上傳 PDF
+2. 輸入教材標題
+3. 點擊 `執行 ETL（ingest_documents）`
+4. Agent 會呼叫 `asset-aware` 的 `ingest_documents`
+5. 成功後可在「參考教材（已索引）」下拉選單看到文件
+
+前提：
+
+- Provider 需支援 MCP 工具呼叫（目前建議使用 `crush`）
+- `libs/asset-aware-mcp` 必須有可執行內容（目錄不可為空）
+
 ### Crush Agent 設定
 
 ```bash
