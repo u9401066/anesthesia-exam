@@ -1,5 +1,25 @@
 # Decision Log
 
+## 2026-04-14
+
+### DEC-009: Heartbeat 改採 file-based job contract
+
+| 項目 | 內容 |
+|------|------|
+| **決策** | `HeartbeatService` 不直接呼叫 agent；改為把補題需求寫成 `data/jobs/*.json` |
+| **問題** | 使用者明確要求 heartbeat 產出的工作應讓外部 agent / OpenClaw 讀取，而非 UI 內直接執行 |
+| **解決方案** | heartbeat 分析 coverage gap / scope request 後輸出 JSON job，並由 CLI / UI 顯示 pending / done / error 狀態 |
+| **影響** | 新增 `scripts/run_heartbeat.py` 與 Streamlit 的 backlog 管理頁；job schema 需穩定且可被外部工具消費 |
+
+### DEC-010: Source 序列化必須保留完整結構
+
+| 項目 | 內容 |
+|------|------|
+| **決策** | `Question.source` 在 entity / repository / UI 之間一律使用 `Source.to_dict()` / `Source.from_dict()` |
+| **問題** | 舊的 page/line flatten 寫法只保留 legacy 欄位，會丟失 `stem_source` / `answer_source` / `explanation_sources` |
+| **解決方案** | 移除中途的扁平化轉換，改走完整 Source round-trip |
+| **影響** | 題庫精確來源 badge、來源詳情與後續審查 UI 才能正確依據真實來源資料運作 |
+
 ## 2026-02-05
 
 ### DEC-006: 流式生成實作方案
@@ -89,3 +109,4 @@
 | PDF 快取策略 | hash-based / mtime-based / 不快取 | 待討論 |
 | 圖片題處理 | PyMuPDF 抽取 / Marker 抽取 / vision model | 待討論 |
 | 來源驗證失敗處理 | 拒絕儲存 / 標記警告 / 人工審核 | 待討論 |
+| 2026-02-13 | 將 Streamlit 底層 Agent 從 Crush 單一綁定改為可插拔 Provider 架構（crush/opencode/copilot-sdk）。 | 降低單點依賴風險，讓 UI 成為可替換包裝層；可依環境與成本切換底層推理引擎，並保留既有 Crush + MCP 工作流相容性。 |
