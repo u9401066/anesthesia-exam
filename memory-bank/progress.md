@@ -2,6 +2,8 @@
 
 ## Done
 
+- `libs/asset-aware-mcp` 已完成 0.6.5 release：Python package、uv lock、VS Code extension metadata、CHANGELOG 與子模組 Memory Bank 已同步升版，並已推送 release commit `37068f2` 與 tag `v0.6.5`
+- release 過程中確認遠端已存在不同內容的 `v0.6.4` tag，因此沒有覆寫既有 tag，而是安全順推到 `0.6.5`
 - `libs/asset-aware-mcp` 已完成並發布大 PDF ingestion 強化：Marker 解析現在會在頁數超過 800 頁時自動啟用 chunking，遇到高圖片量 PDF 時自動關閉 figure extraction，避免大型文件解析時記憶體與輸出量失控
 - `libs/asset-aware-mcp` 已完成真正的 page-range ingestion：支援只 materialize 指定頁段的 `selected_pages.pdf`，並把 markdown / toc / table / image / marker 輸出頁碼 remap 回原始 PDF 頁碼，同時用 page-range scope 避免 `doc_id` collision
 - 上述 asset-aware 變更已提交並推送到子模組 repo `u9401066/asset-aware-mcp`（commit `7b1c6d5`），主 repo 也已更新 submodule pointer（commit `841298d`）
@@ -40,6 +42,7 @@
 
 ## Doing
 
+- 準備把主 repo submodule pointer 從 `7b1c6d5` 更新到 asset-aware-mcp release commit `37068f2`，讓上層正式指向 `v0.6.5`
 - 準備把新的 asset-aware `page_ranges` / auto chunking 能力往上接到正式教材 ingest 與 Web / agent 工作流
 - 準備將生成頁從 prompt 編排式整合進一步收斂到服務層 / pipeline tool 接線
 - 準備重 ingest 真實教材，讓正式出題可取得精確來源

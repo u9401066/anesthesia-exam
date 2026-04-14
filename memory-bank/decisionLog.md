@@ -2,6 +2,15 @@
 
 ## 2026-04-14
 
+### DEC-012: 已存在遠端 release tag 時不得重用版號，改順推下一個 patch
+
+| 項目 | 內容 |
+|------|------|
+| **決策** | 發現 `asset-aware-mcp` 遠端已存在不同內容的 `v0.6.4` tag 時，不覆寫既有 tag，改把當前 release 順推為 `v0.6.5` |
+| **問題** | 若直接 force-push 重寫既有 release tag，會破壞已對外發布的版本語意，也讓子模組 pointer、PyPI / extension metadata 與使用者安裝結果失去可追溯性 |
+| **解決方案** | 保留遠端既有 `v0.6.4`，將 large-PDF/page-range ingestion 這批新內容升版為 `0.6.5`，重新同步 package metadata、CHANGELOG 與 extension 釘版參數 |
+| **影響** | 主 repo、安裝指令與後續 release notes 都應以 `v0.6.5` 作為這批 page-range ingestion 修正的正式版本 |
+
 ### DEC-011: 大 PDF 採 subset + remap 策略，避免全本 ingestion 與頁碼失真
 
 | 項目 | 內容 |

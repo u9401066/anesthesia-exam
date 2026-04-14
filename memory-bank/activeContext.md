@@ -6,7 +6,7 @@
 
 ## Current Focus
 
-**2026-04-14 補充：`libs/asset-aware-mcp` 已完成並發布 large-PDF ingestion 強化。Marker parse 現在會在頁數超過 800 頁時自動 chunk，遇到高圖片量 PDF 時自動停用 figure extraction；另外也新增真正的 `page_ranges` ingestion，會先 materialize `selected_pages.pdf` 再把 subset-local page number remap 回原始 PDF，避免來源頁碼失真，並用 page-range scope 避免 `doc_id` collision。子模組 commit 已推到 `7b1c6d5`，主 repo submodule pointer 已更新到 `841298d`。**
+**2026-04-14 補充：`libs/asset-aware-mcp` 已正式發布 `v0.6.5`。本次 release 收斂 large-PDF auto strategy、真正的 `page_ranges` ingestion 與 page-scoped `doc_id` 修正；release commit 已推到 `37068f2`，tag `v0.6.5` 已存在遠端。過程中確認遠端已先存在不同內容的 `v0.6.4` tag，因此沒有覆寫舊 tag，而是安全順推到 `0.6.5`。主 repo 下一步只剩把 submodule pointer 更新到這個 release commit。**
 
 **2026-04-14 補充：已完成 reviewed-only / exam_track / scope request / heartbeat 這條 Web 治理切片。題庫資料模型現在支援 `exam_track`、`is_validated`、`validation_notes`；Streamlit 已補上 `📋 出題需求` 頁、題庫審查按鈕，以及 heartbeat / backlog 統計。Heartbeat 採 file-based contract，會把補題工作寫到 `data/jobs/*.json` 供外部 agent / OpenClaw 讀取。**
 
