@@ -1,8 +1,8 @@
 # 智慧考卷生成系統 - 完整規格書
 
 > 建立日期: 2026-02-03  
-> 最後更新: 2026-02-03  
-> 狀態: 需求確認中
+> 最後更新: 2026-04-14  
+> 狀態: 需求補充中（Web 驗收對齊）
 
 ---
 
@@ -71,7 +71,7 @@
 │          │                                                      │
 │          ▼                                                      │
 │   ┌─────────────┐                                               │
-│   │     UI      │ ←── Open Notebook 改造 / Chainlit             │
+│   │     UI      │ ←── Streamlit Web App（MVP）                  │
 │   │             │     - 考卷介面                                │
 │   │             │     - 作答介面                                │
 │   │             │     - 互動問答                                │
@@ -254,6 +254,43 @@
 | 學習路徑推薦 | P2 | 根據弱點推薦學習順序 |
 | Audio Overview | P3 | 語音摘要（類似 NotebookLM） |
 
+### 2.7 Web 需求補充（2026-04-14）
+
+本節用來把目前的 Streamlit Web MVP 與最新產品需求對齊，避免把底層能力誤判為前台功能已完整交付。
+
+#### 2.7.1 角色定義
+
+| 角色 | 主要目標 | 最低需要能力 |
+| ---- | -------- | ------------ |
+| 使用者 | 快速練習、指定教材組卷、提出補題需求 | 篩題、作答、建立考卷草稿、送出範圍提案 |
+| 管理者 | 審查題目品質、決定哪些題目可公開使用 | 檢視題目、修改題目、標記通過/退回、查看來源 |
+| 後台 Agent | 根據教材、考古題與模板持續補強題庫 | 讀取 blueprint / reference pack / template library、執行 backfill |
+
+#### 2.7.2 題庫治理與篩選欄位
+
+為了支援不同考試用途與審查流程，題目至少需要以下 metadata：
+
+| 欄位 | 用途 |
+| ---- | ---- |
+| `difficulty` | 難度篩選與配比 |
+| `topics` | 知識點 / 主題標籤 |
+| `review_status` | `draft / reviewed / rejected`，供管理者與使用者篩選 |
+| `source_mode` | `precise / preview / imported_past_exam`，區分正式來源與草稿 |
+| `origin_type` | `textbook / past_exam / mixed / manual` |
+| `exam_track` | `麻專 / ITE / PGY / clerk / 麻醉專科護理師國考 / 再進修` 等正式考試分類 |
+| `audience` | `clerk / PGY / resident / board candidate / CRNA` 等使用情境 |
+
+#### 2.7.3 六項需求驗收矩陣
+
+| 需求 | 最低可接受行為 | 目前狀態 | 說明 |
+| ---- | -------------- | -------- | ---- |
+| 1. 使用者可以快速寫題目 | 可從題庫或剛生成的題組一鍵開始作答，提交後即時計分並查看詳解/來源 | 已達基本需求 | 適合短回合練習與錯題複習 |
+| 2. 使用者可以指定資料跟範圍去出一份考卷來寫 | 可指定教材、章節、題數、難度、主題並產生一輪可直接作答的題組 | 部分達成 | 已有教材/章節選擇式生成，但正式 `exam session / blueprint` 持久化仍待補 |
+| 3. 使用者可以發布希望增加出題的範圍，後台 Agent 在 heartbeat check 時補充題庫 | 使用者可提交 `scope request`，系統保存 backlog，背景 Agent 定期檢查缺口並執行補題 pipeline | 部分達成 | Web 已有 proposal UI、backlog 持久化與 heartbeat job 寫檔；真正 scheduler 與外部 agent 回寫 closed-loop 仍待補 |
+| 4. 管理者可以審查題目，使用者可選擇只用審查過的題目（含考古題） | 管理者可標記 reviewed/rejected，前台練習/組卷可選 `validated_only`，考古題能進同一審查流程 | 已達基本需求 | 題庫管理頁已可審查題目，前台練習與題庫頁也已支援 reviewed-only 篩選；考古題仍待全面納入同一流程 |
+| 5. 後台 Agent 會有考古題跟題型範本可以取得 | Agent 可讀 past-exam blueprint、reference pack、題型模板庫，再依指定考試型態生成 | 後台雛形已具備 | 考古題抽取/分類/blueprint 已有後台骨架，但尚未成為 Web 可操作的能力 |
+| 6. 使用者要可以根據題目 tag 與考試類型來選題 | 題庫需支援正式 taxonomy，前台可依難度、主題、考試類型、來源類型多維篩選 | 部分達成 | `exam_track` 已成為 first-class 欄位並接上前台篩選；更完整的 audience / origin_type facets 仍待補 |
+
 ---
 
 ## 3. 技術架構
@@ -266,7 +303,7 @@
 │  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐            │
 │  │ 考卷生成介面 │  │ 作答練習介面 │  │ 互動問答介面 │            │
 │  └──────────────┘  └──────────────┘  └──────────────┘            │
-│                    Open Notebook 改造 / Chainlit                  │
+│                    Streamlit Web App（目前 MVP）                  │
 └──────────────────────────────────────────────────────────────────┘
                               │
                               ▼
@@ -279,8 +316,8 @@
 ┌──────────────┐    ┌──────────────┐    ┌──────────────┐
 │   Agent      │    │   Document   │    │   Database   │
 │   Service    │    │   Service    │    │              │
-│              │    │              │    │  (PostgreSQL │
-│  Copilot SDK │    │  GraphRAG/   │    │   + Vector)  │
+│              │    │              │    │ (SQLite 現行 / │
+│  Copilot SDK │    │  GraphRAG/   │    │ 向量庫後續擴充)│
 │  / OpenCode  │    │  LightRAG    │    │              │
 └──────────────┘    └──────────────┘    └──────────────┘
         │                   │
@@ -1157,19 +1194,24 @@ class ExamGenerator:
 
 ### 9.1 當前實作狀態
 
-> **⚠️ 重要警告**：目前來源追蹤是 AI 編造的假資料，尚未串接真正的 PDF 解析工具。
+> **⚠️ 重要說明**：目前正式來源追蹤只對具備 Marker blocks 的已索引教材成立；若文件缺少 Marker blocks，系統只能走 preview 草稿模式，不可正式入庫。`consult_knowledge_graph` 也仍受本地 LLM 服務可用性影響。
 
 | 功能 | 狀態 | 說明 |
 | ---- | ---- | ---- |
-| SQLite 持久化 | ✅ 已完成 | `data/questions.db` |
-| Repository Pattern | ✅ 已完成 | `SqliteQuestionRepository` |
-| Audit 追蹤 | ✅ 已完成 | `created_at`, `updated_at`, `version` |
-| MCP Server | ✅ 已完成 | 13 個工具 |
-| Streamlit 三欄布局 | ✅ 已完成 | Sidebar + Main(2/3) + Chat(1/3) |
-| 來源追蹤結構 | ✅ 已完成 | `Source` + `SourceLocation` 資料結構 |
-| PDF 解析 MCP | ❌ 未實作 | 需要建立 |
-| 真正的來源追蹤 | ❌ 未實作 | 需要串接 PDF 工具 |
-| 來源驗證機制 | ❌ 未實作 | 需要實作 |
+| SQLite 持久化 | ✅ 已完成 | 題庫、審計與考古題資料已使用 SQLite |
+| Repository Pattern | ✅ 已完成 | Question / PastExam repository 已落地 |
+| Audit / Validation 資料層 | ✅ 已完成 | 已有 `is_validated`、audit log 與 `exam_mark_validated` |
+| Streamlit Web 工作台 | ✅ 已完成 | 已有生成、作答、題庫、統計與右側 Chat |
+| 快速作答流程 | ✅ 已完成 | 可從題庫或剛生成結果立即開始作答、批改、看詳解 |
+| 教材 / 章節選擇式生成 | ✅ 已完成 | 可選已索引教材、指定章節、難度、主題與題數 |
+| 正式 / preview 來源模式分流 | ✅ 已完成 | 缺少精確來源時會阻擋正式模式，降級為 preview 草稿 |
+| 生成後人工審閱與編輯 | ✅ 已完成 | 生成結果可編輯後再存入題庫 |
+| 題庫搜尋 / 難度 / 主題篩選 | ✅ 已完成 | 可搜尋、篩選並把結果轉成練習 |
+| 考古題抽取 / blueprint 後台骨架 | 🚧 進行中 | MCP / service 已可抽取、分類、建立 blueprint，但尚未完整進入 Web |
+| `validated_only` 前台篩選 | ✅ 已完成 | 練習頁與題庫管理頁都可只看 / 只用已審查題目 |
+| 使用者範圍提案 / backlog | ✅ 已完成 | 已有 `scope request` UI、SQLite 持久化與管理狀態 |
+| heartbeat 自動補題 | 🚧 進行中 | 已能分析缺口並寫出外部 agent 可讀的 job 檔；scheduler 與 done/error 回寫仍待補 |
+| 考試類型 taxonomy | 🚧 進行中 | `exam_track` 已落地到資料層與前台篩選；更完整的 audience / origin_type taxonomy 仍待補 |
 
 ### 9.2 真正的出題流程設計
 

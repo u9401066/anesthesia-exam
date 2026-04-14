@@ -4,47 +4,61 @@ Question Entity - 考題實體
 定義單一考題的結構，包含題目、選項、答案、詳解和來源追蹤。
 """
 
+import uuid
 from dataclasses import dataclass, field
+from datetime import datetime
 from enum import Enum
 from typing import Optional
-from datetime import datetime
-import uuid
 
 
 class QuestionType(str, Enum):
     """題型枚舉"""
-    SINGLE_CHOICE = "single_choice"      # 單選題
+
+    SINGLE_CHOICE = "single_choice"  # 單選題
     MULTIPLE_CHOICE = "multiple_choice"  # 多選題
-    TRUE_FALSE = "true_false"            # 是非題
-    FILL_IN_BLANK = "fill_in_blank"      # 填空題
-    SHORT_ANSWER = "short_answer"        # 簡答題
-    ESSAY = "essay"                      # 問答題
-    IMAGE_BASED = "image_based"          # 圖片題
+    TRUE_FALSE = "true_false"  # 是非題
+    FILL_IN_BLANK = "fill_in_blank"  # 填空題
+    SHORT_ANSWER = "short_answer"  # 簡答題
+    ESSAY = "essay"  # 問答題
+    IMAGE_BASED = "image_based"  # 圖片題
 
 
 class Difficulty(str, Enum):
     """難度枚舉"""
+
     EASY = "easy"
     MEDIUM = "medium"
     HARD = "hard"
+
+
+class ExamTrack(str, Enum):
+    """考試類型 / 軌道"""
+
+    ITE = "ite"  # In-Training Exam
+    PGY = "pgy"  # 住院醫師訓練
+    CLERK = "clerk"  # 實習醫學生
+    SPECIALIST = "specialist"  # 專科考試
+    BOARD = "board"  # 國考 / 甄審
+    CUSTOM = "custom"  # 自訂
 
 
 @dataclass
 class SourceLocation:
     """
     精確來源位置
-    
+
     支援多層級來源追蹤：
     - 題幹來源（整題概念來自哪裡）
     - 正確選項來源（正確答案的依據）
     - 詳解來源（解釋的參考）
     """
-    page: int                            # 頁碼 (1-based)
-    line_start: int                      # 起始行號 (1-based)
-    line_end: int                        # 結束行號 (1-based)
+
+    page: int  # 頁碼 (1-based)
+    line_start: int  # 起始行號 (1-based)
+    line_end: int  # 結束行號 (1-based)
     bbox: Optional[tuple[float, float, float, float]] = None  # 位置 (x0, y0, x1, y1)
-    original_text: str = ""              # 原文引用
-    
+    original_text: str = ""  # 原文引用
+
     def to_dict(self) -> dict:
         return {
             "page": self.page,
@@ -53,7 +67,7 @@ class SourceLocation:
             "bbox": list(self.bbox) if self.bbox else None,
             "original_text": self.original_text,
         }
-    
+
     @classmethod
     def from_dict(cls, data: dict) -> "SourceLocation":
         return cls(
@@ -69,7 +83,7 @@ class SourceLocation:
 class Source:
     """
     來源追蹤 - 支援精確的教材引用
-    
+
     設計理念：
     - document: 教材名稱（如 "Miller's Anesthesia 9th"）
     - chapter: 章節編號（如 "Ch.15"）
@@ -77,32 +91,33 @@ class Source:
     - stem_source: 題幹概念來源（主要知識點）
     - answer_source: 正確選項來源（答案依據）
     - explanation_sources: 詳解參考來源（可多個）
-    
+
     ⚠️ 重要：這些欄位必須由 PDF 解析工具填充，不可 AI 編造！
     """
-    document: str                        # 教材名稱
-    chapter: Optional[str] = None        # 章節編號
-    section: Optional[str] = None        # 小節標題
-    
+
+    document: str  # 教材名稱
+    chapter: Optional[str] = None  # 章節編號
+    section: Optional[str] = None  # 小節標題
+
     # 精確來源位置
-    stem_source: Optional[SourceLocation] = None    # 題幹概念來源
+    stem_source: Optional[SourceLocation] = None  # 題幹概念來源
     answer_source: Optional[SourceLocation] = None  # 正確選項來源
     explanation_sources: list["SourceLocation"] = field(default_factory=list)  # 詳解參考
-    
+
     # 圖片來源（如果是圖片題）
-    figure_id: Optional[str] = None      # 圖片 ID
-    figure_caption: Optional[str] = None # 圖說
-    figure_page: Optional[int] = None    # 圖片所在頁碼
-    
+    figure_id: Optional[str] = None  # 圖片 ID
+    figure_caption: Optional[str] = None  # 圖說
+    figure_page: Optional[int] = None  # 圖片所在頁碼
+
     # 舊版相容欄位（已棄用，保留向後相容）
-    page: Optional[int] = None           # [DEPRECATED] 使用 stem_source.page
-    lines: Optional[str] = None          # [DEPRECATED] 使用 stem_source.line_start/end
+    page: Optional[int] = None  # [DEPRECATED] 使用 stem_source.page
+    lines: Optional[str] = None  # [DEPRECATED] 使用 stem_source.line_start/end
     original_text: Optional[str] = None  # [DEPRECATED] 使用 stem_source.original_text
-    
+
     # 來源驗證狀態
-    is_verified: bool = False            # 是否經過人工驗證
-    pdf_hash: Optional[str] = None       # PDF 檔案 hash（確保來源一致性）
-    
+    is_verified: bool = False  # 是否經過人工驗證
+    pdf_hash: Optional[str] = None  # PDF 檔案 hash（確保來源一致性）
+
     def to_dict(self) -> dict:
         return {
             "document": self.document,
@@ -118,30 +133,23 @@ class Source:
             "pdf_hash": self.pdf_hash,
             # 向後相容
             "page": self.page or (self.stem_source.page if self.stem_source else None),
-            "lines": self.lines or (
-                f"{self.stem_source.line_start}-{self.stem_source.line_end}" 
-                if self.stem_source else None
-            ),
-            "original_text": self.original_text or (
-                self.stem_source.original_text if self.stem_source else None
-            ),
+            "lines": self.lines
+            or (f"{self.stem_source.line_start}-{self.stem_source.line_end}" if self.stem_source else None),
+            "original_text": self.original_text or (self.stem_source.original_text if self.stem_source else None),
         }
-    
+
     @classmethod
     def from_dict(cls, data: dict) -> "Source":
         stem = None
         if data.get("stem_source"):
             stem = SourceLocation.from_dict(data["stem_source"])
-        
+
         answer = None
         if data.get("answer_source"):
             answer = SourceLocation.from_dict(data["answer_source"])
-        
-        explanations = [
-            SourceLocation.from_dict(s) 
-            for s in data.get("explanation_sources", [])
-        ]
-        
+
+        explanations = [SourceLocation.from_dict(s) for s in data.get("explanation_sources", [])]
+
         return cls(
             document=data.get("document", ""),
             chapter=data.get("chapter"),
@@ -165,38 +173,45 @@ class Source:
 class Question:
     """
     考題實體
-    
+
     核心不變量：
     - 單選題必須有且只有一個正確答案
     - 多選題至少有一個正確答案
     - 每題必須有題目文字
     """
-    
+
     # 識別
     id: str = field(default_factory=lambda: str(uuid.uuid4()))
-    
+
     # 內容
-    question_text: str = ""               # 題目
+    question_text: str = ""  # 題目
     options: list[str] = field(default_factory=list)  # 選項 (A, B, C, D...)
-    correct_answer: str = ""              # 正確答案
-    
+    correct_answer: str = ""  # 正確答案
+
     # 詳解
-    explanation: str = ""                 # 解題思路
-    source: Optional[Source] = None       # 來源追蹤
-    
+    explanation: str = ""  # 解題思路
+    source: Optional[Source] = None  # 來源追蹤
+
     # 分類
     question_type: QuestionType = QuestionType.SINGLE_CHOICE
     difficulty: Difficulty = Difficulty.MEDIUM
     topics: list[str] = field(default_factory=list)  # 知識點標籤
-    
+
+    # 考試類型
+    exam_track: Optional["ExamTrack"] = None  # 適用考試類型
+
     # 配置
-    points: int = 1                       # 配分
-    image_path: Optional[str] = None      # 圖片路徑
-    
+    points: int = 1  # 配分
+    image_path: Optional[str] = None  # 圖片路徑
+
+    # 審查狀態
+    is_validated: bool = False  # 是否已審查通過
+    validation_notes: Optional[str] = None  # 審查備註
+
     # 元數據
     created_at: datetime = field(default_factory=datetime.now)
-    created_by: str = "agent"             # 生成者
-    
+    created_by: str = "agent"  # 生成者
+
     def to_dict(self) -> dict:
         """轉換為字典格式"""
         return {
@@ -205,33 +220,26 @@ class Question:
             "options": self.options,
             "correct_answer": self.correct_answer,
             "explanation": self.explanation,
-            "source": {
-                "document": self.source.document,
-                "page": self.source.page,
-                "lines": self.source.lines,
-                "original_text": self.source.original_text,
-            } if self.source else None,
+            "source": self.source.to_dict() if self.source else None,
             "question_type": self.question_type.value,
             "difficulty": self.difficulty.value,
             "topics": self.topics,
+            "exam_track": self.exam_track.value if self.exam_track else None,
             "points": self.points,
             "image_path": self.image_path,
+            "is_validated": self.is_validated,
+            "validation_notes": self.validation_notes,
             "created_at": self.created_at.isoformat(),
             "created_by": self.created_by,
         }
-    
+
     @classmethod
     def from_dict(cls, data: dict) -> "Question":
         """從字典建立實體"""
         source = None
         if data.get("source"):
-            source = Source(
-                document=data["source"].get("document", ""),
-                page=data["source"].get("page"),
-                lines=data["source"].get("lines"),
-                original_text=data["source"].get("original_text"),
-            )
-        
+            source = Source.from_dict(data["source"])
+
         return cls(
             id=data.get("id", str(uuid.uuid4())),
             question_text=data.get("question_text", data.get("question", "")),
@@ -242,29 +250,32 @@ class Question:
             question_type=QuestionType(data.get("question_type", "single_choice")),
             difficulty=Difficulty(data.get("difficulty", "medium")),
             topics=data.get("topics", []),
+            exam_track=ExamTrack(data["exam_track"]) if data.get("exam_track") else None,
             points=data.get("points", 1),
             image_path=data.get("image_path"),
+            is_validated=bool(data.get("is_validated", False)),
+            validation_notes=data.get("validation_notes"),
             created_by=data.get("created_by", "agent"),
         )
-    
+
     def format_display(self) -> str:
         """格式化顯示用"""
         lines = [f"**{self.question_text}**", ""]
-        
+
         for i, opt in enumerate(self.options):
             prefix = chr(65 + i)  # A, B, C, D...
             lines.append(f"{prefix}. {opt}")
-        
+
         return "\n".join(lines)
-    
+
     def format_with_answer(self) -> str:
         """格式化顯示（含答案）"""
         display = self.format_display()
         display += f"\n\n**答案:** {self.correct_answer}"
-        
+
         if self.explanation:
             display += f"\n\n**解析:** {self.explanation}"
-        
+
         if self.source:
             display += f"\n\n**來源:** {self.source.document}"
             if self.source.chapter:
@@ -272,24 +283,24 @@ class Question:
                 if self.source.section:
                     display += f" - {self.source.section}"
                 display += ")"
-            
+
             # 顯示精確來源
             if self.source.stem_source:
                 src = self.source.stem_source
                 display += f"\n  - 題幹: P.{src.page}, 第 {src.line_start}-{src.line_end} 行"
                 if src.original_text:
                     text = src.original_text[:100] + "..." if len(src.original_text) > 100 else src.original_text
-                    display += f"\n    > \"{text}\""
-            
+                    display += f'\n    > "{text}"'
+
             if self.source.answer_source:
                 src = self.source.answer_source
                 display += f"\n  - 答案依據: P.{src.page}, 第 {src.line_start}-{src.line_end} 行"
-            
+
             # 向後相容舊格式
             elif self.source.page:
                 display += f" (P.{self.source.page}"
                 if self.source.lines:
                     display += f", 第 {self.source.lines} 行"
                 display += ")"
-        
+
         return display
