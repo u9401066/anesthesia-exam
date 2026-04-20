@@ -5,11 +5,14 @@
 **統一使用 8501 端口**
 
 ```bash
-# 正確啟動方式
-uv run streamlit run src/presentation/streamlit/app.py --server.port 8501
+# 正確啟動方式（推薦）
+./scripts/run_web.sh
 
-# 或使用專案腳本
-uv run python -m streamlit run src/presentation/streamlit/app.py --server.port 8501
+# 或使用 Python 入口
+uv run python main.py
+
+# 部署為 systemd service
+./scripts/install_systemd_service.sh
 ```
 
 ## 禁止使用的端口
@@ -25,14 +28,17 @@ uv run python -m streamlit run src/presentation/streamlit/app.py --server.port 8
 
 如果遇到端口被占用：
 
-```powershell
-# 停止所有 Python 進程
-Get-Process -Name "python*" -ErrorAction SilentlyContinue | Stop-Process -Force
+```bash
+# 查看 8501 是否已有 Streamlit 回應
+curl -I http://127.0.0.1:8501
 
-# 檢查端口狀態
-netstat -ano | Select-String "8501"
+# 停掉舊的 Streamlit 進程（若確認可以安全重啟）
+pkill -f "streamlit run src/presentation/streamlit/app.py"
 ```
 
 ## Streamlit 配置
 
-專案使用 `.streamlit/config.toml` 進行配置（如需要可建立）。
+正式部署時優先使用下列檔案，而不是臨時手打一串 CLI 參數：
+
+- `scripts/run_web.sh`
+- `deploy/systemd/anesthesia-exam-web.service`

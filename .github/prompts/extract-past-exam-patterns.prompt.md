@@ -25,8 +25,13 @@ tools: ["exam-generator", "asset-aware"]
 
 ### Phase 2: 匯入考古題文件
 如果是掃描 PDF：
-- `parse_pdf_structure(pdf_path="...")`
-- `ingest_documents([...], use_marker=true)` 取得 `doc_id`
+- `parse_pdf_structure(pdf_path="...", page_ranges=["1-120"], marker_max_pages_per_chunk=100, extract_figures=false)`
+- `ingest_documents([...], use_marker=true, page_ranges=["1-120"], marker_max_pages_per_chunk=100, extract_figures=false)` 取得 `doc_id`
+
+大檔策略建議：
+- 先用 `page_ranges` 只處理需要的頁段，避免整本重跑。
+- 若 PDF 很大（或圖片很多），優先設定 `marker_max_pages_per_chunk=50~120` 並把 `extract_figures=false`。
+- 若是小檔且要最高保真，可維持 `marker_max_pages_per_chunk=0`（自動/整本）與 `extract_figures=true`。
 
 如果已經拿到 `doc_id`，優先直接呼叫：
 - `exam_run_past_exam_extraction(doc_id="...", run_id="...")`

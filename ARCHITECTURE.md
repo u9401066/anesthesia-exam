@@ -2,7 +2,7 @@
 
 智慧考卷生成系統 - 架構說明文檔
 
-> 最後更新: 2026-02-03
+> 最後更新: 2026-04-15
 
 ---
 
@@ -32,91 +32,55 @@
 
 ## 核心模組架構
 
-### 1. Question Source 模組（題目來源）
+### 1. Web 工作台
+
+目前 Web 介面集中在單一 Streamlit 工作台，由 `src/presentation/streamlit/app.py` 管理五個主頁面：
+
+- `📝 生成考題`：教材索引、生成設定、來源模式分流、生成後審閱
+- `✍️ 作答練習`：從題庫或剛生成題組立即開始練習與批改
+- `📚 題庫管理`：搜尋 / 篩選 / reviewed-only / 切換成練習
+- `📋 出題需求`：收集 backlog，並可觸發 heartbeat job emission
+- `📊 統計`：查看題庫規模、難度分布與高頻主題
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                    Question Source Module                        │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                  │
-│   ┌─────────────────────┐    ┌─────────────────────┐            │
-│   │  Streaming Source   │    │   Batch Source      │            │
-│   │  (即時流式生成)      │    │   (題庫批次取得)     │            │
-│   ├─────────────────────┤    ├─────────────────────┤            │
-│   │ ■ Crush Agent 調用   │    │ ■ JSON 檔案讀取     │            │
-│   │ ■ SSE 串流輸出       │    │ ■ SQLite/PostgreSQL │            │
-│   │ ■ 即時顯示題目       │    │ ■ 隨機/篩選取題     │            │
-│   │ ■ 進度條追蹤        │    │ ■ 一次載入全部      │            │
-│   └──────────┬──────────┘    └──────────┬──────────┘            │
-│              │                          │                       │
-│              └────────────┬─────────────┘                       │
-│                           ▼                                     │
-│              ┌─────────────────────┐                            │
-│              │  Unified Interface  │                            │
-│              │  QuestionProvider   │                            │
-│              └─────────────────────┘                            │
-└─────────────────────────────────────────────────────────────────┘
+│                    Streamlit Workbench                           │
+├──────────────────┬─────────────────────────────┬────────────────┤
+│ Sidebar          │ Main Workspace              │ Shared Context │
+│ - page nav       │ - generate                  │ - agent status │
+│ - provider/model │ - practice                  │ - chat         │
+│ - bank summary   │ - question bank             │ - ETL result   │
+│                  │ - scope requests            │                │
+│                  │ - statistics                │                │
+└──────────────────┴─────────────────────────────┴────────────────┘
 ```
 
-#### Streaming Source (流式來源)
+### 2. Agent / MCP 整合
 
-```python
-class StreamingQuestionSource:
-    """Crush Agent 即時生成題目"""
-    
-    async def generate(self, config: ExamConfig) -> AsyncGenerator[Question, None]:
-        """流式生成題目，逐題 yield"""
-        async for chunk in self.crush_client.stream(prompt):
-            question = self.parser.parse_streaming(chunk)
-            if question.is_complete:
-                yield question
-```
-
-#### Batch Source (批次來源)
-
-```python
-class BatchQuestionSource:
-    """從題庫批次取得題目"""
-    
-    def fetch(self, filters: QuestionFilters, limit: int) -> List[Question]:
-        """一次取得所有題目"""
-        return self.repository.find_by_filters(filters, limit)
-```
-
----
-
-### 2. Crush Agent 整合
+Web 不直接綁死單一 Agent，而是透過 `src/infrastructure/agent/provider.py` 抽象出 provider 切換層。
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                      Crush Integration                           │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                  │
-│   Streamlit UI                                                   │
-│        │                                                        │
-│        ▼                                                        │
-│   ┌─────────────────┐                                           │
-│   │  CrushClient    │  Python wrapper for Crush CLI             │
-│   │  ─ streaming.py │  subprocess + StreamingParser             │
-│   └────────┬────────┘                                           │
-│            │                                                    │
-│            ▼ (subprocess call)                                  │
-│   ┌─────────────────────────────────────────────────────────┐   │
-│   │  D:\workspace260203\crush\crush.exe                      │   │
-│   │  ─ config: crush.json                                   │   │
-│   │  ─ skills_paths: [".claude/skills"]                     │   │
-│   │  ─ MCP: exam-generator server                           │   │
-│   └────────┬────────────────────────────────────────────────┘   │
-│            │                                                    │
-│            ▼ (MCP protocol)                                     │
-│   ┌─────────────────┐                                           │
-│   │  MCP Exam Server │  src/infrastructure/mcp/exam_server.py  │
-│   │  ─ save_question │                                          │
-│   │  ─ list_questions│                                          │
-│   │  ─ get_question  │                                          │
-│   │  ─ delete        │                                          │
-│   └─────────────────┘                                           │
-└─────────────────────────────────────────────────────────────────┘
+│                  Streamlit app.py                               │
+└──────────────────────────────┬──────────────────────────────────┘
+                               │ create_agent_provider()
+                               ▼
+┌─────────────────────────────────────────────────────────────────┐
+│            Agent Provider Abstraction                           │
+├────────────────────┬───────────────────┬───────────────────────┤
+│ Crush CLI          │ OpenCode CLI      │ Copilot SDK HTTP      │
+└─────────┬──────────┴─────────┬─────────┴───────────┬───────────┘
+          │                    │                     │
+          ▼                    ▼                     ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                      MCP Tooling                                 │
+├──────────────────────────────┬──────────────────────────────────┤
+│ exam-generator               │ asset-aware-mcp                 │
+│ - question CRUD / audit      │ - ingest_documents              │
+│ - validation / stats         │ - search_source_location        │
+│ - past exam extraction       │ - consult_knowledge_graph       │
+│ - blueprint scaffolding      │ - section / asset retrieval     │
+└──────────────────────────────┴──────────────────────────────────┘
 ```
 
 ---
@@ -124,6 +88,13 @@ class BatchQuestionSource:
 ### 3. 大型 PDF 處理架構
 
 > ⚠️ **挑戰**: Miller's Anesthesia 9th (~3500頁, ~500MB+)
+
+目前大檔策略已經上浮到 Web ETL UI，可直接控制：
+
+- `page_ranges`：先聚焦特定頁段，避免一開始整本 ingest
+- `marker_max_pages_per_chunk`：控制大檔分塊頁數
+- `extract_figures`：圖像很多時可先關閉，只保留文字 / blocks
+- `use_marker`：正式來源追蹤必須開啟，否則會落到 preview-only
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
@@ -215,149 +186,84 @@ class LargeFileProcessor:
 
 ```
 src/
-├── domain/                    # 核心領域 (無外部依賴)
+├── domain/                      # 核心領域模型與 repository interface
 │   ├── entities/
-│   │   ├── question.py       # Question, QuestionType, Difficulty
-│   │   ├── exam.py           # Exam, ExamConfig
-│   │   ├── source.py         # Source (page, lines, text)
-│   │   └── conversation.py   # Conversation, Message
-│   ├── value_objects/
-│   │   └── source_citation.py
-│   └── repositories/
-│       └── question_repository.py  # Abstract interface
+│   ├── repositories/
+│   └── value_objects/
 │
-├── application/               # 應用層 (用例編排)
-│   ├── services/
-│   │   ├── question_source_service.py   # Streaming + Batch
-│   │   ├── exam_generation_service.py   # 出題流程
-│   │   └── grading_service.py           # 批改服務
-│   └── use_cases/
-│       ├── generate_exam.py
-│       ├── answer_question.py
-│       └── grade_exam.py
+├── application/                 # 用例協調 / service orchestration
+│   └── services/
+│       ├── heartbeat_service.py
+│       └── past_exam_extraction_service.py
 │
-├── infrastructure/            # 基礎設施 (外部依賴)
-│   ├── crush/
-│   │   ├── client.py         # Crush CLI wrapper
-│   │   └── streaming.py      # SSE streaming parser
+├── infrastructure/              # 外部整合與持久化
+│   ├── agent/
+│   │   └── provider.py         # crush / opencode / copilot-sdk abstraction
 │   ├── mcp/
-│   │   └── exam_server.py    # MCP exam tools
+│   │   └── exam_server.py      # exam-generator MCP tools
 │   ├── persistence/
-│   │   ├── json_repository.py
-│   │   └── sqlite_repository.py
-│   └── pdf/
-│       ├── large_file_processor.py  # 大檔案處理
-│       └── chunker.py               # 原子化切分
+│   ├── crush/
+│   └── logging/
 │
-└── presentation/              # 呈現層
-    └── streamlit/
-        ├── app.py            # 主程式入口
-        ├── layouts/
-        │   └── three_panel.py  # 三欄佈局
-        ├── components/
-        │   ├── sidebar.py      # 左側欄
-        │   ├── exam_area.py    # 中央考題區
-        │   └── chat_panel.py   # 右側對話區
-        └── pages/
-            ├── home.py
-            ├── generate.py
-            └── practice.py
+└── presentation/
+        └── streamlit/
+                └── app.py              # Web 工作台入口
 ```
 
 ---
 
-### 5. Skills 架構
+### 5. 核心資料流
+
+#### 5.1 教材索引 / ETL
 
 ```
-.claude/skills/
-├── 主編排器
-│   └── exam-orchestrator/     # 完整出題流程編排
-│
-├── 知識處理層
-│   ├── knowledge-indexer/     # PDF 解析與 RAG 索引
-│   ├── scope-analyzer/        # 範圍分析
-│   └── knowledge-extractor/   # 概念抽取
-│
-├── 出題生成層
-│   ├── mcq-generator/         # 選擇題
-│   ├── essay-generator/       # 問答題
-│   ├── question-set-generator/# 題組題
-│   └── image-question-generator/ # 圖片題
-│
-├── 品質控制層
-│   ├── question-validator/    # 題目驗證
-│   ├── difficulty-classifier/ # 難度分類
-│   ├── duplicate-checker/     # 重複檢查
-│   └── source-tracker/        # 來源追蹤
-│
-├── 考古題層
-│   ├── past-exam-analyzer/    # 考古題分析
-│   └── past-exam-matcher/     # 考古題比對
-│
-└── 輸出層
-    ├── explanation-generator/ # 詳解生成
-    ├── exam-assembler/        # 試卷組裝
-    └── export-formatter/      # 匯出格式
+上傳 PDF
+    → Streamlit ETL UI
+    → Agent provider.run(prompt)
+    → asset-aware ingest_documents
+    → data/ 下產生 manifest / blocks / assets
+    → 已索引教材回填到生成頁
 ```
 
----
-
-### 6. Memory Bank
-
-| 文件 | 用途 |
-|------|------|
-| `activeContext.md` | 當前工作焦點 |
-| `progress.md` | 進度追蹤 |
-| `decisionLog.md` | 決策記錄 |
-| `productContext.md` | 專案上下文 |
-| `projectBrief.md` | 專案簡介 |
-| `systemPatterns.md` | 系統模式 |
-| `architect.md` | 架構設計 |
-
----
-
-## 資料流
-
-### 流式生成流程
+#### 5.2 生成與審閱
 
 ```
-1. 用戶設定出題參數 (Sidebar)
-2. 點擊「開始生成」
-3. StreamingQuestionSource.generate()
-4. Crush Agent 收到 prompt
-5. Crush 載入相關 Skills
-6. 逐題生成並 yield
-7. UI 即時顯示進度
-8. 完成後儲存到題庫
+選教材 / 章節 / 題數 / 難度
+    → Agent provider 生成候選題
+    → Web 顯示 preview 或 precise source badge
+    → 人工編輯 / 審閱
+    → SQLite 題庫持久化
 ```
 
-### 題庫作答流程
+#### 5.3 練習與題庫治理
 
 ```
-1. 用戶從題庫選擇範圍
-2. BatchQuestionSource.fetch()
-3. 一次載入所有題目
-4. 用戶作答
-5. 提交批改
-6. 顯示詳解與來源
+題庫篩選
+    → reviewed-only / topic / difficulty / exam_track
+    → 抽題進入作答練習
+    → 提交後即時計分
+    → 查看詳解與來源
 ```
 
----
-
-## Crush Skill 觸發機制
-
-Crush 透過 [Agent Skills](https://agentskills.io/) 標準觸發 Skills：
-
-1. **自動檢測**：Crush 解析 `.claude/skills/*/SKILL.md` 的 frontmatter
-2. **關鍵詞匹配**：根據 `description` 欄位的觸發詞匹配
-3. **載入執行**：匹配成功後載入完整 Skill 內容
-
-**範例觸發**：
+#### 5.4 Heartbeat 補題閉環
 
 ```
-用戶: "生成 10 題選擇題"
-       ↓
-Crush 解析 → 匹配 "選擇題" 觸發詞
+scope request backlog
+    → HeartbeatService 分析缺口
+    → data/jobs/*.json
+    → 外部 agent 讀取 job 補題
+    → 題目回存 SQLite / job 狀態回寫
+```
+
+### 6. 部署與啟動
+
+目前正式啟動入口已統一為：
+
+- `scripts/run_web.sh`
+- `main.py`（走目前 Python interpreter 的 `python -m streamlit`）
+- `deploy/systemd/anesthesia-exam-web.service`
+
+部署時以 systemd service 為主，手動啟動僅作為開發與除錯用途。
        ↓
 載入 mcq-generator/SKILL.md
        ↓

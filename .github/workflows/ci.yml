@@ -1,0 +1,59 @@
+name: Root CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+  workflow_dispatch:
+
+env:
+  PYTHON_VERSION: "3.12"
+
+jobs:
+  draft-workflow-guards:
+    name: Draft Workflow Guards
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          version: latest
+
+      - name: Install Python
+        run: uv python install ${{ env.PYTHON_VERSION }}
+
+      - name: Sync dependencies
+        run: uv sync --extra webapp --dev
+
+      - name: Run draft workflow regression tests
+        run: uv run pytest -q tests/test_draft_workflow_guards.py
+
+  streamlit-browser-smoke:
+    name: Streamlit Browser Smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          version: latest
+
+      - name: Install Python
+        run: uv python install ${{ env.PYTHON_VERSION }}
+
+      - name: Sync dependencies
+        run: uv sync --extra webapp --dev
+
+      - name: Install Playwright Chromium
+        run: uv run python -m playwright install --with-deps chromium
+
+      - name: Run Streamlit browser smoke tests
+        run: uv run pytest -q tests/test_streamlit_practice_browser.py

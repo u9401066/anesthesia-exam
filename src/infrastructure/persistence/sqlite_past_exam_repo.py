@@ -168,6 +168,52 @@ class SQLitePastExamRepository(IPastExamRepository):
             rows = cursor.fetchall()
         return [self._row_to_question(row) for row in rows]
 
+    def list_exam_catalog(self, limit: int = 20) -> list[dict]:
+        with get_connection(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT
+                    pe.id,
+                    pe.exam_year,
+                    pe.exam_name,
+                    pe.total_questions,
+                    pe.source_doc_id,
+                    pe.imported_at,
+                    pe.is_classified,
+                    COALESCE(
+                        SUM(CASE WHEN peq.correct_answer IS NOT NULL AND TRIM(peq.correct_answer) != '' THEN 1 ELSE 0 END),
+                        0
+                    ) AS answered_questions
+                FROM past_exams pe
+                LEFT JOIN past_exam_questions peq ON peq.past_exam_id = pe.id
+                GROUP BY pe.id, pe.exam_year, pe.exam_name, pe.total_questions, pe.source_doc_id, pe.imported_at, pe.is_classified
+                ORDER BY pe.exam_year DESC, pe.imported_at DESC
+                LIMIT ?
+                """,
+                (limit,),
+            )
+            rows = cursor.fetchall()
+        return [dict(row) for row in rows]
+
+    def get_statistics(self) -> dict[str, int]:
+        with get_connection(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT COUNT(*) FROM past_exams")
+            exam_count = cursor.fetchone()[0]
+            cursor.execute("SELECT COUNT(*) FROM past_exam_questions")
+            question_count = cursor.fetchone()[0]
+            cursor.execute(
+                "SELECT COUNT(*) FROM past_exam_questions WHERE correct_answer IS NOT NULL AND TRIM(correct_answer) != ''"
+            )
+            answered_question_count = cursor.fetchone()[0]
+
+        return {
+            "exam_count": exam_count,
+            "question_count": question_count,
+            "answered_question_count": answered_question_count,
+        }
+
     def upsert_concepts(self, concepts: list[Concept]) -> int:
         if not concepts:
             return 0

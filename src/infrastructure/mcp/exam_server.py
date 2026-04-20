@@ -947,6 +947,17 @@ def _parse_source_location(data: dict | None) -> SourceLocation | None:
     )
 
 
+def _has_precise_source_location(location: SourceLocation | None) -> bool:
+    """Return whether a source location is usable for formal save."""
+    return bool(
+        location
+        and location.page > 0
+        and location.line_start > 0
+        and location.line_end >= location.line_start
+        and location.original_text.strip()
+    )
+
+
 def save_question(args: dict) -> dict:
     """儲存考題到 SQLite（支援完整 Source 結構）"""
 
@@ -959,6 +970,25 @@ def save_question(args: dict) -> dict:
         explanation_sources = [
             parsed for s in args.get("explanation_sources", []) if s and (parsed := _parse_source_location(s))
         ]
+
+        if args.get("preview_only"):
+            return {
+                "success": False,
+                "error": "preview-only 題目不可正式入庫，請先送進草稿箱。",
+            }
+
+        missing_fields = []
+        if not _has_precise_source_location(stem_source):
+            missing_fields.append("stem_source")
+        if not _has_precise_source_location(answer_source):
+            missing_fields.append("answer_source")
+        if not any(_has_precise_source_location(source) for source in explanation_sources):
+            missing_fields.append("explanation_sources")
+        if missing_fields:
+            return {
+                "success": False,
+                "error": "教材題目正式入庫需要完整 evidence pack，缺少: " + ", ".join(missing_fields),
+            }
 
         source = Source(
             document=args.get("source_doc", ""),

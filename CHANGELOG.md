@@ -9,6 +9,10 @@
 
 ### Added
 
+- Web 啟動腳本 `scripts/run_web.sh`
+- Systemd unit `deploy/systemd/anesthesia-exam-web.service`
+- Systemd 安裝腳本 `scripts/install_systemd_service.sh`
+
 - SQLite 資料庫架構 (`data/questions.db`)
   - questions 表：完整題目儲存
   - question_audits 表：操作審計追蹤
@@ -32,13 +36,15 @@
 
 ### Changed
 
+- `main.py` 改為透過目前 Python interpreter 啟動 Streamlit，並固定使用 `8501` / `0.0.0.0`
+- README / ARCHITECTURE / SPEC / ROADMAP / instruction 對齊目前 Web 工作台、ETL 大檔控制與 systemd 部署方式
 - MCP Server 從 JSON 檔案儲存改為 SQLite Repository
 - Streamlit UI 從單頁切換改為三欄佈局
 
 ### Known Issues
 
-- ⚠️ 來源追蹤是 AI 編造的假資料，尚未串接 PDF 解析工具
-- 需要 asset-aware-mcp 或類似工具來實現真正的來源追蹤
+- ⚠️ 正式來源追蹤只對具備 Marker blocks 的已索引教材成立；缺少 blocks 的文件會降級成 preview 模式
+- `consult_knowledge_graph` 仍受本地 LLM / LightRAG 服務可用性影響
 
 ## [0.1.0] - 2025-12-15
 

@@ -44,69 +44,85 @@ class SQLiteQuestionRepository(IQuestionRepository):
     ) -> str:
         """儲存題目（新增或更新）"""
         with get_connection(self.db_path) as conn:
-            cursor = conn.cursor()
+            return self.save_with_connection(
+                conn,
+                question,
+                actor_type=actor_type,
+                actor_name=actor_name,
+                generation_context=generation_context,
+                commit=True,
+            )
 
-            # 檢查是否已存在
-            cursor.execute("SELECT id FROM questions WHERE id = ?", (question.id,))
-            exists = cursor.fetchone() is not None
+    def save_with_connection(
+        self,
+        conn,
+        question: Question,
+        actor_type: ActorType = ActorType.AGENT,
+        actor_name: str = "crush",
+        generation_context: Optional[dict] = None,
+        commit: bool = False,
+    ) -> str:
+        """Save a question using an existing database connection."""
+        cursor = conn.cursor()
 
-            if exists:
-                # 更新
-                updated_id = self._update_internal(conn, question, actor_type, actor_name, None)
-                if updated_id is None:
-                    raise RuntimeError(f"Question {question.id} disappeared during update")
-                return updated_id
-            else:
-                # 新增
-                now = datetime.now().isoformat()
+        cursor.execute("SELECT id FROM questions WHERE id = ?", (question.id,))
+        exists = cursor.fetchone() is not None
 
-                cursor.execute(
-                    """
-                    INSERT INTO questions (
-                        id, question_text, options, correct_answer, explanation,
-                        source, question_type, difficulty, topics, points,
-                        image_path, created_at, created_by, updated_at,
-                        is_deleted, is_validated, exam_track
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?)
-                """,
-                    (
-                        question.id,
-                        question.question_text,
-                        json.dumps(question.options, ensure_ascii=False),
-                        question.correct_answer,
-                        question.explanation,
-                        json.dumps(
-                            question.source.to_dict()
-                            if hasattr(question.source, "to_dict")
-                            else self._source_to_dict(question.source),
-                            ensure_ascii=False,
-                        )
-                        if question.source
-                        else None,
-                        question.question_type.value,
-                        question.difficulty.value,
-                        json.dumps(question.topics, ensure_ascii=False),
-                        question.points,
-                        question.image_path,
-                        question.created_at.isoformat() if isinstance(question.created_at, datetime) else now,
-                        question.created_by,
-                        now,
-                        question.exam_track.value if question.exam_track else None,
-                    ),
+        if exists:
+            updated_id = self._update_internal(conn, question, actor_type, actor_name, None, commit=commit)
+            if updated_id is None:
+                raise RuntimeError(f"Question {question.id} disappeared during update")
+            return updated_id
+
+        now = datetime.now().isoformat()
+
+        cursor.execute(
+            """
+            INSERT INTO questions (
+                id, question_text, options, correct_answer, explanation,
+                source, question_type, difficulty, topics, points,
+                image_path, created_at, created_by, updated_at,
+                is_deleted, is_validated, exam_track
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?)
+        """,
+            (
+                question.id,
+                question.question_text,
+                json.dumps(question.options, ensure_ascii=False),
+                question.correct_answer,
+                question.explanation,
+                json.dumps(
+                    question.source.to_dict()
+                    if hasattr(question.source, "to_dict")
+                    else self._source_to_dict(question.source),
+                    ensure_ascii=False,
                 )
+                if question.source
+                else None,
+                question.question_type.value,
+                question.difficulty.value,
+                json.dumps(question.topics, ensure_ascii=False),
+                question.points,
+                question.image_path,
+                question.created_at.isoformat() if isinstance(question.created_at, datetime) else now,
+                question.created_by,
+                now,
+                question.exam_track.value if question.exam_track else None,
+            ),
+        )
 
-                # 記錄審計
-                self._add_audit(
-                    conn,
-                    question_id=question.id,
-                    action=AuditAction.CREATED,
-                    actor_type=actor_type,
-                    actor_name=actor_name,
-                    generation_context=generation_context,
-                )
+        self._add_audit(
+            conn,
+            question_id=question.id,
+            action=AuditAction.CREATED,
+            actor_type=actor_type,
+            actor_name=actor_name,
+            generation_context=generation_context,
+        )
 
-                conn.commit()
-                return question.id
+        if commit:
+            conn.commit()
+        return question.id
 
     def _source_to_dict(self, source: Source | None) -> dict | None:
         """將 Source 轉為字典"""
@@ -260,6 +276,7 @@ class SQLiteQuestionRepository(IQuestionRepository):
         actor_type: ActorType,
         actor_name: str,
         reason: Optional[str],
+        commit: bool = True,
     ) -> Optional[str]:
         """內部更新方法"""
         cursor = conn.cursor()
@@ -322,7 +339,8 @@ class SQLiteQuestionRepository(IQuestionRepository):
                 reason=reason,
             )
 
-        conn.commit()
+        if commit:
+            conn.commit()
         return question.id
 
     def _calculate_changes(self, old: Question, new: Question) -> dict:

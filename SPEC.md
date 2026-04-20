@@ -1,8 +1,8 @@
 # 智慧考卷生成系統 - 完整規格書
 
 > 建立日期: 2026-02-03  
-> 最後更新: 2026-04-14  
-> 狀態: 需求補充中（Web 驗收對齊）
+> 最後更新: 2026-04-15  
+> 狀態: 需求補充中（Web / 部署對齊）
 
 ---
 
@@ -42,10 +42,11 @@
 
 ### 1.3 核心特色
 
-- **Agent 驅動** - 使用 GitHub Copilot SDK 或 OpenCode（支援 Skill + Instruction + Sub-agent）
+- **Agent 驅動** - 使用 Crush / OpenCode / Copilot SDK（支援 Skill + Instruction + Sub-agent）
 - **精準來源追蹤** - 詳解標註頁碼、行數、原文引用
 - **半編碼 Instruction** - 預設模板 + 後台結構化設定可調整
 - **多媒體支援** - 支援從教材擷取圖片出題
+- **大型 PDF 控制** - Web ETL 直接提供 `page_ranges`、分塊頁數與圖像擷取控制
 
 ### 1.4 系統整合架構
 
@@ -63,7 +64,7 @@
 │          │                                                      │
 │          ▼                                                      │
 │   ┌─────────────┐                                               │
-│   │   Agent     │ ←── Copilot SDK / OpenCode                    │
+│   │   Agent     │ ←── Crush / OpenCode / Copilot SDK            │
 │   │             │     - Skill 定義                              │
 │   │             │     - Instruction 解析                        │
 │   │             │     - Sub-agent 協調                          │
@@ -291,6 +292,16 @@
 | 5. 後台 Agent 會有考古題跟題型範本可以取得 | Agent 可讀 past-exam blueprint、reference pack、題型模板庫，再依指定考試型態生成 | 後台雛形已具備 | 考古題抽取/分類/blueprint 已有後台骨架，但尚未成為 Web 可操作的能力 |
 | 6. 使用者要可以根據題目 tag 與考試類型來選題 | 題庫需支援正式 taxonomy，前台可依難度、主題、考試類型、來源類型多維篩選 | 部分達成 | `exam_track` 已成為 first-class 欄位並接上前台篩選；更完整的 audience / origin_type facets 仍待補 |
 
+#### 2.7.4 Web / 部署現況補充
+
+| 面向 | 目前狀態 | 備註 |
+| ---- | -------- | ---- |
+| Web 導航 | 已完成 | `生成考題 / 作答練習 / 題庫管理 / 出題需求 / 統計` 五頁整合於單一 Streamlit 工作台 |
+| ETL 大檔控制 | 已完成 | ETL UI 已支援 `page_ranges`、`marker_max_pages_per_chunk`、`extract_figures` |
+| 正式啟動腳本 | 已完成 | `scripts/run_web.sh` 為手動與 service 共用入口 |
+| Systemd deployment assets | 已完成 | 已提供 `deploy/systemd/anesthesia-exam-web.service` 與 `scripts/install_systemd_service.sh` |
+| 真正的 systemd 啟動 | 視部署主機而定 | 需在以 systemd 當 PID 1 的 Linux 主機上執行 |
+
 ---
 
 ## 3. 技術架構
@@ -315,10 +326,11 @@
           ▼                   ▼                   ▼
 ┌──────────────┐    ┌──────────────┐    ┌──────────────┐
 │   Agent      │    │   Document   │    │   Database   │
-│   Service    │    │   Service    │    │              │
+│   Provider   │    │   Service    │    │              │
 │              │    │              │    │ (SQLite 現行 / │
-│  Copilot SDK │    │  GraphRAG/   │    │ 向量庫後續擴充)│
-│  / OpenCode  │    │  LightRAG    │    │              │
+│  Crush /     │    │ asset-aware  │    │ 向量庫後續擴充)│
+│  OpenCode /  │    │ + LightRAG   │    │              │
+│  Copilot SDK │    │              │    │              │
 └──────────────┘    └──────────────┘    └──────────────┘
         │                   │
         ▼                   ▼
@@ -339,7 +351,7 @@
 | OpenCode | https://github.com/anomalyco/opencode | ✅ | ✅ 類似架構 | ✅ |
 | LangGraph（備案） | https://github.com/langchain-ai/langgraph | ⚠️ 需自建 | ⚠️ 需自建 | ✅ |
 
-**決策**：優先使用 Copilot SDK 或 OpenCode，LangGraph 僅作為備案
+**決策**：目前 Web 先以 Crush 為預設 provider，並保留 OpenCode / Copilot SDK 切換；LangGraph 仍作為備案
 
 ### 3.3 文件處理與索引流程
 

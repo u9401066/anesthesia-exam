@@ -4,18 +4,21 @@ Database Connection - SQLite 資料庫連線管理
 提供 SQLite 資料庫的連線和初始化功能。
 """
 
+import os
 import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Generator
 
 # 預設資料庫路徑
+DB_PATH_ENV_VAR = "ANESTHESIA_EXAM_DB_PATH"
 DEFAULT_DB_PATH = Path(__file__).parent.parent.parent.parent / "data" / "questions.db"
 
 
 def get_db_path() -> Path:
     """取得資料庫路徑"""
-    return DEFAULT_DB_PATH
+    override = os.getenv(DB_PATH_ENV_VAR)
+    return Path(override) if override else DEFAULT_DB_PATH
 
 
 def init_database(db_path: Path | None = None) -> None:
@@ -25,7 +28,7 @@ def init_database(db_path: Path | None = None) -> None:
     Args:
         db_path: 資料庫路徑，None 則使用預設路徑
     """
-    db_path = db_path or DEFAULT_DB_PATH
+    db_path = db_path or get_db_path()
     db_path.parent.mkdir(parents=True, exist_ok=True)
 
     with sqlite3.connect(db_path) as conn:
@@ -137,6 +140,9 @@ def init_database(db_path: Path | None = None) -> None:
 
     # ─── Scope Request Schema ───
     _init_scope_request_tables(db_path)
+
+    # ─── Draft Question Schema ───
+    _init_question_draft_tables(db_path)
 
 
 def _init_past_exam_tables(db_path: Path) -> None:
@@ -301,6 +307,97 @@ def _init_scope_request_tables(db_path: Path) -> None:
         conn.commit()
 
 
+def _init_question_draft_tables(db_path: Path) -> None:
+    """初始化題目草稿箱表。"""
+    with sqlite3.connect(db_path) as conn:
+        cursor = conn.cursor()
+
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS question_drafts (
+                id TEXT PRIMARY KEY,
+                question_data TEXT NOT NULL,
+                source_confidence TEXT DEFAULT 'none',
+                status TEXT DEFAULT 'draft',
+                is_starred INTEGER DEFAULT 0,
+                notes TEXT,
+                origin TEXT DEFAULT 'generated_review',
+                template_data TEXT,
+                blueprint_data TEXT,
+                qa_metadata TEXT,
+                promoted_question_id TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+
+        cursor.execute("PRAGMA table_info(question_drafts)")
+        draft_columns = {row[1] for row in cursor.fetchall()}
+
+        if "template_data" not in draft_columns:
+            cursor.execute("ALTER TABLE question_drafts ADD COLUMN template_data TEXT")
+        if "blueprint_data" not in draft_columns:
+            cursor.execute("ALTER TABLE question_drafts ADD COLUMN blueprint_data TEXT")
+        if "qa_metadata" not in draft_columns:
+            cursor.execute("ALTER TABLE question_drafts ADD COLUMN qa_metadata TEXT")
+
+        cursor.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_question_drafts_status
+            ON question_drafts (status)
+            """
+        )
+        cursor.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_question_drafts_starred
+            ON question_drafts (is_starred)
+            """
+        )
+        cursor.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_question_drafts_updated_at
+            ON question_drafts (updated_at)
+            """
+        )
+
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS question_draft_versions (
+                id TEXT PRIMARY KEY,
+                draft_id TEXT NOT NULL,
+                version_number INTEGER NOT NULL,
+                action TEXT NOT NULL,
+                actor_name TEXT NOT NULL,
+                reason TEXT,
+                snapshot_data TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (draft_id) REFERENCES question_drafts (id)
+            )
+            """
+        )
+        cursor.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_question_draft_versions_unique
+            ON question_draft_versions (draft_id, version_number)
+            """
+        )
+        cursor.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_question_draft_versions_draft_id
+            ON question_draft_versions (draft_id)
+            """
+        )
+        cursor.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_question_draft_versions_created_at
+            ON question_draft_versions (created_at)
+            """
+        )
+
+        conn.commit()
+
+
 @contextmanager
 def get_connection(db_path: Path | None = None) -> Generator[sqlite3.Connection, None, None]:
     """
@@ -312,7 +409,7 @@ def get_connection(db_path: Path | None = None) -> Generator[sqlite3.Connection,
     Yields:
         SQLite 連線
     """
-    db_path = db_path or DEFAULT_DB_PATH
+    db_path = db_path or get_db_path()
 
     # 確保資料庫已初始化
     if not db_path.exists():

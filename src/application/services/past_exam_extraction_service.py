@@ -22,7 +22,7 @@ from src.domain.entities.past_exam import Concept, PastExam, PastExamQuestion, Q
 from src.domain.repositories.past_exam_repository import IPastExamRepository
 
 PAGE_MARKER_RE = re.compile(r"<!--\s*Page\s+(\d+)\s*-->")
-QUESTION_START_RE = re.compile(r"^\s*(\d{1,3})\s*[\.、\)）:：]\s*(.+?)\s*$")
+QUESTION_START_RE = re.compile(r"^\s*(\d{1,3})\s*[\.、\)）:：]\s*(.*?)\s*$")
 ANSWER_HEADING_RE = re.compile(
     r"^\s{0,3}(?:#+\s*)?(?:答案|解答|參考答案|answer(?:\s+key)?|answers)\s*$",
     re.IGNORECASE,
@@ -32,6 +32,7 @@ INLINE_ANSWER_RE = re.compile(
     re.IGNORECASE,
 )
 OPTION_START_RE = re.compile(r"(?<![A-Z0-9])([A-E])[\.、\)）:：]\s*")
+OPTION_LABEL_ONLY_RE = re.compile(r"^\s*\(?([A-E])[\.、\)）:：]\s*$", re.IGNORECASE)
 OPTION_RE = re.compile(
     r"(?<![A-Z0-9])([A-E])[\.、\)）:：]\s*(.+?)(?=(?<![A-Z0-9])[A-E][\.、\)）:：]\s*|$)",
     re.IGNORECASE,
@@ -303,6 +304,14 @@ class PastExamExtractionService:
         manifest_path = doc_dir / f"{doc_id}_manifest.json"
         markdown_path = doc_dir / f"{doc_id}_full.md"
         if not manifest_path.exists():
+            legacy_manifest_path = doc_dir / "manifest.json"
+            if legacy_manifest_path.exists():
+                manifest_path = legacy_manifest_path
+        if not markdown_path.exists():
+            legacy_markdown_path = doc_dir / "content.md"
+            if legacy_markdown_path.exists():
+                markdown_path = legacy_markdown_path
+        if not manifest_path.exists():
             raise FileNotFoundError(f"找不到 manifest: {manifest_path}")
         if not markdown_path.exists():
             raise FileNotFoundError(f"找不到 markdown: {markdown_path}")
@@ -339,7 +348,9 @@ class PastExamExtractionService:
 
         for line, page in question_region:
             match = QUESTION_START_RE.match(line)
-            if match:
+            matched_number = int(match.group(1)) if match else None
+            is_next_question = current_number is None or matched_number == current_number + 1
+            if match and is_next_question:
                 if current_number is not None:
                     question = self._build_question(
                         question_number=current_number,
@@ -353,7 +364,7 @@ class PastExamExtractionService:
                     if question is not None:
                         questions.append(question)
                 current_number = int(match.group(1))
-                current_lines = [match.group(2)]
+                current_lines = [match.group(2)] if match.group(2) else []
                 current_pages = [page]
                 continue
 

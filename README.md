@@ -1,14 +1,16 @@
 # 智慧考卷生成系統 (Anesthesia Exam Generator)
 
-> AI Agent 驅動的醫學專科考試模擬系統
+> AI Agent 驅動的醫學專科考試 Web 工作台
 
 ## 功能特色
 
-- 🎯 **自動產生考卷** - 符合實際考試規格的模擬考卷
-- ✍️ **線上作答練習** - 產生考卷後直接線上作答
-- 📥 **PDF 下載** - 下載考卷 + 詳解 PDF
-- 📚 **詳細解答** - 精確來源追蹤（頁碼、行號、原文）
-- 💬 **互動式學習** - Crush Agent 即時問答
+- 🎯 **教材導向出題** - 可指定已索引教材、章節、題數、難度與主題生成題目
+- 📥 **PDF ETL 索引** - Web 直接觸發 `ingest_documents`，支援 `page_ranges`、大檔分塊與圖像擷取
+- 🧭 **正式 / preview 來源模式分流** - 缺少 Marker blocks 的文件會阻擋正式入庫，改走 preview 草稿
+- ✍️ **線上作答練習** - 從剛生成題組或既有題庫立即開始作答、批改與查看詳解
+- 📚 **題庫治理** - 支援關鍵字 / 難度 / 主題 / 考試類型 / reviewed-only 篩選
+- 📋 **出題需求 backlog** - 使用者可提出補題需求，heartbeat 會把缺口寫成 `data/jobs/*.json`
+- 🤖 **多 Agent Provider** - Sidebar 可切換 `crush`、`opencode`、`copilot-sdk`
 
 ## 系統架構
 
@@ -31,13 +33,14 @@
 
 | 層次 | 技術選型 |
 | ---- | -------- |
-| Agent | Crush (Go binary) + Claude Skills |
-| 前端 UI | Streamlit (三欄式佈局) |
-| MCP Server | exam-generator (4 tools) |
-| PDF 解析 | asset-aware-mcp |
+| Agent | Crush / OpenCode / Copilot SDK（透過 provider abstraction 切換） |
+| 前端 UI | Streamlit 工作台（生成 / 練習 / 題庫 / 需求 / 統計） |
+| MCP Server | `exam-generator`（13 tools） + `asset-aware-mcp` |
+| PDF 解析 | `asset-aware-mcp` + Marker 模式 |
+| 持久化 | SQLite + `data/jobs/*.json` heartbeat 工作檔 |
 | Python 管理 | uv |
 
-### Skills 架構 (35 個)
+### Skills 架構
 
 ```
 .claude/skills/
@@ -55,11 +58,40 @@
 ```bash
 # 建立虛擬環境
 uv venv
-uv sync
+uv sync --extra webapp --dev
 
-# 啟動應用
-uv run streamlit run main.py
+# 初始化 submodule
+git submodule update --init --recursive
+
+# 啟動 Web
+./scripts/run_web.sh
+
+# 或使用 Python 入口
+uv run python main.py
 ```
+
+## Systemd 部署
+
+專案已提供 systemd unit 與安裝腳本：
+
+```bash
+# 安裝 / 啟用 / 啟動 systemd service
+./scripts/install_systemd_service.sh
+
+# 查看狀態
+systemctl status anesthesia-exam-web.service --no-pager
+
+# 重新啟動
+systemctl restart anesthesia-exam-web.service
+```
+
+相關檔案：
+
+- `deploy/systemd/anesthesia-exam-web.service`
+- `scripts/install_systemd_service.sh`
+- `scripts/run_web.sh`
+
+若部署路徑不是目前 repo 位置，請先調整 unit 內的 `WorkingDirectory`、`ExecStart` 與 `User`。
 
 ### 重要：初始化子模組（asset-aware-mcp）
 
@@ -104,20 +136,33 @@ export EXAM_COPILOT_SDK_TOKEN='your-token'
 - `EXAM_AGENT_PROVIDER=copilot-sdk` 時，會 POST 到 `EXAM_COPILOT_SDK_ENDPOINT`。
 - Sidebar 可即時切換 provider，並顯示連線狀態。
 
+## Web 工作台頁面
+
+目前 Web 介面包含五個主頁面：
+
+- `📝 生成考題`：教材索引、出題設定、正式/preview 模式分流、生成後審閱
+- `✍️ 作答練習`：依難度 / 主題 / 題數抽題、提交後即時計分
+- `📚 題庫管理`：搜尋、篩選、審查與從篩選結果切換成練習
+- `📋 出題需求`：提出補題需求、管理 backlog、觸發 heartbeat job emission
+- `📊 統計`：查看題庫規模、難度分布與高頻主題
+
 ## MCP ETL 流程（PDF → 索引）
 
 在 `📝 生成考題` 頁面已加入 ETL 區塊：
 
 1. 上傳 PDF
 2. 輸入教材標題
-3. 點擊 `執行 ETL（ingest_documents）`
-4. Agent 會呼叫 `asset-aware` 的 `ingest_documents`
-5. 成功後可在「參考教材（已索引）」下拉選單看到文件
+3. 視需要填入 `頁段範圍（page_ranges）`
+4. 視需要調整 `大檔分塊頁數` 與 `擷取圖像 assets`
+5. 點擊 `執行 ETL（ingest_documents）`
+6. Agent 會呼叫 `asset-aware` 的 `ingest_documents`
+7. 成功後可在「參考教材（已索引）」下拉選單看到文件
 
 前提：
 
 - Provider 需支援 MCP 工具呼叫（目前建議使用 `crush`）
 - `libs/asset-aware-mcp` 必須有可執行內容（目錄不可為空）
+- 若要做正式來源追蹤，請開啟 Marker 模式，讓文件保留 `blocks.json`
 
 ### Crush Agent 設定
 
@@ -136,12 +181,12 @@ export EXAM_COPILOT_SDK_TOKEN='your-token'
 
 ## 大型 PDF 處理
 
-針對大型教材 (如 Miller's Anesthesia 9th, ~3500 頁)：
+針對大型教材（如 Miller's Anesthesia 9th）：
 
-1. **分批解析** - 每次處理 50-100 頁
-2. **斷點續傳** - 支援暫停/繼續
-3. **原子化切分** - 保留頁碼、行號
-4. **向量索引** - Chroma / pgvector
+1. 先用 `頁段範圍` 聚焦需要的章節，而不是一開始就整本 ingest
+2. 若使用 Marker，透過 `大檔分塊頁數` 控制每批處理頁數
+3. 圖像很多的 PDF 可先關閉 `擷取圖像 assets`，優先保住文字 / blocks
+4. 正式來源追蹤依賴 Marker blocks；若文件只有摘要或低品質 OCR，系統會降級成 preview 模式
 
 ## 文檔
 

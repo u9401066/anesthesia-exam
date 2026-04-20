@@ -1,0 +1,21 @@
+[Unit]
+Description=Anesthesia Exam Streamlit Web
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/root/workspace260209/anesthesia-exam
+Environment=PYTHONUNBUFFERED=1
+Environment=EXAM_AGENT_PROVIDER=crush
+ExecStart=/root/workspace260209/anesthesia-exam/scripts/run_web.sh
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=20
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

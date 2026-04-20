@@ -329,8 +329,20 @@ uv add --dev pytest ruff mypy bandit vulture
 ### 啟動服務
 
 ```bash
-# 啟動 Streamlit 應用 (port 8501)
-uv run streamlit run src/presentation/streamlit/app.py --server.port 8501
+# 安裝 Web 依賴
+uv sync --extra webapp --dev
+
+# 啟動 Streamlit Web (port 8501)
+./scripts/run_web.sh
+
+# 或使用 Python 入口
+uv run python main.py
+
+# 安裝 / 啟用 systemd service
+./scripts/install_systemd_service.sh
+
+# 檢查 service 狀態
+systemctl status anesthesia-exam-web.service --no-pager
 ```
 
 ### 開發相關

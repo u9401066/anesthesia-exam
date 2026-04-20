@@ -1,6 +1,210 @@
 # Decision Log
 
+## 2026-04-15
+
+### DEC-030: 作答練習的考古題模式應以「年份區間 + 單份/多份考卷」建題池，並沿用同一套 scoring state；另外每次重開回合都必須先清 practice radio widget state
+
+| 項目 | 內容 |
+|------|------|
+| **決策** | `✍️ 作答練習` 的歷屆來源不再停在單一 selectbox，而是升級成 `考古題模式`：先選 `起始年度 / 結束年度`，再決定 `多份混抽 / 單份考卷`，最後把選到的歷屆題目併成同一個 practice pool。提交後仍沿用既有 `practice_questions / practice_answers / practice_submitted` 這套 state，不另開平行 scoring flow；但每次開始新回合前必須先清掉 `q_<question_key>` radio widget state，避免同題重開時殘留上一輪答案。 |
+| **問題** | 前一版只支援單份考古題，無法滿足多份混抽與年份區間需求；而 Streamlit radio widget 又會把上一輪的值留在 session state，若剛好抽到同一批題目，清空 `practice_answers` 仍不足以讓 UI 真正回到未作答狀態。 |
+| **解決方案** | 在 practice 設定區新增 `考古題模式` 與 `練習方式 / 起始年度 / 結束年度 / 納入考卷` 控制，題池一律先在 app layer 組好，再沿用既有提交/計分流程。結果區若偵測來源為 past exam，額外顯示 `年度表現 / 考卷表現 / 題型與主題 / 錯題回顧`。session helper 則統一負責清掉 practice radio widget key，避免 stale widget state。 |
+| **影響** | 後續若再擴成「弱點題再練一次」「跨回合錯題本」等功能，應繼續建立在單一 practice session state 與這個 past-exam pool builder 上，不要另建第二套作答頁或第二套 answer state。 |
+
+### DEC-029: 作答練習的題目來源要明確分流；一般題庫 filter 不得直接套到歷屆考卷
+
+| 項目 | 內容 |
+|------|------|
+| **決策** | `✍️ 作答練習` 現在明確提供 `一般題庫 / 指定考古題` 來源切換；若選考古題，練習頁只套 `題數 / 難度 / 主題 / 隨機順序`，不套用 `validated_only` 與 `exam_track`。 |
+| **問題** | 先前作答練習只呼叫 `load_questions()`，實際上只會讀一般題庫；雖然 app 內已經有 `load_past_exam_catalog()` 與 `load_past_exam_questions()`，但完全沒接到 practice UI。若硬把一般題庫的審查/考試類型 filter 直接套到考古題，也會混淆兩個資料層的語意。 |
+| **解決方案** | 在 practice 設定區增加來源切換與考古題 selectbox。一般題庫仍走 `load_questions(validated_only, exam_track)`；考古題則改走 `load_past_exam_questions(past_exam_id)`，再於 app layer 套用共用的難度/主題/隨機順序。 |
+| **影響** | 後續若要再擴成 `多份考古題混合練習` 或 `歷屆年份篩選`，應沿用這個 source split，不要再把 past exam 當成一般題庫的一種 exam_track。 |
+
+### DEC-028: Draft box 的 browser E2E 不應直接回寫 multiselect widget key；要用 test-mode selection override 穩定跨 rerun 保留 batch promote 對象
+
+| 項目 | 內容 |
+|------|------|
+| **決策** | 在 `src/presentation/streamlit/app.py` 對草稿箱批次選取新增 `draft_batch_selection_override` 與 `draft_batch_selection_reset_pending`，並只在 `ANESTHESIA_EXAM_E2E_TEST_MODE=1` 下提供最小 test anchor `🧪 E2E 全選目前草稿`。 |
+| **問題** | Playwright 實測顯示，Streamlit multiselect 一旦已經 instantiate，就不能在同一輪 script 中回寫同 key 的 `st.session_state`；否則會觸發 `StreamlitAPIException`，也讓 batch promote 的 button 在 rerun 過程中失去穩定的 selected ids。 |
+| **解決方案** | 正式 UI 仍保留原本 multiselect；E2E mode 另外維持一份 selection override，讓 browser smoke 可在外部製造 partial failure（例如刪掉其中一個 draft）後，仍把原始 batch selection 傳進 promote。需要清空時只設 reset flag，下一輪在 widget mount 前再清除 widget-backed state。 |
+| **影響** | 後續若還要補更多 Streamlit browser smoke，只要牽涉「先選取、再外部改資料、再按批次按鈕」這種 rerun-sensitive 路徑，都應沿用 override/reset-pending pattern，不要再次直接改 widget key。 |
+
+### DEC-027: Streamlit E2E smoke 要用臨時 DB + 真瀏覽器執行，不得依賴現場 questions.db 或手動 browser session
+
+| 項目 | 內容 |
+|------|------|
+| **決策** | 新增 `tests/test_streamlit_practice_browser.py`，以 Playwright 啟動真 Chromium，並透過 `ANESTHESIA_EXAM_DB_PATH` 注入暫時 SQLite DB 來 seed 固定題目。 |
+| **問題** | 原本 `library -> practice` 與 `practice submit` 只有人工 browser smoke。若直接打現場 `data/questions.db`，測試結果會隨題庫內容漂移，且無法在 CI / 重跑時保證 deterministic。 |
+| **解決方案** | 在 persistence 層增加 env-based DB override，讓 E2E server process 使用暫時 DB；測試自行 seed 題目後再啟動 Streamlit，確保題目內容、分數與跳頁行為可重現。 |
+| **影響** | 之後任何 UI smoke 若牽涉到資料庫內容，都應優先沿用這個 temp DB pattern，而不是直接共享正式資料庫。 |
+
+### DEC-025: Draft promote 的資料一致性要由 shared SQLite transaction 保證，不再依賴事後補償 rollback
+
+| 項目 | 內容 |
+|------|------|
+| **決策** | `QuestionDraftService.promote_drafts()` 現在對每個 draft promotion 開單一 shared SQLite connection，並在同一 transaction 內完成 `question_repo.save_with_connection()` 與 `draft_repo.mark_promoted_with_connection()`。 |
+| **問題** | 前一版雖已補「question 已入庫但 mark_promoted 失敗時回滾 soft delete」的補償機制，但本質上仍是兩段式 workflow；正式題目與草稿狀態的一致性仍不是由 DB transaction 本身保證。 |
+| **解決方案** | 對 question repo / draft repo 新增內部的 connection-aware save / promote API，讓 service 在 `BEGIN IMMEDIATE` 下共用同一 SQLite transaction；任一步驟失敗就直接 rollback，不讓半成功資料落盤。 |
+| **影響** | 後續若還要擴充 promote gate（QA / similarity override / reviewer approvals），都應沿用這條 shared transaction 路徑，不要退回分段寫入再補償修正。 |
+
+### DEC-026: Streamlit 程式化跳頁不得直接回寫已實例化 widget 的 session_state；應由 current_page 驅動，render 前同步 widget state
+
+| 項目 | 內容 |
+|------|------|
+| **決策** | `navigate_to()` 不再直接設定 `st.session_state.page_nav`；它只改 `current_page` 與 URL query params，sidebar radio 則在每輪 render 前用 `sync_nav_widget_state()` 依 `current_page` 回填。 |
+| **問題** | 瀏覽器 smoke 實際抓到 `StreamlitAPIException: st.session_state.page_nav cannot be modified after the widget with key page_nav is instantiated`。也就是說，只要在同一輪 script 中先 render 出 radio，再透過某個按鈕 handler 去改 `page_nav`，就會在 runtime 爆掉。 |
+| **解決方案** | 把 `page_nav` 降為 widget projection，不作為程式化跳頁的直接寫入目標；改由 `current_page` 作為單一導覽狀態，再於下一輪 render 前同步 radio checked state。 |
+| **影響** | 後續新增任何 page-level quick action 或 CTA，只能呼叫 `navigate_to()` 或更新 `current_page`，不能再直接動 `page_nav`。 |
+
+### DEC-024: Draft workflow 的 guard 問題優先以「輸入前驗證 + 失敗補償 + DB 串行化」收斂，而非一次重寫整個 transaction stack
+
+| 項目 | 內容 |
+|------|------|
+| **決策** | 第二輪 audit 發現 draft workflow 的主要風險集中在三處：batch enum 轉換、promote 半成功、version snapshot race。這一輪不直接重做 repository 架構，而是優先補三種 guard：`bulk_update()` 在迴圈前先驗證 enum、`promote_drafts()` 在 `mark_promoted()` 失敗時補償回滾正式題目、`save()` 在版本號分配前先取 `BEGIN IMMEDIATE` transaction。 |
+| **問題** | 若直接沿用原狀，非法 batch 參數會留下部分更新；draft promote 在正式題目已入庫但草稿標記失敗時會留下 orphan question；version snapshot 以 `MAX(version_number)+1` 分配時存在並發撞號風險。 |
+| **解決方案** | 用最小修正先把三個 root cause 收斂：輸入在進入 loop 前就 fail fast、promotion failure 做補償式 delete、SQLite writer 在 `save()` 入口就串行化。再用 focused regression tests 鎖住這三條行為。 |
+| **影響** | 後續若要再往上升級成完整跨 repository transaction，應建立在這些 guard 已存在的前提上；不要為了追求一次性重構而放任現場資料一致性風險持續存在。 |
+
+### DEC-023: Streamlit 導航 state 必須同時收斂到單一 widget key，並持久化到 URL query params
+
+| 項目 | 內容 |
+|------|------|
+| **決策** | `src/presentation/streamlit/app.py` 的左側導航不再以 `st.radio(index=PAGE_OPTIONS.index(current_page))` 驅動，而改採 `page_nav` widget key + callback 同步 `current_page`，所有程式化跳頁統一走 `navigate_to()`，並把 active page 寫入 URL `?page=` query param。 |
+| **問題** | 原本的 `radio(index=...)` + `st.session_state.current_page = page` 模式在 rerun 時會讓 widget state 與 page state 互相覆寫；此外瀏覽器 refresh 會建立新 session，使 `current_page` 掉回預設頁，造成「點了會卡、refresh 會跳回」的 UX。 |
+| **解決方案** | 導航 widget 使用固定 key，由 callback 負責同步 `current_page`；程式內任何跳頁都更新 `current_page` 與 `page_nav`，同時把對應頁面 slug 寫進 `st.query_params["page"]`。初始化時則先從 query param 還原頁面。 |
+| **影響** | 後續若新增任何 sidebar/page 切換功能，不可再直接依賴動態 `index` 或只改 `current_page`；否則很容易重新引入 refresh reset 或 widget/content 不同步問題。 |
+
+### DEC-022: Copilot/OpenClaw + MCP 仍是正式出題層；草稿模板/QA/版本歷史屬於生成後作者工作流層
+
+| 項目 | 內容 |
+|------|------|
+| **決策** | 正式「產出考題」仍由 Copilot/OpenClaw 經 MCP pipeline（教材查詢、來源定位、生成、儲存）完成；草稿模板、QA checklist、相似題摘要與版本歷史則是生成後的 authoring/review layer，依附在 `question_drafts` 上。 |
+| **問題** | 若把模板/QA/history 直接混進 MCP generation pipeline，會模糊「證據鏈生成」與「人工審閱整理」的責任邊界，也讓 UI/作者工具反過來污染 agent workflow。 |
+| **解決方案** | 保持 MCP layer 專注在 evidence-backed generation；把草稿箱擴成 post-generation authoring workspace，承接 template、blueprint、QA、similarity 與 version snapshots。 |
+| **影響** | 現在的方向是正確的，但仍不算完整：後續應補 promote override UX、版本回滾與更明確的 author gate，而不是把這些責任推回 MCP prompt orchestration。 |
+
+### DEC-021: 題目模板必須直接建立在已正規化的歷史題庫上，並以 draft JSON metadata 承接 blueprint / QA
+
+| 項目 | 內容 |
+|------|------|
+| **決策** | 草稿箱的題目模板不另建手寫模板表，也不讓 AI 自行幻想 skeleton；第一版直接從 `past_exam_questions` 依 `pattern` / `topics` / `concept_names` 萃取模板，並把模板引用、blueprint 摘要、QA checklist 存入 `question_drafts.template_data / blueprint_data / qa_metadata` 三個 JSON 欄位。 |
+| **問題** | 使用者明確要求「題目模板應該要參考真的的歷史資料」；若模板只是 UI 側的假資料或零散欄位，之後很難追來源，也會讓作者工作流再次退化成沒有證據鏈的容器。 |
+| **解決方案** | 新增 `QuestionTemplateService` 直接讀既有 `past_exam_questions` corpus 產生模板；建立模板草稿時同步帶入來源年份/題號、歷史 blueprint 摘要與 QA 初始欄位。metadata 先採 JSON 欄位承接，保留未來擴充 checklist / history / reviewer signal 的空間。 |
+| **影響** | 後續若要做「套用模板到既有草稿」「promote 前摘要卡」「版本歷史」等作者工具，優先沿用這三組 metadata 擴充，不要再把臨時欄位塞回 `Question` 本體或 `app.py` session state。 |
+
+### DEC-020: 相似題提醒先採 soft warning，不直接阻止作者送草稿或正式入庫
+
+| 項目 | 內容 |
+|------|------|
+| **決策** | 先以 `QuestionSimilarityService` 做題幹文字正規化比對，於生成審閱區與草稿箱顯示 duplicate/similar warning；目前不在 save/promote 流程做 hard block。 |
+| **問題** | 使用者希望先有相似題提醒，但若在第一版就直接阻止 promote/save，容易因簡單文字比對的誤判把作者流程卡死，也缺少「仍要覆寫入庫」的清楚 UX。 |
+| **解決方案** | 用 SequenceMatcher + normalized text 對正式題庫與活動草稿做輕量比對，先把風險顯示在 UI；保留人工判斷空間，等之後有更穩定的 metric 與覆寫流程再考慮升級為阻擋。 |
+| **影響** | 之後若要把相似題檢查移到 promote gate，必須同時設計人工覆寫、閾值調校與更可信的 similarity signal，不能只把 warning 直接改成 error。 |
+
+### DEC-019: 題目作者工作流改為 draft-first，正式題庫只接收 promote 後的題目
+
+| 項目 | 內容 |
+|------|------|
+| **決策** | AI 生成或審閱中的候選題，預設不直接寫入正式 `questions`，而是先進 `question_drafts` 草稿箱；使用者在草稿箱完成批次編修、加星、篩選與審查後，再執行 promote 送入正式題庫。 |
+| **問題** | 目前 Web 對「生成候選題」與「正式題庫題目」的工作流界線過薄，容易讓低品質或尚未整理的題目直接污染正式 bank，也不利於之後加上相似題提醒、模板、版本歷史與 QA checklist。 |
+| **解決方案** | 新增 `QuestionDraft` domain model、draft repository / service、`question_drafts` schema，並在 Streamlit 增加 `🗃️ 草稿箱` 頁；生成頁審閱區優先提供「送進草稿箱」，正式入庫則成為次路徑或 promote 動作。 |
+| **影響** | 後續作者工作流功能應以草稿箱為核心擴充：相似題提醒、模板、blueprint、QA checklist、版本歷史等都應掛在 draft/promote 這條鏈上，而不是直接耦合到正式題庫 CRUD。 |
+
+### DEC-018: 一般題庫的 UI read-model 應下沉到 application service，而非持續堆在 app.py
+
+| 項目 | 內容 |
+|------|------|
+| **決策** | 一般題庫的統計整合、generated exam 檔案計數，以及 `validated_only / exam_track` 的 signature-aware 查詢邏輯，不再留在 `src/presentation/streamlit/app.py`，而是下沉到 `src/application/services/question_bank_query_service.py`。 |
+| **問題** | 雖然歷屆題庫 aggregate 已先下沉到 repository，但一般題庫這邊若仍把 read-model、相容邏輯與 dict 轉換留在 `app.py`，Presentation 層還是會繼續膨脹，而且之後新增排序/搜尋/儀表板時很容易再長成第二坨 orchestration code。 |
+| **解決方案** | 新增 query service，讓 `app.py` 的 `get_questions_stats()` / `load_questions()` 只作 facade；service 內統一整合 question repo、past exam repo 與 generated exam file count，並保留對舊版 repository signature 的容錯。 |
+| **影響** | 後續一般題庫若要加複合搜尋、排序、分頁、儀表板摘要，應優先擴 `QuestionBankQueryService`；Presentation 層盡量只留 UI 狀態與 render logic。 |
+
+### DEC-017: 歷屆題庫 aggregate 應下沉到 repository，Streamlit width API 應一次性遷移完畢
+
+| 項目 | 內容 |
+|------|------|
+| **決策** | `past_exams` / `past_exam_questions` 的清單與統計查詢不再留在 `app.py` 直接寫 SQL，而是下沉到 `SQLitePastExamRepository`；同時把 `app.py` 全部 `use_container_width=True` 一次性換成 `width="stretch"`。 |
+| **問題** | UI 直接持有 aggregate SQL 會讓 `app.py` 持續膨脹，也使資料口徑邏輯散落在呈現層；另外 Streamlit 已對 `use_container_width` 發出移除警告，若只修局部，後續還會持續在 terminal 噴 warning。 |
+| **解決方案** | 在 past exam repository 補 `list_exam_catalog()`、`get_statistics()` 兩個 read API，讓 UI 只拿 summary data；width API 則採一次性全面替換，避免留下零星舊呼叫。 |
+| **影響** | 後續若還要擴歷屆 dashboard / 篩選，應優先加在 repository/service，而不是回到 `app.py` 直寫 SQL；新增 UI 元件時也應直接使用新版 `width` 參數。 |
+
+### DEC-016: 題庫 UI 必須明確分開一般題庫與歷屆題庫，且 repository 篩選需容忍 runtime signature 漂移
+
+| 項目 | 內容 |
+|------|------|
+| **決策** | Streamlit 不再把 sidebar / 統計中的單一「題目數」當成全域內容量；改明確拆成一般題庫、歷屆題庫、歷屆考卷。另一方面，`load_questions()` 不直接假設底層 repo 一定支援 `validated_only` / `exam_track` 參數，而是在 UI 邊界做 signature-aware 相容處理。 |
+| **問題** | 使用者看到 `23` 時會自然誤判 earlier past-exam import 失敗；同時現場也曾出現 `SQLiteQuestionRepository.list_all()` runtime 實作與目前 source signature 不一致，導致作答頁直接 `TypeError`。 |
+| **解決方案** | `get_questions_stats()` 額外統計 `past_exams` / `past_exam_questions`，題庫管理改為「一般題庫 / 歷屆題庫 / 待審題目」tabs，作答頁對 `validated=0` 的 reviewed-only 篩選做 disabled + 說明；`load_questions()` 先 inspect `repo.list_all` parameters，再決定是否傳入 repo-level filters，否則於 app layer 補過濾。 |
+| **影響** | 之後所有 Web 文案都應維持這組名詞口徑，不可再把歷屆題庫藏在單一「題目數」背後；若 repository 介面再演進，應優先維持 UI 邊界容錯，避免單一實作漂移導致整頁 crash。 |
+
+### DEC-015: Web 啟動入口統一為 run_web.sh + systemd unit
+
+| 項目 | 內容 |
+|------|------|
+| **決策** | 正式部署以 `scripts/run_web.sh` + `deploy/systemd/anesthesia-exam-web.service` 為單一啟動路徑；`main.py` 只保留為同命令的 Python 入口 |
+| **問題** | 先前 README / instruction / `main.py` / 手動啟動方式彼此不一致，而且 `uv sync` 預設也不會帶入 Streamlit optional dependency，導致照文件操作不一定能啟動 Web |
+| **解決方案** | 新增統一啟動腳本與 systemd 安裝腳本，`main.py` 改為呼叫目前 interpreter 的 `python -m streamlit`，並同步修正文檔與部署指引 |
+| **影響** | 後續所有部署 / instruction / README 都應以 `scripts/run_web.sh` 與 `anesthesia-exam-web.service` 為準；若在非 systemd 容器內驗證，只能做 unit static verify，不能要求 `systemctl` 成功 |
+
+## 2026-04-17
+
+### DEC-033: 教材題必須把 `preview_only` 與 formal-save 當成兩個一級狀態，且 formal-save gate 必須同時落在 UI 與後端
+
+| 項目 | 內容 |
+|------|------|
+| **決策** | textbook generation 現在明確拆成 `preview_only` 與 `formal-save-ready` 兩種狀態。Streamlit review UI 會顯示每題 gate 結果與原因；`exam_server.save_question()` 也會硬性拒絕 `preview_only=true` 或缺少 `stem_source / answer_source / explanation_sources` 的教材題目。 |
+| **問題** | 先前即使 UI 提示某份教材只能 preview，仍可能被繞過前端後直接送進正式題庫；此外 evidence pack 若只在 UI 組裝、沒有後端驗證，會讓 formal-save 規則退化成「只是提醒，不是保證」。 |
+| **解決方案** | 新增 `TextbookGenerationService` 負責標記 preview-only、組 evidence pack 與判定 `formal_save_ready`；UI 只負責呈現狀態與 disable 按鈕，真正的 save gate 則由 `exam_server` 再驗一次。 |
+| **影響** | 後續若再加 reviewer override 或 pipeline artifact，必須建立在這個雙層 gate 上；不能退回只有前端提示、後端照存的弱規則。 |
+
+### DEC-034: 教材 source readiness 的根據是可搜尋 blocks 與實際 source probe，不是 Marker/markdown 成功與否；若 Marker blocks 不可用，可接受共享層 fallback 合成 searchable blocks
+
+| 項目 | 內容 |
+|------|------|
+| **決策** | 對教材型 PDF，`source_ready` 的判定標準是 `search_source_location` 能否在同一資料平面成功命中正文，且 `blocks.json` 需具備可搜尋文字與 line metadata。若 Marker 只吐出空的 `MarkdownOutput` shell，但 markdown 與 PDF page text 仍存在，asset-aware 允許在 shared infrastructure 層自動合成 searchable blocks。 |
+| **問題** | Miller 的 root-plane doc 一開始雖有 `full.md` 與 manifest，卻因 `blocks.json` 幾乎是空殼，導致 source lookup 完全失效。若只看「Marker parse 成功」或「有 markdown」，會錯把 preview-ready 當成 formal-save-ready。 |
+| **解決方案** | 在 `marker_adapter.py` 新增 markdown + PDF page text 的 block synthesis fallback，並把 `document_tools.search_source_location()` 補強到可回傳 line/snippet 資訊；此外 LightRAG working dir 也必須跟 root `data/` 平面一致，否則 KG 與 source lookup 會落在不同資料面。 |
+| **影響** | 後續任何 textbook formal-save gate 都必須以 source probe 為真值來源。KG 可以輔助檢索，但不能替代 precise source evidence。 |
+
+## 2026-04-16
+
+### DEC-032: 教材型 generation 的正式入庫 gate 不可只看 markdown/manifest；必須驗證 `search_source_location` 真的能命中正文
+
+| 項目 | 內容 |
+|------|------|
+| **決策** | 對教材型 PDF，`source_ready` 的定義從「已有 `full.md` / manifest / Marker ingest」提升為「同一個 doc_id 上 `search_source_location` readiness probe 可成功命中實際正文，且 `blocks.json` 含可搜尋文字 block」。若 probe 失敗，只能產出 preview/draft，不得正式入庫。 |
+| **問題** | Miller `doc_2020_miller_s_anesthesia_9th_7481c2` 在 root `data/` 平面雖然有可讀的 `doc_id_full.md`，也可列到章節標題，但實際 `blocks.json` 只有兩個空的 `MarkdownOutput` shell，導致 `search_source_location` 對真實正文句子全部查無結果。若只看 markdown/manifest，就會誤判為「可正式引用」。 |
+| **解決方案** | 將教材 evidence gate 明確分成兩層：1) 可讀層：`full.md` / chapter / section 可供 preview 草稿閱讀；2) 正式引用層：必須再通過 `search_source_location` probe 與 non-empty searchable blocks 檢查。若 KG (`consult_knowledge_graph`) 失敗，可退回 chapter/full_text 輔助閱讀，但仍不得跳過 source probe。 |
+| **影響** | 後續 textbook/chapter generation workflow 必須把 readiness probe 寫成明確 phase gate；否則很容易再次把「Marker 成功 + markdown 可讀」誤當成已具備 page/line/bbox 級來源追蹤能力。 |
+
+### DEC-031: Miller 這類大型教材先以 page-range 歸檔驗證為主；全書索引前必須先解決 LightRAG endpoint，且教材型出題不得沿用 past-exam extraction flow
+
+| 項目 | 內容 |
+|------|------|
+| **決策** | 對 `2020 Miller's Anesthesia 9th.pdf` 這類大型教材，現階段先以 `asset-aware-mcp` 的 `page_ranges + marker_max_pages_per_chunk + extract_figures=False` 做章節/頁段級歸檔驗證，不直接整本 hard ingest；同時明確區分「教材 ETL」與「考古題 extraction」兩種流程。教材章節不能直接丟進 `run_past_exam_extraction()` 當成 numbered-question corpus。 |
+| **問題** | 現場 Miller 檔案雖然只有 `107.36 MB`，但實際頁數達 `3336` 頁；asset-aware 端的大檔 ETL 已能處理局部頁段，但只要啟用 LightRAG 就會打到 `http://localhost:11434/api/embed` / `api/chat` 回 `404`。另外 exam 端目前的 `PastExamExtractionService` 是為「已有題號與答案」的文檔設計，對 textbook chapter 雖能讀 manifest/markdown，卻不會抽出任何題目。 |
+| **解決方案** | 先在 `ENABLE_LIGHTRAG=false` 下驗證 PyMuPDF/Marker 兩條局部 ingest 路徑與歸檔產物；全書處理前先補通 Ollama/LightRAG endpoint，再決定是否批次分章索引。另一方面，對教材出題要另走 chapter/textbook generation workflow，不再誤用 past-exam extraction。這一輪並順手補了 `PastExamExtractionService.load_asset_document()` 對 asset-aware 舊命名 `manifest.json/content.md` 的相容讀取。 |
+| **影響** | 後續若要讓 Miller 真正支撐教材出題，優先事項是：1) 補齊 KG/embedding 基礎設施；2) 設計教材型 chapter-level generation service / prompt；3) 若要做長書索引，採分頁段或分章批次 ETL，而不是一次整本同步處理。 |
+
 ## 2026-04-14
+
+### DEC-014: 題目切分只看連續題號，不可再加「純選項標籤後禁止切題」的 blanket guard
+
+| 項目 | 內容 |
+|------|------|
+| **決策** | `PastExamExtractionService` 的新題判斷維持「候選題號 = 上一題 + 1」即可，不再加入「若前一行是純 `(A)/(B)/...` 就不可切題」的 blanket guard |
+| **問題** | 這個 guard 雖曾用來擋住圖題選項內容誤切，但在真實 `111` / `112` 題本裡，某些 image-style 題目本來就以純 `(D)` / `(E)` 收尾，結果會把下一題 `94` 或 `40` 整段吞掉 |
+| **解決方案** | 移除 blanket guard，完全依賴 sequence-aware 題號判斷，並新增 regression test 覆蓋「圖題以純選項標籤結束後，下一題仍須正確切出」 |
+| **影響** | `109-113` 五份 PDF 題本目前皆可穩定抽出並落庫 100/100 題；後續若再遇到圖題，先檢查題號序列，不要優先加 broad heuristic |
+
+### DEC-013: 歷屆題本切題改採 sequence-aware 判斷，不再以「點號後不得接數字」硬切
+
+| 項目 | 內容 |
+|------|------|
+| **決策** | `PastExamExtractionService` 的題目起始判斷改為 sequence-aware：只有在候選題號符合上一題 `+1`，且不是純選項標籤後面的續行時，才視為新題 |
+| **問題** | 只用 regex 禁止 `.` 後面接數字雖能避開 `2.1 mmol/L`、`51.2kg` 這類誤切題，但會錯殺真實題幹如 `11.33 歲女性...` |
+| **解決方案** | 放寬 `QUESTION_START_RE`，把誤判防線移到迴圈上下文：結合目前題號序列與 `OPTION_LABEL_ONLY_RE` 決定是否切題，並補 regression tests 覆蓋三種真實格式 |
+| **影響** | 真實 `109` / `113` 題本已可穩定抽出 100/100 題；後續若擴更多年份，優先沿用上下文判斷而非再把 regex 調得更僵硬 |
 
 ### DEC-012: 已存在遠端 release tag 時不得重用版號，改順推下一個 patch
 

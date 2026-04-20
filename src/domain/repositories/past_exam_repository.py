@@ -36,5 +36,13 @@ class IPastExamRepository(ABC):
         """List normalized/classified questions for one extracted exam."""
 
     @abstractmethod
+    def list_exam_catalog(self, limit: int = 20) -> list[dict]:
+        """List past exam summary rows for dashboard / management views."""
+
+    @abstractmethod
+    def get_statistics(self) -> dict[str, int]:
+        """Return aggregate counts for imported past exams and questions."""
+
+    @abstractmethod
     def upsert_concepts(self, concepts: list[Concept]) -> int:
         """Upsert concept catalog entries discovered during classification."""
