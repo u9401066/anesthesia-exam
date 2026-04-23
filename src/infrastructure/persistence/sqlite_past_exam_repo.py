@@ -9,7 +9,10 @@ from typing import Optional
 
 from src.domain.entities.past_exam import Concept, PastExam, PastExamQuestion, QuestionPattern
 from src.domain.repositories.past_exam_repository import IPastExamRepository
-from src.infrastructure.persistence.database import get_connection, init_database
+from src.infrastructure.logging import get_logger
+from src.infrastructure.persistence.database import begin_immediate_transaction, get_connection, init_database
+
+logger = get_logger(__name__)
 
 
 class SQLitePastExamRepository(IPastExamRepository):
@@ -18,9 +21,16 @@ class SQLitePastExamRepository(IPastExamRepository):
     def __init__(self, db_path: Path | None = None):
         self.db_path = db_path
         init_database(db_path)
+        logger.debug("past_exam_repository_initialized", db_path=str(db_path) if db_path else None)
 
     def save_exam(self, past_exam: PastExam) -> str:
+        log = logger.bind(
+            past_exam_id=past_exam.id,
+            doc_id=past_exam.source_doc_id,
+            exam_year=past_exam.exam_year,
+        )
         with get_connection(self.db_path) as conn:
+            begin_immediate_transaction(conn)
             cursor = conn.cursor()
             cursor.execute(
                 """
@@ -55,10 +65,17 @@ class SQLitePastExamRepository(IPastExamRepository):
                 ),
             )
             conn.commit()
+        log.info(
+            "past_exam_saved",
+            exam_name=past_exam.exam_name,
+            question_count=past_exam.total_questions,
+            is_classified=past_exam.is_classified,
+        )
         return past_exam.id
 
     def get_exam(self, exam_id: str) -> Optional[PastExam]:
         with get_connection(self.db_path) as conn:
+            begin_immediate_transaction(conn)
             cursor = conn.cursor()
             cursor.execute("SELECT * FROM past_exams WHERE id = ?", (exam_id,))
             row = cursor.fetchone()
@@ -72,6 +89,7 @@ class SQLitePastExamRepository(IPastExamRepository):
 
     def get_exam_by_doc_id(self, source_doc_id: str) -> Optional[PastExam]:
         with get_connection(self.db_path) as conn:
+            begin_immediate_transaction(conn)
             cursor = conn.cursor()
             cursor.execute(
                 "SELECT * FROM past_exams WHERE source_doc_id = ? ORDER BY imported_at DESC LIMIT 1",
@@ -89,6 +107,11 @@ class SQLitePastExamRepository(IPastExamRepository):
     def save_questions(self, past_exam_id: str, questions: list[PastExamQuestion]) -> int:
         if not questions:
             return 0
+
+        log = logger.bind(
+            past_exam_id=past_exam_id,
+            doc_id=questions[0].source_doc_id if questions else None,
+        )
 
         with get_connection(self.db_path) as conn:
             cursor = conn.cursor()
@@ -156,17 +179,82 @@ class SQLitePastExamRepository(IPastExamRepository):
                 (len(questions), past_exam_id),
             )
             conn.commit()
+        log.info("past_exam_questions_saved", question_count=len(questions))
         return len(questions)
 
     def list_questions(self, past_exam_id: str) -> list[PastExamQuestion]:
         with get_connection(self.db_path) as conn:
             cursor = conn.cursor()
             cursor.execute(
-                "SELECT * FROM past_exam_questions WHERE past_exam_id = ? ORDER BY question_number ASC",
+                """
+                SELECT *
+                FROM past_exam_questions
+                WHERE past_exam_id = ?
+                ORDER BY COALESCE(source_page, 0) ASC, created_at ASC, question_number ASC
+                """,
                 (past_exam_id,),
             )
             rows = cursor.fetchall()
         return [self._row_to_question(row) for row in rows]
+
+    def list_all_questions(
+        self,
+        limit: int | None = None,
+        *,
+        explanation_required: bool = False,
+    ) -> list[PastExamQuestion]:
+        with get_connection(self.db_path) as conn:
+            cursor = conn.cursor()
+            query = """
+                SELECT *
+                FROM past_exam_questions
+                WHERE 1 = 1
+            """
+            params: list[object] = []
+
+            if explanation_required:
+                query += " AND explanation IS NOT NULL AND TRIM(explanation) != ''"
+
+            query += " ORDER BY exam_year DESC, question_number ASC, created_at ASC"
+            if limit is not None:
+                query += " LIMIT ?"
+                params.append(limit)
+
+            cursor.execute(query, params)
+            rows = cursor.fetchall()
+        logger.debug(
+            "past_exam_question_list_all_loaded",
+            explanation_required=explanation_required,
+            limit=limit,
+            result_count=len(rows),
+        )
+        return [self._row_to_question(row) for row in rows]
+
+    def update_question_explanation(self, question_id: str, explanation: str) -> bool:
+        cleaned_explanation = explanation.strip()
+        if not cleaned_explanation:
+            return False
+
+        with get_connection(self.db_path) as conn:
+            begin_immediate_transaction(conn)
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                UPDATE past_exam_questions
+                SET explanation = ?
+                WHERE id = ?
+                """,
+                (cleaned_explanation, question_id),
+            )
+            updated = cursor.rowcount > 0
+            conn.commit()
+
+        logger.info(
+            "past_exam_question_explanation_updated",
+            question_id=question_id,
+            updated=updated,
+        )
+        return updated
 
     def list_exam_catalog(self, limit: int = 20) -> list[dict]:
         with get_connection(self.db_path) as conn:
@@ -194,6 +282,7 @@ class SQLitePastExamRepository(IPastExamRepository):
                 (limit,),
             )
             rows = cursor.fetchall()
+        logger.debug("past_exam_catalog_listed", limit=limit, result_count=len(rows))
         return [dict(row) for row in rows]
 
     def get_statistics(self) -> dict[str, int]:
@@ -208,11 +297,13 @@ class SQLitePastExamRepository(IPastExamRepository):
             )
             answered_question_count = cursor.fetchone()[0]
 
-        return {
+        stats = {
             "exam_count": exam_count,
             "question_count": question_count,
             "answered_question_count": answered_question_count,
         }
+        logger.debug("past_exam_statistics_loaded", **stats)
+        return stats
 
     def upsert_concepts(self, concepts: list[Concept]) -> int:
         if not concepts:
@@ -241,6 +332,7 @@ class SQLitePastExamRepository(IPastExamRepository):
                     ),
                 )
             conn.commit()
+        logger.info("past_exam_concepts_upserted", concept_count=len(concepts))
         return len(concepts)
 
     def _row_to_past_exam(self, row) -> PastExam:

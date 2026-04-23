@@ -19,6 +19,7 @@ from src.application.services.past_exam_extraction_service import (  # noqa: E40
     AssetAwareDocument,
     PastExamExtractionService,
 )
+from src.infrastructure.logging import bootstrap_logging, get_logger, log_context, new_run_id  # noqa: E402
 from src.infrastructure.persistence.sqlite_past_exam_repo import (  # noqa: E402
     SQLitePastExamRepository,
 )
@@ -59,6 +60,28 @@ QUESTION_HINTS = (
     "錯誤",
     "原因",
 )
+VERIFIED_112_ANSWER_TEXT = """
+1 C 21 B 41 D 61 C 81 C
+2 C 22 A 42 B 62 B 82 D
+3 A 23 B 43 D 63 B 83 A
+4 A 24 B 44 D 64 A 84 B
+5 B 25 C 45 C 65 B 85 C
+6 D 26 B 46 A 66 D 86 A
+7 AD 27 A 47 A 67 AB 87 D
+8 D 28 D 48 D 68 B 88 D
+9 B 29 C 49 D 69 C 89 B
+10 C 30 A 50 C 70 C 90 B
+11 B 31 C 51 A 71 D 91 C
+12 A 32 C 52 C 72 D 92 BD
+13 A 33 C 53 D 73 B 93 D
+14 C 34 A 54 A 74 D 94 B
+15 B 35 D 55 B 75 C 95 D
+16 D 36 A 56 C 76 B 96 D
+17 D 37 B 57 D 77 C 97 C
+18 BD 38 D 58 B 78 A 98 D
+19 C 39 A 59 C 79 C 99 A
+20 C 40 CD 60 B 80 D 100 BD
+"""
 VERIFIED_114_ANSWER_TEXT = """
 1 D 21 C 41 B 61 C 81 C
 2 D 22 C 42 A 62 D 82 A
@@ -81,9 +104,32 @@ VERIFIED_114_ANSWER_TEXT = """
 19 B 39 A 59 D 79 B 99 A
 20 A 40 C 60 B 80 B 100 D
 """
+VERIFIED_109_ANSWER_TEXT = """
+1 B 21 D 41 C 61 C 81 D
+2 D 22 B 42 C 62 A 82 C
+3 C 23 C 43 B 63 C 83 A
+4 B 24 C 44 C 64 D 84 C
+5 C 25 C 45 A 65 C 85 D
+6 B 26 D 46 D 66 D 86 A
+7 B 27 D 47 C 67 B 87 B
+8 C 28 A 48 C 68 D 88 A
+9 A 29 B 49 C 69 C 89 D
+10 B 30 C 50 D 70 C 90 C
+11 D 31 C 51 B 71 D 91 C
+12 D 32 B 52 D 72 B 92 A
+13 A 33 A 53 D 73 B 93 B
+14 B 34 C 54 C 74 C 94 B
+15 C 35 D 55 B 75 C 95 D
+16 B 36 D 56 B 76 D 96 C
+17 D 37 B 57 B 77 C 97 B
+18 A 38 B 58 C 78 C 98 D
+19 C 39 A 59 B 79 C 99 C
+20 D 40 A 60 C 80 B 100 C
+"""
 
 
 EXTRACTION_SERVICE = PastExamExtractionService(DATA_DIR)
+logger = get_logger(__name__)
 
 
 @dataclass(slots=True)
@@ -418,14 +464,11 @@ def load_asset_exam_with_answers(roc_year: int, answer_map: dict[int, str], note
 
 
 def prepare_109_exam() -> PreparedExam:
-    document = EXTRACTION_SERVICE.load_asset_document(ASSET_DOC_IDS[109])
-    bonus_answers = {number: "BONUS" for number in range(1, 101)}
-    return PreparedExam(
-        roc_year=109,
-        exam_name=ASSET_EXAM_NAMES[109],
-        document=document,
-        answer_overrides=bonus_answers,
-        notes=["答案本僅標示本題送分，已以 BONUS 覆寫 1-100 題答案欄位。"],
+    answer_map = parse_answer_pairs(VERIFIED_109_ANSWER_TEXT)
+    return load_asset_exam_with_answers(
+        109,
+        answer_map,
+        notes=["109 年筆試答案已依官方答案表影像逐題校對後匯入。"],
     )
 
 
@@ -440,13 +483,11 @@ def prepare_111_exam() -> PreparedExam:
 
 
 def prepare_112_exam() -> PreparedExam:
-    document = EXTRACTION_SERVICE.load_asset_document(ASSET_DOC_IDS[112])
-    return PreparedExam(
-        roc_year=112,
-        exam_name=ASSET_EXAM_NAMES[112],
-        document=document,
-        expected_answer_count=0,
-        notes=["workspace 內未找到 112 年筆試答案來源，保留題目但答案欄位維持空白。"],
+    answer_map = parse_answer_pairs(VERIFIED_112_ANSWER_TEXT)
+    return load_asset_exam_with_answers(
+        112,
+        answer_map,
+        notes=["112 年筆試答案已依 JPG 答案表逐題校對後匯入。"],
     )
 
 
@@ -469,77 +510,99 @@ def prepare_114_exam() -> PreparedExam:
 
 
 def prepare_exams(only_years: set[int] | None = None) -> list[PreparedExam]:
+    logger.info(
+        "past_exam_prepare_start",
+        selected_years=sorted(only_years) if only_years else "all",
+    )
     prepared: list[PreparedExam] = []
     with tempfile.TemporaryDirectory() as temp_dir_name:
         temp_root = Path(temp_dir_name)
-        archive_106 = extract_archive(SOURCE_DIR / "106年專甄考古題.rar", temp_root / "106")
-        archive_107 = extract_archive(SOURCE_DIR / "107年專甄題庫.rar", temp_root / "107")
-        archive_108 = extract_archive(SOURCE_DIR / "108年專甄題庫.rar", temp_root / "108")
-        prepared.extend(
-            [
-                prepare_106_exam(archive_106),
-                prepare_107_exam(archive_107),
-                prepare_108_exam(archive_108),
-            ]
-        )
+        if only_years is None or 106 in only_years:
+            logger.info("past_exam_prepare_year", roc_year=106)
+            archive_106 = extract_archive(SOURCE_DIR / "106年專甄考古題.rar", temp_root / "106")
+            prepared.append(prepare_106_exam(archive_106))
+        if only_years is None or 107 in only_years:
+            logger.info("past_exam_prepare_year", roc_year=107)
+            archive_107 = extract_archive(SOURCE_DIR / "107年專甄題庫.rar", temp_root / "107")
+            prepared.append(prepare_107_exam(archive_107))
+        if only_years is None or 108 in only_years:
+            logger.info("past_exam_prepare_year", roc_year=108)
+            archive_108 = extract_archive(SOURCE_DIR / "108年專甄題庫.rar", temp_root / "108")
+            prepared.append(prepare_108_exam(archive_108))
 
-    prepared.extend(
-        [
-            prepare_109_exam(),
-            prepare_110_exam(),
-            prepare_111_exam(),
-            prepare_112_exam(),
-            prepare_113_exam(),
-            prepare_114_exam(),
-        ]
-    )
-    if only_years is None:
-        return prepared
-    return [exam for exam in prepared if exam.roc_year in only_years]
+    year_factories = {
+        109: prepare_109_exam,
+        110: prepare_110_exam,
+        111: prepare_111_exam,
+        112: prepare_112_exam,
+        113: prepare_113_exam,
+        114: prepare_114_exam,
+    }
+    for roc_year, factory in year_factories.items():
+        if only_years is None or roc_year in only_years:
+            logger.info("past_exam_prepare_year", roc_year=roc_year)
+            prepared.append(factory())
+    logger.info("past_exam_prepare_complete", exam_count=len(prepared))
+    return prepared
 
 
 def process_exam(prepared: PreparedExam, repo: SQLitePastExamRepository | None, dry_run: bool) -> dict:
-    extraction = EXTRACTION_SERVICE.extract_questions(
-        prepared.document,
-        exam_name=prepared.exam_name,
-        exam_year=prepared.gregorian_year,
-    )
-    for question in extraction.questions:
-        override = prepared.answer_overrides.get(question.question_number)
-        if override:
-            question.correct_answer = override
-    answer_count = sum(1 for question in extraction.questions if question.correct_answer)
-
-    if len(extraction.questions) != prepared.expected_question_count:
-        raise ValueError(
-            f"{prepared.roc_year} 年題數異常：預期 {prepared.expected_question_count} 題，實得 {len(extraction.questions)} 題"
+    with log_context(doc_id=prepared.document.doc_id):
+        logger.info(
+            "past_exam_process_start",
+            roc_year=prepared.roc_year,
+            exam_year=prepared.gregorian_year,
+            exam_name=prepared.exam_name,
+            dry_run=dry_run,
         )
-    if prepared.expected_answer_count is not None and answer_count != prepared.expected_answer_count:
-        raise ValueError(
-            f"{prepared.roc_year} 年答案數異常：預期 {prepared.expected_answer_count} 題，實得 {answer_count} 題"
+        extraction = EXTRACTION_SERVICE.extract_questions(
+            prepared.document,
+            exam_name=prepared.exam_name,
+            exam_year=prepared.gregorian_year,
         )
+        for question in extraction.questions:
+            override = prepared.answer_overrides.get(question.question_number)
+            if override:
+                question.correct_answer = override
+        answer_count = sum(1 for question in extraction.questions if question.correct_answer)
 
-    classified_questions, concepts = EXTRACTION_SERVICE.classify_questions(extraction.questions)
-    past_exam = EXTRACTION_SERVICE._build_past_exam_aggregate(prepared.document, extraction, repo)
-    past_exam.questions = classified_questions
-    past_exam.total_questions = len(classified_questions)
-    past_exam.is_classified = True
+        if len(extraction.questions) != prepared.expected_question_count:
+            raise ValueError(
+                f"{prepared.roc_year} 年題數異常：預期 {prepared.expected_question_count} 題，實得 {len(extraction.questions)} 題"
+            )
+        if prepared.expected_answer_count is not None and answer_count != prepared.expected_answer_count:
+            raise ValueError(
+                f"{prepared.roc_year} 年答案數異常：預期 {prepared.expected_answer_count} 題，實得 {answer_count} 題"
+            )
 
-    if not dry_run and repo is not None:
-        repo.save_exam(past_exam)
-        repo.save_questions(past_exam.id, classified_questions)
-        repo.upsert_concepts(concepts)
+        classified_questions, concepts = EXTRACTION_SERVICE.classify_questions(extraction.questions)
+        past_exam = EXTRACTION_SERVICE._build_past_exam_aggregate(prepared.document, extraction, repo)
+        past_exam.questions = classified_questions
+        past_exam.total_questions = len(classified_questions)
+        past_exam.is_classified = True
 
-    return {
-        "roc_year": prepared.roc_year,
-        "gregorian_year": prepared.gregorian_year,
-        "exam_id": past_exam.id,
-        "source_doc_id": prepared.document.doc_id,
-        "question_count": len(classified_questions),
-        "answer_count": answer_count,
-        "concept_count": len(concepts),
-        "notes": prepared.notes,
-    }
+        if not dry_run and repo is not None:
+            repo.save_exam(past_exam)
+            repo.save_questions(past_exam.id, classified_questions)
+            repo.upsert_concepts(concepts)
+
+        logger.info(
+            "past_exam_process_complete",
+            exam_id=past_exam.id,
+            question_count=len(classified_questions),
+            answer_count=answer_count,
+            concept_count=len(concepts),
+        )
+        return {
+            "roc_year": prepared.roc_year,
+            "gregorian_year": prepared.gregorian_year,
+            "exam_id": past_exam.id,
+            "source_doc_id": prepared.document.doc_id,
+            "question_count": len(classified_questions),
+            "answer_count": answer_count,
+            "concept_count": len(concepts),
+            "notes": prepared.notes,
+        }
 
 
 def print_summary(results: list[dict], dry_run: bool) -> None:
@@ -558,11 +621,26 @@ def print_summary(results: list[dict], dry_run: bool) -> None:
 def main() -> None:
     args = parse_args()
     only_years = set(args.only) if args.only else None
+    run_id = new_run_id("histimp")
+    bootstrap_logging(
+        __name__,
+        extra_context={"run_id": run_id, "provider": "historical-import"},
+    )
+    logger.info(
+        "past_exam_import_start",
+        dry_run=args.dry_run,
+        selected_years=sorted(only_years) if only_years else "all",
+    )
     repo = None if args.dry_run else SQLitePastExamRepository(DATA_DIR / "questions.db")
 
-    prepared_exams = prepare_exams(only_years=only_years)
-    results = [process_exam(prepared, repo, dry_run=args.dry_run) for prepared in prepared_exams]
-    print_summary(results, dry_run=args.dry_run)
+    try:
+        prepared_exams = prepare_exams(only_years=only_years)
+        results = [process_exam(prepared, repo, dry_run=args.dry_run) for prepared in prepared_exams]
+        print_summary(results, dry_run=args.dry_run)
+    except Exception as exc:
+        logger.exception("past_exam_import_failed", error=str(exc))
+        raise
+    logger.info("past_exam_import_complete", imported_exam_count=len(results), dry_run=args.dry_run)
 
 
 if __name__ == "__main__":

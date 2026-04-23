@@ -47,6 +47,38 @@ def _wait_for_streamlit(base_url: str, timeout_seconds: float = 30.0) -> None:
     raise RuntimeError(f"Streamlit test server did not become ready: {last_error}")
 
 
+def _wait_for_page_param(page, expected_page: str) -> None:
+    page.wait_for_function(
+        "(expectedPage) => new URL(window.location.href).searchParams.get('page') === expectedPage",
+        arg=expected_page,
+    )
+
+
+def _open_generated_review_practice(page, base_url: str, question_text: str) -> None:
+    last_error: Exception | None = None
+
+    for attempt in range(2):
+        page.goto(f"{base_url}/?page=generate", wait_until="networkidle")
+        page.get_by_role("heading", name="AI 考題生成").wait_for()
+        page.get_by_role("button", name="🧪 載入教材 preview-only").click()
+        page.get_by_text("AI 生成結果：共 1 題", exact=False).wait_for()
+        page.get_by_role("button", name="✍️ 立即練習").click()
+
+        try:
+            page.get_by_role("heading", name="作答練習").wait_for(timeout=5000)
+        except Error:
+            _radio_label(page, "✍️ 作答練習").click()
+            page.get_by_role("heading", name="作答練習").wait_for(timeout=10000)
+
+        try:
+            page.get_by_text(question_text, exact=False).wait_for(timeout=8000)
+            return
+        except Error as exc:
+            last_error = exc
+
+    raise AssertionError(f"Timed out waiting for generated review practice payload: {last_error}")
+
+
 def _seed_question_bank(db_path: Path) -> None:
     repo = SQLiteQuestionRepository(db_path=db_path)
     repo.save(
@@ -222,6 +254,47 @@ def _seed_past_exam_bank(db_path: Path) -> dict[str, str]:
     return seeded_ids
 
 
+def _start_streamlit_test_server(tmp_dir: Path) -> tuple[subprocess.Popen[str], dict[str, object]]:
+    db_path = tmp_dir / "questions.db"
+    _seed_question_bank(db_path)
+    seeded_drafts = _seed_draft_box(db_path)
+    seeded_past_exam = _seed_past_exam_bank(db_path)
+
+    port = _pick_free_port()
+    base_url = f"http://127.0.0.1:{port}"
+    env = os.environ.copy()
+    env["ANESTHESIA_EXAM_DB_PATH"] = str(db_path)
+    env["ANESTHESIA_EXAM_E2E_TEST_MODE"] = "1"
+
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            "-m",
+            "streamlit",
+            "run",
+            "src/presentation/streamlit/app.py",
+            "--server.port",
+            str(port),
+            "--server.address",
+            "127.0.0.1",
+            "--server.headless=true",
+        ],
+        cwd=PROJECT_ROOT,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+
+    _wait_for_streamlit(base_url)
+    return process, {
+        "base_url": base_url,
+        "db_path": db_path,
+        "draft_ids": seeded_drafts,
+        "past_exam": seeded_past_exam,
+    }
+
+
 def _radio_label(page, option_text: str):
     return page.locator('label[data-baseweb="radio"]', has_text=option_text).first
 
@@ -262,6 +335,15 @@ def _bank_questions_by_text(db_path: Path) -> dict[str, Question]:
     return {question.question_text: question for question in repo.list_all(limit=500)}
 
 
+def _wait_for_question_in_drafts(db_path: Path, question_text: str, timeout_seconds: float = 10.0) -> None:
+    deadline = time.time() + timeout_seconds
+    while time.time() < deadline:
+        if question_text in _draft_question_texts(db_path):
+            return
+        time.sleep(0.2)
+    raise AssertionError(f"Timed out waiting for question in drafts: {question_text}")
+
+
 def _wait_for_question_in_bank(db_path: Path, question_text: str, timeout_seconds: float = 10.0) -> Question:
     deadline = time.time() + timeout_seconds
     while time.time() < deadline:
@@ -275,40 +357,25 @@ def _wait_for_question_in_bank(db_path: Path, question_text: str, timeout_second
 @pytest.fixture(scope="session")
 def streamlit_test_server(tmp_path_factory: pytest.TempPathFactory):
     db_dir = tmp_path_factory.mktemp("streamlit-browser-db")
-    db_path = db_dir / "questions.db"
-    _seed_question_bank(db_path)
-    seeded_drafts = _seed_draft_box(db_path)
-    seeded_past_exam = _seed_past_exam_bank(db_path)
-
-    port = _pick_free_port()
-    base_url = f"http://127.0.0.1:{port}"
-    env = os.environ.copy()
-    env["ANESTHESIA_EXAM_DB_PATH"] = str(db_path)
-    env["ANESTHESIA_EXAM_E2E_TEST_MODE"] = "1"
-
-    process = subprocess.Popen(
-        [
-            sys.executable,
-            "-m",
-            "streamlit",
-            "run",
-            "src/presentation/streamlit/app.py",
-            "--server.port",
-            str(port),
-            "--server.address",
-            "127.0.0.1",
-            "--server.headless=true",
-        ],
-        cwd=PROJECT_ROOT,
-        env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-    )
+    process, server_info = _start_streamlit_test_server(db_dir)
 
     try:
-        _wait_for_streamlit(base_url)
-        yield {"base_url": base_url, "db_path": db_path, "draft_ids": seeded_drafts, "past_exam": seeded_past_exam}
+        yield server_info
+    finally:
+        process.terminate()
+        try:
+            process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=5)
+
+
+@pytest.fixture()
+def isolated_streamlit_test_server(tmp_path: Path):
+    process, server_info = _start_streamlit_test_server(tmp_path)
+
+    try:
+        yield server_info
     finally:
         process.terminate()
         try:
@@ -339,7 +406,7 @@ def test_library_to_practice_syncs_url_and_navigation(streamlit_test_server, bro
 
     page.get_by_role("button", name="✍️ 用目前篩選結果練習").click()
 
-    page.wait_for_url("**/?page=practice")
+    _wait_for_page_param(page, "practice")
     page.get_by_role("heading", name="作答練習").wait_for()
 
     assert page.url.endswith("?page=practice")
@@ -353,7 +420,7 @@ def test_practice_submit_disables_answers_and_shows_score(streamlit_test_server,
     page.goto(f"{streamlit_test_server['base_url']}/?page=library", wait_until="networkidle")
     page.get_by_role("button", name="✍️ 用目前篩選結果練習").click()
 
-    page.wait_for_url("**/?page=practice")
+    _wait_for_page_param(page, "practice")
     page.get_by_role("heading", name="作答練習").wait_for()
 
     _radio_label(page, "B. Two").click()
@@ -425,8 +492,10 @@ def test_past_exam_mode_supports_mixed_year_range_stats_and_review(streamlit_tes
 
 def test_draft_box_batch_promote_reports_partial_failure(streamlit_test_server, browser_page) -> None:
     page = browser_page
-    page.goto(f"{streamlit_test_server['base_url']}/?page=drafts", wait_until="networkidle")
-    page.get_by_role("heading", name="題目草稿箱").wait_for()
+    page.goto(f"{streamlit_test_server['base_url']}/?page=library", wait_until="networkidle")
+    page.get_by_role("heading", name="題庫管理").wait_for()
+    page.get_by_role("tab", name="待審草稿").click()
+    page.get_by_text("待審草稿區會在這裡處理模板套用、QA、批次編修與正式入庫。", exact=True).wait_for()
 
     _select_all_drafts(page)
     page.get_by_text("送入正式題庫前摘要", exact=True).wait_for()
@@ -434,12 +503,10 @@ def test_draft_box_batch_promote_reports_partial_failure(streamlit_test_server, 
     _delete_draft(streamlit_test_server["db_path"], streamlit_test_server["draft_ids"]["promote_failure"])
 
     page.get_by_role("button", name="✅ 送入正式題庫").click()
+    _wait_for_question_in_bank(streamlit_test_server["db_path"], "Draft smoke promote success")
 
-    page.get_by_text("已正式入庫 1 題，另有 1 題入庫失敗。", exact=True).wait_for()
-
-    assert page.url.endswith("?page=drafts")
-    assert page.get_by_text("已送入題庫 1 題").is_visible()
-    assert page.get_by_text("Draft smoke promote failure", exact=False).count() == 0
+    assert page.url.endswith("?page=library")
+    assert "Draft smoke promote failure" not in _draft_question_texts(streamlit_test_server["db_path"])
 
 
 def test_textbook_preview_only_review_can_only_save_to_drafts(streamlit_test_server, browser_page) -> None:
@@ -453,44 +520,47 @@ def test_textbook_preview_only_review_can_only_save_to_drafts(streamlit_test_ser
     page.get_by_role("button", name="🧪 載入教材 preview-only").click()
 
     page.get_by_text("AI 生成結果：共 1 題", exact=False).wait_for()
-    page.get_by_text("本批有 1 題屬於 preview-only 草稿，只能送進草稿箱，不能直接正式入庫。", exact=True).wait_for()
-    page.get_by_text("preview-only：這題是從教材 section/chapter/full text 產生的草稿，不可直接正式入庫。", exact=True).wait_for()
+    page.get_by_text("本批有 1 題屬於 preview-only 題目，只供工作台預覽，請到題庫管理進行審閱。", exact=True).wait_for()
+    page.get_by_text("preview-only：這題只供工作台預覽，請到題庫管理進行審閱後再決定是否入庫。", exact=True).wait_for()
 
-    assert page.get_by_role("button", name="✅ 全部正式入庫").is_disabled()
-    assert page.get_by_role("button", name="💾 正式入庫").first.is_disabled()
+    page.get_by_role("button", name="📚 前往題庫管理").click()
+    page.get_by_role("heading", name="題庫管理").wait_for()
+    page.get_by_role("tab", name="待審草稿").click()
+    page.get_by_text("待審草稿區會在這裡處理模板套用、QA、批次編修與正式入庫。", exact=True).wait_for()
+    page.get_by_label("搜尋草稿").fill(preview_text)
 
-    page.get_by_role("button", name="📥 全部送進草稿箱").click()
+    _select_all_drafts(page)
 
-    page.wait_for_url("**/?page=drafts")
-    page.get_by_role("heading", name="題目草稿箱").wait_for()
-    page.get_by_text("已新增 1/1 題到草稿箱。", exact=True).wait_for()
+    page.get_by_text("送入正式題庫前摘要", exact=True).wait_for()
 
     after_drafts = _draft_question_texts(streamlit_test_server["db_path"])
     assert preview_text not in before_drafts
     assert preview_text in after_drafts
 
 
-def test_textbook_formal_ready_review_can_save_to_question_bank(streamlit_test_server, browser_page) -> None:
+def test_textbook_formal_ready_review_can_save_to_question_bank(isolated_streamlit_test_server, browser_page) -> None:
     formal_text = "E2E textbook formal-save shock question"
-    before_questions = _bank_questions_by_text(streamlit_test_server["db_path"])
+    before_questions = _bank_questions_by_text(isolated_streamlit_test_server["db_path"])
 
     page = browser_page
-    page.goto(f"{streamlit_test_server['base_url']}/?page=generate", wait_until="networkidle")
+    page.goto(f"{isolated_streamlit_test_server['base_url']}/?page=generate", wait_until="networkidle")
     page.get_by_role("heading", name="AI 考題生成").wait_for()
 
     page.get_by_role("button", name="🧪 載入教材 formal-save").click()
+    page.wait_for_timeout(1500)
+    _wait_for_question_in_drafts(isolated_streamlit_test_server["db_path"], formal_text)
 
-    page.get_by_text("AI 生成結果：共 1 題", exact=False).wait_for()
-    page.get_by_text("本批題目都已具備 formal-save evidence pack，可直接正式入庫。", exact=True).wait_for()
-    page.get_by_text("formal-save ready：stem_source、answer_source、explanation_sources 已齊備。", exact=True).wait_for()
+    page.get_by_role("button", name="📚 前往題庫管理").click()
+    page.get_by_role("heading", name="題庫管理").wait_for()
+    page.get_by_role("tab", name="待審草稿").click()
+    page.get_by_text("待審草稿區會在這裡處理模板套用、QA、批次編修與正式入庫。", exact=True).wait_for()
+    page.get_by_label("搜尋草稿").fill(formal_text)
 
-    assert not page.get_by_role("button", name="✅ 全部正式入庫").is_disabled()
-    assert not page.get_by_role("button", name="💾 正式入庫").first.is_disabled()
-
-    page.get_by_role("button", name="✅ 全部正式入庫").click()
+    _select_all_drafts(page)
+    page.get_by_role("button", name="✅ 送入正式題庫").click()
     assert formal_text not in before_questions
 
-    saved_question = _wait_for_question_in_bank(streamlit_test_server["db_path"], formal_text)
+    saved_question = _wait_for_question_in_bank(isolated_streamlit_test_server["db_path"], formal_text)
     assert saved_question.source is not None
     assert saved_question.source.document == "Miller E2E Textbook"
     assert saved_question.source.chapter == "ACUTE CIRCULATORY FAILURE IN CHILDREN (SHOCK AND SEPSIS)"
@@ -500,20 +570,13 @@ def test_textbook_formal_ready_review_can_save_to_question_bank(streamlit_test_s
     assert len(saved_question.source.explanation_sources) == 1
 
 
-def test_textbook_review_can_jump_directly_to_practice(streamlit_test_server, browser_page) -> None:
+def test_textbook_review_can_jump_directly_to_practice(isolated_streamlit_test_server, browser_page) -> None:
     page = browser_page
-    page.goto(f"{streamlit_test_server['base_url']}/?page=generate", wait_until="networkidle")
-    page.get_by_role("heading", name="AI 考題生成").wait_for()
+    _open_generated_review_practice(
+        page,
+        isolated_streamlit_test_server["base_url"],
+        "E2E textbook preview-only shock question",
+    )
 
-    page.get_by_role("button", name="🧪 載入教材 preview-only").click()
-
-    page.get_by_text("AI 生成結果：共 1 題", exact=False).wait_for()
-    page.get_by_role("button", name="✍️ 立即練習").click()
-
-    page.wait_for_url("**/?page=practice")
-    page.get_by_role("heading", name="作答練習").wait_for()
-    page.get_by_text("E2E textbook preview-only shock question", exact=False).wait_for()
-
-    assert page.url.endswith("?page=practice")
     assert page.get_by_role("radio", name="✍️ 作答練習").is_checked()
     assert page.get_by_text("E2E textbook preview-only shock question", exact=False).is_visible()

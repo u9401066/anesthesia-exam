@@ -17,9 +17,11 @@ from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 from src.domain.entities.past_exam import Concept, PastExam, PastExamQuestion, QuestionPattern
 from src.domain.repositories.past_exam_repository import IPastExamRepository
+from src.infrastructure.logging import get_logger
 
 PAGE_MARKER_RE = re.compile(r"<!--\s*Page\s+(\d+)\s*-->")
 QUESTION_START_RE = re.compile(r"^\s*(\d{1,3})\s*[\.、\)）:：]\s*(.*?)\s*$")
@@ -28,16 +30,17 @@ ANSWER_HEADING_RE = re.compile(
     re.IGNORECASE,
 )
 INLINE_ANSWER_RE = re.compile(
-    r"(?:答案|正確答案|answer(?:\s+key)?|correct\s+answer)\s*[:：]?\s*([A-E])",
+    r"(?:答案|正確答案|answer(?:\s+key)?|correct\s+answer)\s*[:：=]?\s*([A-E]{1,5}|BONUS)",
     re.IGNORECASE,
 )
 OPTION_START_RE = re.compile(r"(?<![A-Z0-9])([A-E])[\.、\)）:：]\s*")
+OPTION_LINE_RE = re.compile(r"^\s*\(?([A-E])[\.、\)）:：]\s*(.*)$", re.IGNORECASE)
 OPTION_LABEL_ONLY_RE = re.compile(r"^\s*\(?([A-E])[\.、\)）:：]\s*$", re.IGNORECASE)
 OPTION_RE = re.compile(
     r"(?<![A-Z0-9])([A-E])[\.、\)）:：]\s*(.+?)(?=(?<![A-Z0-9])[A-E][\.、\)）:：]\s*|$)",
     re.IGNORECASE,
 )
-ANSWER_PAIR_RE = re.compile(r"(\d{1,3})\s*[\.、\)）:：-]?\s*([A-E])(?:\b|$)", re.IGNORECASE)
+ANSWER_PAIR_RE = re.compile(r"(\d{1,3})\s*[\.、\)）:：=\-]?\s*([A-E]{1,5}|BONUS)(?:\b|$)", re.IGNORECASE)
 EXPLANATION_RE = re.compile(r"(?:解析|詳解|說明|explanation)\s*[:：]\s*(.+)$", re.IGNORECASE)
 
 ENGLISH_STOPWORDS = {
@@ -204,6 +207,8 @@ CONCEPT_RULES = [
     },
 ]
 
+logger = get_logger(__name__)
+
 
 @dataclass(slots=True)
 class AssetAwareDocument:
@@ -297,8 +302,10 @@ class PastExamExtractionService:
 
     def load_asset_document(self, doc_id: str) -> AssetAwareDocument:
         """Load manifest + markdown produced by asset-aware for a given doc_id."""
+        log = logger.bind(doc_id=doc_id)
         doc_dir = self.data_dir / doc_id
         if not doc_dir.exists():
+            log.error("asset_document_dir_missing", doc_dir=str(doc_dir))
             raise FileNotFoundError(f"找不到 doc_id 目錄: {doc_id}")
 
         manifest_path = doc_dir / f"{doc_id}_manifest.json"
@@ -312,19 +319,28 @@ class PastExamExtractionService:
             if legacy_markdown_path.exists():
                 markdown_path = legacy_markdown_path
         if not manifest_path.exists():
+            log.error("asset_manifest_missing", manifest_path=str(manifest_path))
             raise FileNotFoundError(f"找不到 manifest: {manifest_path}")
         if not markdown_path.exists():
+            log.error("asset_markdown_missing", markdown_path=str(markdown_path))
             raise FileNotFoundError(f"找不到 markdown: {markdown_path}")
 
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         markdown = markdown_path.read_text(encoding="utf-8")
-        return AssetAwareDocument(
+        document = AssetAwareDocument(
             doc_id=doc_id,
             title=manifest.get("title") or manifest.get("filename") or doc_id,
             manifest=manifest,
             markdown=markdown,
             markdown_path=markdown_path,
         )
+        log.info(
+            "asset_document_loaded",
+            title=document.title,
+            markdown_chars=len(markdown),
+            markdown_path=str(markdown_path),
+        )
+        return document
 
     def extract_questions(
         self,
@@ -333,6 +349,8 @@ class PastExamExtractionService:
         exam_year: int = 0,
     ) -> ExtractionResult:
         """Normalize numbered questions and answer keys from a markdown artifact."""
+        log = logger.bind(doc_id=document.doc_id, exam_name=exam_name or document.title, exam_year=exam_year)
+        log.info("past_exam_extract_start", markdown_chars=len(document.markdown))
         lines_with_pages = self._markdown_lines_with_pages(document.markdown)
         answer_heading_index = self._find_answer_heading(lines_with_pages)
         answer_region = lines_with_pages[answer_heading_index:] if answer_heading_index is not None else []
@@ -349,7 +367,27 @@ class PastExamExtractionService:
         for line, page in question_region:
             match = QUESTION_START_RE.match(line)
             matched_number = int(match.group(1)) if match else None
-            is_next_question = current_number is None or matched_number == current_number + 1
+            current_block_has_question_shape = (
+                matched_number is not None
+                and current_number is not None
+                and matched_number > current_number
+                and self._block_looks_like_question(current_lines)
+            )
+            is_reset_question = (
+                matched_number == 1
+                and current_number is not None
+                and current_number > matched_number
+                and current_pages
+                and page != current_pages[-1]
+                and matched_number in answer_map
+                and self._block_looks_like_question(current_lines)
+            )
+            is_next_question = current_number is None or matched_number == current_number + 1 or (
+                matched_number is not None
+                and current_number is not None
+                and matched_number > current_number
+                and (matched_number in answer_map or current_block_has_question_shape)
+            ) or is_reset_question
             if match and is_next_question:
                 if current_number is not None:
                     question = self._build_question(
@@ -390,19 +428,27 @@ class PastExamExtractionService:
             if question is not None:
                 questions.append(question)
 
-        return ExtractionResult(
+        result = ExtractionResult(
             exam_name=exam_name or document.title,
             exam_year=exam_year,
             doc_id=document.doc_id,
             questions=questions,
             answer_map=answer_map,
         )
+        log.info(
+            "past_exam_extract_complete",
+            question_count=len(questions),
+            answer_key_count=len(answer_map),
+        )
+        return result
 
     def classify_questions(
         self,
         questions: list[PastExamQuestion],
     ) -> tuple[list[PastExamQuestion], list[Concept]]:
         """Derive concept, pattern and difficulty tags from normalized questions."""
+        log = logger.bind(question_count=len(questions))
+        log.info("past_exam_classify_start")
         concepts_by_name: dict[str, Concept] = {}
 
         for question in questions:
@@ -426,10 +472,103 @@ class PastExamExtractionService:
             question.difficulty = self._detect_difficulty(question, pattern, matched_concepts)
             question.bloom_level = self._detect_bloom_level(pattern, question.difficulty)
 
-        return questions, list(concepts_by_name.values())
+        concepts = list(concepts_by_name.values())
+        log.info("past_exam_classify_complete", concept_count=len(concepts))
+        return questions, concepts
+
+    def build_question_semantic_outline(self, question: PastExamQuestion | dict[str, Any]) -> dict[str, Any]:
+        """Build a structured semantic outline for one question and its options."""
+        if isinstance(question, PastExamQuestion):
+            payload = question.to_dict()
+        else:
+            payload = dict(question)
+
+        question_text = str(payload.get("question_text") or "").strip()
+        options = [str(option).strip() for option in (payload.get("options") or []) if str(option).strip()]
+        correct_answer = str(payload.get("correct_answer") or "").strip().upper()
+        combined_text = " ".join([question_text, *options]).strip()
+
+        pattern = self._detect_pattern(combined_text)
+        stem_concepts = self._detect_concepts(question_text)
+        if not stem_concepts:
+            stem_concepts = self._fallback_concepts(question_text)
+
+        stem_topics = self._topics_from_concepts(stem_concepts)
+        stem_concept_names = [concept.name for concept in stem_concepts]
+        stem_categories = _dedupe_preserve_order(
+            [concept.category for concept in stem_concepts] + [concept.subcategory for concept in stem_concepts if concept.subcategory]
+        )
+
+        option_rows: list[dict[str, Any]] = []
+        all_topics = list(stem_topics)
+        all_concepts = list(stem_concept_names)
+
+        for index, option_text in enumerate(options):
+            option_concepts = self._detect_concepts(option_text)
+            if not option_concepts:
+                option_concepts = self._fallback_concepts(f"{question_text} {option_text}".strip())
+
+            option_topics = self._topics_from_concepts(option_concepts)
+            option_concept_names = [concept.name for concept in option_concepts]
+            option_categories = _dedupe_preserve_order(
+                [concept.category for concept in option_concepts]
+                + [concept.subcategory for concept in option_concepts if concept.subcategory]
+            )
+            option_label = chr(65 + index)
+            option_role = "correct_answer" if option_label == correct_answer else "distractor"
+
+            option_rows.append(
+                {
+                    "label": option_label,
+                    "text": option_text,
+                    "topics": option_topics,
+                    "concept_names": option_concept_names,
+                    "categories": option_categories,
+                    "role": option_role,
+                }
+            )
+            all_topics.extend(option_topics)
+            all_concepts.extend(option_concept_names)
+
+        anchor_topic = stem_topics[0] if stem_topics else (all_topics[0] if all_topics else "")
+        anchor_concept = stem_concept_names[0] if stem_concept_names else (all_concepts[0] if all_concepts else "")
+        correct_option = next((row for row in option_rows if row["label"] == correct_answer), None)
+
+        return {
+            "question_group": {
+                "group_type": "standalone_question",
+                "exam_context": {
+                    "exam_year": payload.get("exam_year"),
+                    "exam_name": payload.get("exam_name"),
+                    "question_number": payload.get("question_number"),
+                },
+                "pattern": pattern.value,
+                "task_focus": self._task_focus_for_pattern(pattern),
+                "anchor_topic": anchor_topic,
+                "anchor_concept": anchor_concept,
+                "group_topics": _dedupe_preserve_order(all_topics),
+                "group_concepts": _dedupe_preserve_order(all_concepts),
+            },
+            "stem_focus": {
+                "question_text": question_text,
+                "pattern": pattern.value,
+                "task_focus": self._task_focus_for_pattern(pattern),
+                "topics": stem_topics,
+                "concept_names": stem_concept_names,
+                "categories": stem_categories,
+            },
+            "options_analysis": option_rows,
+            "correct_option": {
+                "label": correct_answer,
+                "text": correct_option.get("text") if correct_option else "",
+                "topics": correct_option.get("topics", []) if correct_option else [],
+                "concept_names": correct_option.get("concept_names", []) if correct_option else [],
+            },
+        }
 
     def build_blueprint(self, questions: list[PastExamQuestion], concepts: list[Concept]) -> dict:
         """Aggregate extracted questions into a reusable reference blueprint."""
+        logger.info("past_exam_blueprint_build_start", question_count=len(questions), concept_count=len(concepts))
         pattern_counts = Counter(question.pattern.value for question in questions)
         difficulty_counts = Counter(question.difficulty for question in questions)
         concept_counts = Counter(name for question in questions for name in question.concept_names)
@@ -446,7 +585,7 @@ class PastExamExtractionService:
         if top_patterns:
             recommended_rules.append(f"優先保留高頻題型骨架：{', '.join(top_patterns)}。")
 
-        return {
+        blueprint = {
             "question_count": len(questions),
             "concept_count": len(concepts),
             "pattern_distribution": dict(pattern_counts),
@@ -465,6 +604,12 @@ class PastExamExtractionService:
                 for question in questions[:5]
             ],
         }
+        logger.info(
+            "past_exam_blueprint_build_complete",
+            top_pattern_count=len(top_patterns),
+            high_frequency_concept_count=len(top_concepts),
+        )
+        return blueprint
 
     def _build_past_exam_aggregate(
         self,
@@ -539,7 +684,7 @@ class PastExamExtractionService:
                 continue
             cleaned_block.append(line)
 
-        stem, options = self._extract_stem_and_options(" ".join(cleaned_block))
+        stem, options = self._extract_stem_and_options("\n".join(cleaned_block))
         if not stem or len(options) < 2:
             return None
 
@@ -557,7 +702,19 @@ class PastExamExtractionService:
             raw_text=block_text,
         )
 
+    def _block_looks_like_question(self, block_lines: list[str]) -> bool:
+        filtered_lines = [line.strip() for line in block_lines if line.strip()]
+        if not filtered_lines:
+            return False
+
+        stem, options = self._extract_stem_and_options("\n".join(filtered_lines))
+        return bool(stem) and len(options) >= 2
+
     def _extract_stem_and_options(self, block_text: str) -> tuple[str, list[str]]:
+        stem, options = self._extract_linewise_stem_and_options(block_text)
+        if len(options) >= 2:
+            return stem, options
+
         block_text = _clean_inline_text(block_text)
         first_option = OPTION_START_RE.search(block_text)
         if not first_option:
@@ -566,6 +723,43 @@ class PastExamExtractionService:
         stem = _clean_inline_text(block_text[: first_option.start()])
         options_text = block_text[first_option.start() :]
         options = [_clean_inline_text(match.group(2)) for match in OPTION_RE.finditer(options_text)]
+        return stem, options
+
+    def _extract_linewise_stem_and_options(self, block_text: str) -> tuple[str, list[str]]:
+        stem_lines: list[str] = []
+        option_order: list[str] = []
+        option_fragments: dict[str, list[str]] = {}
+        current_label: str | None = None
+
+        for raw_line in block_text.splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+
+            match = OPTION_LINE_RE.match(line)
+            if match is not None:
+                label = match.group(1).upper()
+                current_label = label
+                if label not in option_fragments:
+                    option_order.append(label)
+                    option_fragments[label] = []
+                option_text = _clean_inline_text(match.group(2))
+                if option_text:
+                    option_fragments[label].append(option_text)
+                continue
+
+            cleaned_line = _clean_inline_text(line)
+            if current_label is None:
+                stem_lines.append(cleaned_line)
+                continue
+
+            option_fragments[current_label].append(cleaned_line)
+
+        stem = _clean_inline_text(" ".join(stem_lines))
+        options: list[str] = []
+        for label in option_order:
+            option_text = _clean_inline_text(" ".join(option_fragments[label]))
+            options.append(option_text or f"圖像選項 {label}")
         return stem, options
 
     def _detect_pattern(self, combined_text: str) -> QuestionPattern:
@@ -649,3 +843,26 @@ class PastExamExtractionService:
         if difficulty == "medium":
             return 2
         return 1
+
+    @staticmethod
+    def _topics_from_concepts(concepts: list[Concept]) -> list[str]:
+        return _dedupe_preserve_order(
+            [concept.category for concept in concepts]
+            + [concept.subcategory for concept in concepts if concept.subcategory]
+            + [concept.name for concept in concepts if concept.name]
+        )
+
+    @staticmethod
+    def _task_focus_for_pattern(pattern: QuestionPattern) -> str:
+        mapping = {
+            QuestionPattern.DIRECT_RECALL: "fact_recall",
+            QuestionPattern.CLINICAL_SCENARIO: "clinical_decision",
+            QuestionPattern.COMPARISON: "compare_and_discriminate",
+            QuestionPattern.MECHANISM: "mechanism_reasoning",
+            QuestionPattern.CALCULATION: "clinical_calculation",
+            QuestionPattern.IMAGE_BASED: "image_interpretation",
+            QuestionPattern.BEST_ANSWER: "best_choice_selection",
+            QuestionPattern.NEGATION: "false_statement_detection",
+            QuestionPattern.SEQUENCE: "sequence_ordering",
+        }
+        return mapping.get(pattern, "knowledge_assessment")

@@ -36,6 +36,19 @@ class IPastExamRepository(ABC):
         """List normalized/classified questions for one extracted exam."""
 
     @abstractmethod
+    def list_all_questions(
+        self,
+        limit: int | None = None,
+        *,
+        explanation_required: bool = False,
+    ) -> list[PastExamQuestion]:
+        """List past-exam questions across all imported exams."""
+
+    @abstractmethod
+    def update_question_explanation(self, question_id: str, explanation: str) -> bool:
+        """Update the persisted explanation for one past-exam question."""
+
+    @abstractmethod
     def list_exam_catalog(self, limit: int = 20) -> list[dict]:
         """List past exam summary rows for dashboard / management views."""
 
