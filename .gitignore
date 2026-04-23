@@ -51,8 +51,19 @@ secrets/
 # 教材 PDF (版權保護)
 *.pdf
 
+# 本地教材/歷屆來源包 (版權與授權限制，不追蹤原檔)
+Miller anesthesia章節分割版/
+歷屆考題/
+ITE考題與詳解/
+
 # 資料目錄 (不追蹤)
 data/
+
+# 批次/稽核報告輸出
+reports/
+
+# Shell redirection / package spec typo artifacts
+=*
 
 # 測試產出 (不追蹤)
 tests/**/output/

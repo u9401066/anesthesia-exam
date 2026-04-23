@@ -2,9 +2,45 @@
 
 ## Current Goals
 
-- 正在整理主 repo 的臨時備份提交，目標是將除考古題原始檔與書本 PDF 之外的變更 commit 並 push 到 remote，以便切換工作區繼續開發。已確認主 repo origin 與 git author 設定正確；另外發現 libs/asset-aware-mcp 子模組本身仍有未提交變更與 merge conflict，需要視為獨立風險處理。
+- 讓 repo 的「考古題互動學習」主線先真正可用：優先補齊有完整答案鍵年份的詳解、維持 Streamlit 題庫管理頁可單題/批次生成詳解、並保留對 `192.168.1.145:8081/v1` 的 direct OpenAI-compatible fallback。
 
 ## Current Focus
+
+**2026-04-23 補充：Miller 9th 分章教材的 figure asset 已完成全量刷新與品質稽核。這次不是再盲目全書 strict Marker 重跑，而是在 asset-aware pipeline 補上可控的 high-fidelity profile、figure filtering、Marker bbox crop fallback 與 PyMuPDF caption timeout guard 後，對 `Miller anesthesia章節分割版` 87/87 章節執行 figure-only refresh。刷新後 latest audit 顯示：figure 總數 `4159 -> 867`，極小碎圖 `<20k area` 從 `2267` 降到 `51`，低變異圖從 `1759` 降到 `14`，最大單頁 figure 數從 `268` 降到 `4`，且 manifest path 的 missing / unreadable / 舊 `/root` prefix 已歸零。這代表先前「圖像多數錯誤」的主要 root cause 已從大量 XObject/region false positives 收斂為少數章節的 caption/evidence matching 問題；下一步應做 targeted caption recovery，而不是再次全書重刷。**
+
+**2026-04-22 補充：`109/2020` 年歷屆題答案鍵異常已完成 root-cause investigation 與正式修復。問題不是官方全卷送分，而是 `109年筆試考題答案.pdf` 的隱藏文字層/OCR 結果錯誤，先前匯入腳本因此把整份答案檔誤判成 `本題送分`，再硬寫成 `BONUS`。目前已把校對後的 `1-100` 題官方答案表固化進 `scripts/import_written_past_exams.py`，並透過 `scripts/repair_109_written_answers.py` 先備份再更新正式 DB；修復結果為 `updated_count=100`、`bonus_rows_remaining=0`，抽查 `Q1=B / Q40=A / Q71=D / Q100=C` 均符合原始答案頁。這代表 `2020` 年 written 題庫現在已重新具備網站互動判分資格。**
+
+**2026-04-21 補充：已用正式流程把 `2025` 年歷屆題首批 `10` 題詳解寫入 `data/questions.db`。這批是透過新加的 `scripts/batch_fill_past_exam_explanations.py` 執行，流程會先備份正式 DB，再用 repo 內相似詳解題與 `data/2020 Miller's Anesthesia 9th.pdf` 萃出的文字片段一起組 prompt，最後直接呼叫 `http://192.168.1.145:8081/v1` 的 OpenAI-compatible endpoint。驗證結果為 `generated_count=10`、`error_count=0`，`2025` 年剩餘缺詳解題數目前是 `90`。這代表網站端已經有第一批「可判分 + 有詳解」的真實歷屆題可供練習。**
+
+**2026-04-21 補充：已打通「考古題缺詳解補寫」這條使用者主線。新增 `PastExamExplanationService` 後，系統可先從 repo 內已有詳解的一般題庫/歷屆題庫找相似題，組成 reference context，再用 provider 或直接走 `opencode.json` 指向的 OpenAI-compatible endpoint 生成繁中詳解，最後寫回 `past_exam_questions.explanation`。Streamlit `📚 題庫管理 -> 歷屆題庫` 也同步補上單題生成/存檔、批次補寫本卷缺詳解、以及參考題脈絡檢視。這很重要，因為目前真實 DB 有 900 題歷屆題，其中 800 題缺 explanation；現在網站端終於有內建補齊路徑，而不必先等完整 MCP/pipeline 大改完。**
+
+**2026-04-21 補充：`OpenCode` 設定面也做了一刀實用收斂。repo 的 `opencode.json` 已改成把預設模型指向 `gb10/Qwen3.5-122B-A10B-Q5_K_M-00001-of-00003.gguf`，base URL 為 `http://192.168.1.145:8081/v1`；`src/infrastructure/agent/provider.py` 與 Streamlit metadata loader 也不再假設 `provider.models` 一定是單一 dict 形狀，現在可正確列出 custom provider/model refs，且在 top-level `model` 缺席時會回退到第一個已配置模型。額外確認到目前這台機器其實沒有 `opencode` binary，因此「考古題詳解補寫」刻意支援 direct OpenAI-compatible fallback，避免功能被 CLI 安裝狀態卡死。**
+
+**2026-04-21 補充：已完成 `exam_server.py` 第一刀瘦身。題庫型 MCP tools（save/list/create/stats/get/delete/validate/update/audit/search/restore/bulk）已下沉到 `src/application/services/exam_tool_application_service.py`，transport 名稱分派改由 `src/infrastructure/mcp/exam_tool_handlers.py` registry 統一處理；pipeline harness 與 past-exam flow 先留在 `exam_server.py` 作 legacy handlers，同時保留 `exam_server.save_question()` 等 module-level wrappers 以維持現有測試與 monkeypatch path。focused 驗證已通過：`tests/test_exam_tool_handlers.py + test_textbook_formal_save_gate.py + test_exam_pipeline_harness.py` 共 `10 passed`。下一刀適合繼續把 `get_generation_guide / get_topics` 或 past-exam handlers 往 application/service 層收，不要一口氣動整條 pipeline harness。**
+
+**2026-04-21 補充：`app.py` 的生成頁已開始做 DDD-friendly presentation 切片。這一輪沒有去碰整條 prompt orchestration，而是先把「生成後審閱/正式入庫」這塊從單檔抽開：新增 `src/application/services/question_review_service.py` 承接 review payload -> domain entity -> formal bank persistence，用於避免 Streamlit 直接持有正式入庫 mapping；同時新增 `src/presentation/streamlit/generation/controller.py` 與 `.../fragments.py`，把 review form 的 render 與按鈕行為移出 `app.py`。後續又把 `formal-save` gate helper 收斂成 `src/application/services/textbook_generation_service.py` 的單一 facade，避免 `app.py` 與 fragments 規則漂移。驗證已通過：`test_streamlit_practice_browser + test_textbook_generation_service + test_textbook_formal_save_gate + test_draft_workflow_guards` 共 `22 passed`，editor diagnostics 也全綠。**
+
+**2026-04-21 補充：SQLite 資料層已從「每次裸 `sqlite3.connect()`」升級到 per-process 的 SQLAlchemy `QueuePool`，並在 connection factory 統一套用 WAL、`busy_timeout=15000ms`、`foreign_keys=ON`、`synchronous=NORMAL`、`wal_autocheckpoint` 等 hardening。主要 writer repo（question / past exam / scope request / draft）也同步補上 `BEGIN IMMEDIATE`，讓多使用者 Web、heartbeat、MCP agent、importer 同時碰 DB 時至少先有一致的 writer 競爭行為。這輪另外把 `HeartbeatService` 與 `TextbookGenerationService` 接上 structured logging；focused 驗證已通過：SQLite hardening + draft workflow + textbook service + browser smoke 共 `21 passed`，`import_written_past_exams.py --dry-run --only 112` 與 `run_heartbeat.py --status` 也正常。這一輪刻意沒有再拆 `app.py` 的 fragment/dialog，因為生成頁 rerun/state 耦合仍高，適合下一刀獨立 UI 切片處理。**
+
+**2026-04-21 補充：已把 logging 初始化正式抽成共用 bootstrap，`main.py`、Streamlit Web、MCP server 與現有 Python scripts 都改走同一套 `bootstrap_logging()`。新 logging 層支援 env-driven level / JSON console / rotation / debug switch，並加入 contextvars-based `run_id` 綁定；資料層與 workflow 補點後，`database / sqlite_question_repo / sqlite_past_exam_repo / PastExamExtractionService / QuestionBankQueryService / historical importer` 會穩定帶出 `run_id`，且在適用路徑上補 `doc_id / question_id / provider`。同一輪也做了一個低風險 UX 收斂：生成流程改用 `st.status` 聚合長流程狀態，草稿箱成功/資訊訊息改優先走 `st.toast`，避免頁面被瞬時提示訊息洗版。驗證結果：focused pytest `22 passed`、importer dry-run 正常、repository write smoke 正常、所有 touched files `py_compile` 與 editor diagnostics 皆通過。**
+
+**2026-04-21 補充：已修正一個真實的 Streamlit 視覺回歸。問題不是單純 sidebar 漏設字色，而是當瀏覽器/系統進入 dark color scheme 時，Streamlit 內層 widget 仍沿用暗色主題，但頁面外層背景已被自訂 CSS 改成淺色，於是出現 sidebar 白字、暗色輸入框與低對比按鈕。現在 `inject_app_styles()` 會強制 light color scheme，並明確覆寫 sidebar、markdown、form labels、select/input 與按鈕樣式；用 Playwright dark-mode 模擬已驗證 sidebar 字色回到深色，表單與按鈕也恢復可讀，另有 browser smoke `test_library_to_practice_syncs_url_and_navigation` 通過。**
+
+**2026-04-21 補充：作答練習頁還有一個更局部的配色漏網。`📋 練習設定` expander header 與 `stNumberInput` 的 `- / +` stepper 在先前修完 dark color scheme 後，仍殘留 Streamlit 的暗色背景，因為這兩個元件沒有被前一輪按鈕/輸入框 selector 覆蓋到。現在已額外覆寫 expander summary 與 number-input stepper 樣式，Playwright 實測已從暗底切回淺底深字，且 `test_practice_submit_disables_answers_and_shows_score` 通過。**
+
+**2026-04-21 補充：browser smoke 環境阻塞已解除。補完 Ubuntu/Chromium 常見 Linux shared libraries 後，`tests/test_streamlit_practice_browser.py` 不再 skip，而是 8 條全部實跑通過；完整 `tests/` 目前為 `39 passed`。這代表先前的 browser smoke 問題確實是系統依賴缺失，不是 repo 內 test-mode gate 或 Playwright 腳本本身故障。**
+
+**2026-04-21 補充：`past exam pipeline` 下一個真邊界已確認是「新頁題號重置」，不是跨頁題幹續接。新加的 cross-page fixture 已證實現有 extractor 本來就能保留跨頁題幹；真正出錯的是當題本在新頁從 `1.` 重新開始時，`extract_questions()` 原本只接受遞增題號，導致 reset 題被併進前題。現在 extractor 已針對「新頁 + reset 到 1 + 前題已成形 + answer map 可佐證」這個窄條件切出新題；同時 `SQLitePastExamRepository.list_questions()` 也改為依 `source_page + created_at + question_number` 讀回，避免 persistence 層把卷序重洗成數字排序。對應回歸測試已鎖住，past-exam focused suite 與 pipeline harness 為 `17 passed`。**
+
+**2026-04-21 補充：`past exam pipeline` 又收掉一個更貼近真實資料的邊界。`PastExamExtractionService` 原本的答案 regex 只支援單一字母，因此 `40=BE`、`53=AD` 這類多重正確答案鍵會被解析成空字串；現在 `INLINE_ANSWER_RE` 與 `ANSWER_PAIR_RE` 已同步放寬，支援等號、multi-letter answer 與 `BONUS`，並新增 regression test 鎖住這個行為。這個修正很重要，因為 repo 其他 written import 路徑本來就已保留 `111` 年的 `40=BE` / `53=AD`，現在主 extraction service 與那條資料面終於對齊。當前非 E2E 測試面已提升到 `29 passed`。**
+
+**2026-04-21 補充：已沿著 `past exam pipeline` 再往下一層收斂。除了先前修掉的 `1 -> 3` 跳號邊界外，現在也補上「答案區不完整時的跳號切題」回歸測試；root cause 是 `extract_questions()` 原本把跳號切題過度綁在 `matched_number in answer_map`，所以當答案區漏掉第 5 題答案時，`5.` 會被併進第 1 題。現在的規則是：若目前 block 已經長成可解析的完整題目，就算答案區不完整，也要把更大的題號視為新題邊界。新增測試已鎖住 `1 -> 5` 且答案區只含第 1 題答案的情境。browser smoke 診斷也更完整：本機已成功下載 Playwright Chromium，但啟動時仍因缺 `libatk-1.0.so.0` 而 skip；這代表 repo 內測試邏輯本身尚未開始執行到 UI 互動，下一步若要真正跑 smoke，必須先補齊 Linux 系統函式庫。當前非 E2E 測試面已提升到 `28 passed`。**
+
+**2026-04-21 補充：已沿著 `past exam pipeline` 主線收斂下一個真邊界。`PastExamExtractionService.extract_questions()` 原本只接受嚴格連號切分，因此遇到 `1 ... 3 ...` 這種跳號題本時，第三題會被併進第一題；目前已改成在答案鍵可佐證時接受跳號邊界，並新增 regression test 鎖住。教材 source-tracking 也再補了一個更貼近真實的多文件/多 section hint 測試：不用 monkeypatch 打分邏輯，也能驗證完整 `source_ready` 文件會壓過較高分但不完整的 competing doc。browser smoke 部分則已確認本機 skip 根因不是 test-mode，而是環境依賴分兩層：先缺 Playwright Chromium binary，安裝後又缺 Linux shared library `libatk-1.0.so.0`；`playwright install-deps chromium` 可往前走，但在這台機器需要 sudo 才能完成。當前驗證結果已提升到非 E2E 測試面 `27 passed`。**
+
+**2026-04-21 補充：已把 `tests/compare_section_extraction.py`、`tests/test_chapter_extraction.py`、`tests/test_ch79_ingest.py` 三支手動 PDF 腳本正式移出 `tests/`，集中到 `scripts/pdf_experiments/`，並改成 repo-relative 路徑與 CLI 用法，避免再被 pytest 收集為回歸測試。這一輪同時修掉一個更接近主線的教材 source-tracking bug：`TextbookGenerationService._build_evidence_pack()` 在多 `doc_id` 情境下，原本可能選到 `source_ready=false` 但分數較高的 pack，蓋掉另一個可正式入庫的完整 pack；現在已改成先比 `source_ready`，同狀態下才比 score，並新增 regression test 鎖住這個行為。當前驗證結果：`pytest --collect-only tests -q` 為 32 collected，非 E2E 測試面為 `25 passed`，`scripts/pdf_experiments/*.py` 也已通過 `py_compile`。**
+
+**2026-04-20 補充：已收斂一個真實的測試面污染問題。`tests/test_ch79_ingest.py` 與 `tests/test_chapter_extraction.py` 都是舊的 Windows-only PDF 實驗腳本，不應再視為正式回歸測試；目前已改為 module-level skip，避免 `pytest` 在 broad collect / full non-E2E run 時因 `fitz` 缺失、硬編碼 Windows 路徑或不存在模組而失敗。同一輪也把 `src/domain/entities/message.py` 的 Pydantic class-based config 換成 `ConfigDict`，所以目前非 E2E 測試面為 `24 passed, 2 skipped`，且不再有 deprecation warning。**
 
 **2026-04-17 補充：教材 review 後直接切到 practice 的 UI 路徑也已被 browser smoke 鎖住。`tests/test_streamlit_practice_browser.py` 新增 `review -> ✍️ 立即練習 -> 作答練習頁` 驗證，確認 seeded textbook review state 能直接開一回合練習，不只停留在 save gate 驗證。**
 
@@ -48,7 +84,7 @@
 
 **2026-04-15 補充：已新增 `src/application/services/question_bank_query_service.py`，把一般題庫的內容統計、generated exam 檔案數整合，以及 `validated_only / exam_track` 的 signature-aware 查詢邏輯從 `app.py` 收進 application layer。`app.py` 的 `get_questions_stats()` / `load_questions()` 現在只剩 service facade。之後若要擴一般題庫 dashboard、搜尋或排序，優先加在這個 service，不要再把 read-model 邏輯長回 `app.py`。同一輪已用 `scripts/run_web.sh` 重啟 live 8501，現行 PID 為 `156210`，首頁 live check 正常。**
 
-**2026-04-14 補充：已完成 written 歷屆題庫 `106-114` 的異質來源匯入。新增 `scripts/import_written_past_exams.py` 後，現在可以把 `106-108` 的 RAR/PDF/DOCX、`109-113` 的題本 + 分離式答案檔，以及 `114` 的 DOCX 題本 + JPG 答案表，統一轉成既有 past-exam markdown pipeline 並寫回 SQLite。當前 DB 狀態為：`106/107/108/109/110/111/113/114` 皆已達 `100` 題且 `100` 題有答案；`112` 題本也已完整落庫 `100` 題，但因 workspace 內找不到答案來源，答案欄位維持空白。`109` 的 `本題送分` 已落成 `BONUS`，`111` 的 `40=BE` 與 `53=AD` 也已保留。**
+**2026-04-14 補充：已完成 written 歷屆題庫 `106-114` 的異質來源匯入。新增 `scripts/import_written_past_exams.py` 後，現在可以把 `106-108` 的 RAR/PDF/DOCX、`109-113` 的題本 + 分離式答案檔，以及 `114` 的 DOCX 題本 + JPG 答案表，統一轉成既有 past-exam markdown pipeline 並寫回 SQLite。當前 DB 狀態為：`106/107/108/109/110/111/113/114` 皆已達 `100` 題且 `100` 題有答案；`112` 題本也已完整落庫 `100` 題，但因 workspace 內找不到答案來源，答案欄位維持空白。`109` 年答案鍵已在 2026-04-22 依官方答案表影像修正；`111` 的 `40=BE` 與 `53=AD` 也已保留。**
 
 **2026-04-14 補充：已用真實歷屆題本完成 past-exam parser 第三輪收斂。`109` 到 `113` 五份 PDF 題本皆已驗證可經 asset-aware ingestion 後正確抽出 100/100 題，並已全部落庫，累計 past exam questions = 500。這輪額外修正了 image-style 題目邊界：若上一題以純 `(D)`/`(E)` 收尾，也必須允許下一個連續題號正常切出。當前真正未解的是 `106-108` 的 `rar` 前處理、`114` 題本 `docx` 匯入，以及分離式答案檔（PDF/DOCX/JPG）的 OCR / merge 流程。**
 
@@ -122,6 +158,7 @@
 - **Web 生成頁仍屬 prompt 編排式整合**：UI gating 已正確，但正式生成仍需要把 pipeline tool 調用做成更穩定的服務層接線
 - **作者工具仍未完整**：草稿箱已具 draft-first、相似題提醒、歷史模板、blueprint、QA checklist、版本歷史與 promote 前摘要基礎，但尚未支援 filter presets、版本回滾與更細的 promote gate override UX
 - **systemd 服務在目前 workspace 內無法直接啟動**：unit / install script 已備妥，且 `/etc/systemd/system/anesthesia-exam-web.service` 已落檔；但此容器 PID 1 非 systemd，因此 `systemctl` 無法連 bus
+- **Miller 圖像 caption coverage 仍需 targeted 補強**：碎圖與壞路徑已收斂，但 chapter 30、42、59、66、32 等章節仍有較高 no-caption ratio；詳解/出題若需要圖像證據，應先做章節級 caption/evidence recovery，不要把無 caption 圖直接當作可靠引用
 
 ## Next Steps
 
@@ -132,3 +169,4 @@
 5. **擴草稿箱下一刀**：補 filter presets、版本回滾與更清楚的 promote override UX，讓版本歷史不只可看也可回復
 6. **補 UI / Agent 接線**：讓生成頁正式消費 pipeline tools，並保留目前已驗證的 source-ready gate / preview mode UX
 7. **在真正的 systemd 主機驗證 service lifecycle**：執行 `./scripts/install_systemd_service.sh`，確認 enable/restart/journal 行為
+8. **針對 Miller 低 caption coverage 章節補強 evidence recovery**：優先從 latest image audit 的高風險章節開始，讓圖像、頁碼、caption 與 markdown evidence 可一起被詳解/出題流程消費

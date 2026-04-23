@@ -1,0 +1,12 @@
+{
+  "base": "default",
+  "name": "miller_marker_hq",
+  "description": "High-fidelity Miller textbook profile for Marker-based figure extraction",
+  "filters": {
+    "min_figure_px": 96,
+    "min_table_rows": 1,
+    "min_table_cols": 2,
+    "max_caption_number": 999,
+    "min_caption_body_len": 10
+  }
+}

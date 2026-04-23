@@ -55,6 +55,14 @@ crush.json
     └── list_documents            # 列出已處理文件
 ```
 
+### Asset-Aware 使用規則
+
+- 教材型 PDF 若需要可靠的 figure extraction，必須走 `Marker` 路徑，不可把 `PyMuPDF` fallback 圖像輸出視為正式圖像結果。
+- Miller 教材預設使用 repo 內的 `configs/asset-aware/miller_marker_hq.json` 自訂 profile。
+- 透過 MCP 取圖時，優先使用 `fetch_document_asset(doc_id, "figure", fig_id)` 或 `document://{doc_id}/figures`，不要只把本地圖片路徑丟給模型。
+- 若需要批次重跑 Miller 章節，優先使用：
+  `uv run python scripts/ingest_miller_chapters.py --high-fidelity-marker ...`
+
 ---
 
 ## 開發哲學 💡

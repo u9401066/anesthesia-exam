@@ -1,5 +1,83 @@
 # Decision Log
 
+## 2026-04-23
+
+### DEC-042: Miller 教材圖像修復採「figure-only 全章節刷新 + audit gate」，不再用無界限 strict Marker 全書重跑
+
+| 項目 | 內容 |
+|------|------|
+| **決策** | 對 Miller 9th 分章教材先做 figure-only refresh，重建每個章節 manifest 的 `assets.figures` 與 `images/`，並以 image audit 指標作為完成門檻；strict Marker 僅保留作為 targeted 高風險章節策略，不作為這台機器上的全書預設重跑方式。 |
+| **問題** | 先前 figure manifest 中存在大量碎圖與錯圖：總數達 `4159`，其中 `<20k area` 有 `2267` 張，低變異圖 `1759` 張，甚至單頁可噴出 `268` 張 figure。這會直接污染詳解 grounding 與未來出題 evidence。另一方面，strict Marker 全章節在本機 CPU-bound 環境成本過高，且單頁 smoke 可出現 `0` figures，不適合作為盲目全書重跑方案。 |
+| **解決方案** | 在 asset-aware 中新增 Miller high-fidelity profile、Marker bbox crop fallback、PyMuPDF figure filtering 與 figure caption extraction document timeout；再用 `scripts/refresh_miller_figures.py` 對 87 章節做 figure-only refresh，最後用 `scripts/audit_miller_image_quality.py` 產出 before/after 報告。遇到 chapter 74/75 的 path 落盤殘留問題時，採 targeted rerun 修正到 `missing=0`。 |
+| **影響** | 最新 audit 結果為 figure 總數 `4159 -> 867`、極小碎圖 `2267 -> 51`、低變異圖 `1759 -> 14`、最大單頁 figure 數 `268 -> 4`，且 missing/unreadable/old-root path 全部歸零。後續焦點應轉向少數章節 caption/evidence matching，而不是再全書重跑圖像。 |
+
+## 2026-04-22
+
+### DEC-041: `109/2020` 年答案鍵修復應採「校對後答案常數 + 單年受控更新腳本」，而不是直接在正式 DB 手工改值
+
+| 項目 | 內容 |
+|------|------|
+| **決策** | 把 `109年筆試考題答案.pdf` 的官方答案表逐題校對後固化進 `scripts/import_written_past_exams.py`，並新增 `scripts/repair_109_written_answers.py` 對正式 DB 做單年、單來源、可備份的受控更新；不直接手工改 SQLite，也不以整份重匯入覆蓋整卷資料。 |
+| **問題** | `2020` 年歷屆題在正式 DB 中曾出現 `100/100` 題 `correct_answer='BONUS'`。追查後發現這不是官方全卷送分，而是 `109年筆試考題答案.pdf` 的隱藏文字層錯誤，導致早期匯入腳本把整份答案檔誤判成 `本題送分`，再以 `BONUS` 覆寫全部答案鍵。這會直接破壞網站上的作答判分。 |
+| **解決方案** | 先用原始答案頁影像作為真值來源逐題校對 `1-100` 題答案，讓 `prepare_109_exam()` 回到正常的 answer-map 路徑；正式修復時則只更新 `exam_year=2020` 且 `source_doc_id=doc_109______a9f9c7` 的 `100` 題 `correct_answer`，並在更新前自動建立 DB 備份、更新後輸出 before/after 驗證報告。 |
+| **影響** | `109/2020` 年現在已恢復為可互動判分的 written 題庫，且之後若重跑 `scripts/import_written_past_exams.py --only 109`，不會再把答案鍵回滾成 `BONUS`。這次也建立了一個處理正式資料錯誤的模式：先找 root cause、再把修正落回可重現的 code path，最後才更新正式資料。 |
+
+## 2026-04-21
+
+### DEC-040: 第一批正式補寫詳解先落在 `2025` 年，而不是直接寫 `2020` 年；此判斷在當時成立，`2020` 年答案鍵已於 2026-04-22 修復
+
+| 項目 | 內容 |
+|------|------|
+| **決策** | 第一批正式寫入 `data/questions.db` 的歷屆題詳解，先選 `2025` 年並以小批次 `10` 題落庫；`2020` 年暫時只拿來做 `Miller 9th` 知識 grounding 與乾跑驗證，不當作第一批互動演練資料。 |
+| **問題** | 使用者希望 repo 能讓網站上的考古題演練真正可用，因此除了有詳解，還必須能正確判分。在當時的正式 DB 狀態下，`2020` 年 `100/100` 題的 `correct_answer` 都是 `BONUS`，若直接把這一年當成第一批網站題目，即使詳解生成完成，前台作答結果仍會失真。 |
+| **解決方案** | 先把批次補寫腳本 `scripts/batch_fill_past_exam_explanations.py` 實際套用在答案鍵完整的 `2025` 年，並持續用 `data/2020 Miller's Anesthesia 9th.pdf` 的文字片段作知識校正。這樣能同時滿足「先有一批可上站互動」與「內容要有教材 grounding」兩個需求。 |
+| **影響** | `2025` 年首批 `10` 題詳解已正式寫回，網站端已有一批可判分且有詳解的真實歷屆題。若之後要把 `2020` 年也納入互動練習，下一步優先順序應是修補 `correct_answer`，而不是先無限制批量補 explanation。 |
+
+### DEC-039: 考古題詳解補寫先走「repo context + direct OpenAI-compatible fallback」，不要把網站互動能力綁死在 `opencode` CLI 是否已安裝
+
+| 項目 | 內容 |
+|------|------|
+| **決策** | 新增 `src/application/services/past_exam_explanation_service.py`，由它負責從一般題庫/歷屆題庫中找相似且已有詳解的 reference questions，組 prompt 生成考古題詳解，並寫回 `past_exam_questions.explanation`。生成路徑優先用現成 provider；若 provider 不可用，則直接讀 `opencode.json` 的 custom OpenAI-compatible provider 設定，呼叫對應 endpoint。 |
+| **問題** | 真實 DB 目前約有 900 題歷屆題、其中 800 題缺 explanation；網站雖已有作答與考古題瀏覽，但缺少內建補寫詳解的 use case。另一方面，這台機器目前沒有 `opencode` binary，若把整個功能綁死在 CLI，就算 `opencode.json` 設定正確也無法在站上操作。 |
+| **解決方案** | 先做一條較窄、但對使用者立即有價值的能力：從歷屆題庫頁提供單題與小批次補寫詳解，context 主要來自 repo 內既有詳解題，不依賴完整 MCP tool-calling。provider 層補強 `opencode` custom provider/model 解析；UI 則在 provider unavailable 時自動退回 direct endpoint。 |
+| **影響** | 這條路不取代完整的教材來源追蹤 generation pipeline，而是補足「考古題互動學習」缺的 explanation layer。後續若要做更嚴格的詳解品質治理，應在此服務上再加 reviewer workflow / provenance / versioning，而不是直接把這類輕量互動塞回 `exam_server.py` 或 Streamlit 頁面裡。 |
+
+### DEC-038: `exam_server.py` 先採「handler registry + per-call application adapter」切出題庫型工具，同時保留 module-level wrappers 穩住既有測試與 monkeypatch 路徑
+
+| 項目 | 內容 |
+|------|------|
+| **決策** | `src/infrastructure/mcp/exam_server.py` 的題庫型 MCP tools 先抽到 `src/application/services/exam_tool_application_service.py`，`call_tool` 改由 `src/infrastructure/mcp/exam_tool_handlers.py` 的 registry 分派；但 `exam_server.save_question()`、`list_questions()` 等 module-level wrappers 先保留。 |
+| **問題** | `exam_server.py` 同時承擔 transport dispatch、題庫 CRUD/validation、generation guide、pipeline harness 與 past-exam workflow；現有 tests 又直接 import `exam_server.save_question()` 與 pipeline helpers，若一次粗暴搬空，容易把 refactor 直接變成介面破壞。 |
+| **解決方案** | 先抽最有明確邊界的「題庫型工具」：save/list/create/stats/get/delete/validate/update/audit/search/restore/bulk。server 只保留 bootstrap、tool schema、registry wiring 與 legacy handlers。為了保留測試可 monkeypatch `exam_server.repo` 的能力，wrapper 每次 call 都依當前 module globals 建立 service，而不是綁死 singleton。 |
+| **影響** | 下一刀可續拆 `get_generation_guide / get_topics` 或 past-exam adapters，而不必同時重寫 pipeline harness。這也確立了 MCP 層的新邊界：transport/dispatch 留在 infrastructure，題庫 use case 先往 application layer 收。 |
+
+### DEC-037: Streamlit 生成頁先以「application review service + presentation controller/fragments」做局部切片，不直接把整條 prompt orchestration 一次拆爆
+
+| 項目 | 內容 |
+|------|------|
+| **決策** | 針對 `src/presentation/streamlit/app.py` 的生成頁，先抽出「生成後審閱與正式入庫」這個局部切片：新增 `src/application/services/question_review_service.py` 承接 review payload 到正式題庫的 use case；在 presentation 層新增 `src/presentation/streamlit/generation/controller.py` 與 `fragments.py`，承接 review form 的 render 與 UI action dispatch。 |
+| **問題** | `app.py` 原本把 source info render、review form、draft save、formal save、dict -> domain entity mapping 全塞在同一檔內，讓 presentation、use-case orchestration 與 persistence mapping 黏成一塊；若再往裡面堆功能，只會讓 rerun/state 耦合更難拆。 |
+| **解決方案** | 不先動最重的 prompt orchestration，而是先切出 review/save slice，讓正式入庫回到 application layer，Streamlit 只保留頁面組裝與導覽 callback。這樣既能縮小 `app.py`，也不會在同一刀把 generation flow、session_state 與 UI layout 全部一起打散。 |
+| **影響** | 後續若要再收斂 `app.py`，應延續這個 pattern：presentation 內再拆 controller / fragments；真正的 formal save、promote、查詢與 gate 判斷則盡量下沉到 application service。若下一刀改拆 `exam_server.py`，也應比照「transport handler -> application adapter」而不是讓 MCP tool 直接長成第二個胖 controller。 |
+
+### DEC-036: 在維持 SQLite 的前提下，資料層改採 SQLAlchemy QueuePool + connection hardening；多 writer 路徑則統一升級為 `BEGIN IMMEDIATE`
+
+| 項目 | 內容 |
+|------|------|
+| **決策** | `src/infrastructure/persistence/database.py` 不再每次裸開 `sqlite3.connect()`，而是改成 per-process SQLAlchemy `QueuePool`；所有 checkout 連線統一套用 `journal_mode=WAL`、`busy_timeout=15000ms`、`foreign_keys=ON`、`synchronous=NORMAL`、`wal_autocheckpoint` 等 PRAGMA。主要 writer repositories（question / past exam / scope request / draft）則在寫入入口升級成 `BEGIN IMMEDIATE`。 |
+| **問題** | 單純每次直連 SQLite 雖然在低併發可用，但在「多個使用者同時操作 Web + heartbeat 背景寫入 + MCP agent 存題 + importer/批次工作常駐跑」的情境下，缺少成熟 pool manager、busy timeout 與明確的 writer transaction policy，容易讓 lock contention 行為漂移，也難以從 log 辨識實際連線狀態。 |
+| **解決方案** | 引入 SQLAlchemy pool 做成熟的 per-process connection lifecycle 管理，同時保留現有 DBAPI repository 介面，避免整批重寫資料層。connection checkout 時額外做 DBAPI ping/retry；schema init 完成後會 dispose 既有 pool，確保後續 checkout 使用帶 hardening 的 fresh connections。另補 focused regression tests 鎖住 pool reuse、PRAGMA hardening 與同進程多執行緒 question writes。 |
+| **影響** | 這能顯著提升單機多執行緒/多工作流程的穩定性，但不改變 SQLite「跨 process 同時間仍只有單一 writer」的物理限制。若後續需求再升到真正高併發多 writer，仍應評估 PostgreSQL；但在目前單機服務形態下，這次升級已比原本的裸連線模式穩健很多。 |
+
+### DEC-035: Logging 必須由共用 bootstrap + contextvars 進行統一初始化；資料層讀寫採 debug/info 分流，避免長期服務被觀測訊號洗版
+
+| 項目 | 內容 |
+|------|------|
+| **決策** | 新增 `src/infrastructure/logging/setup.py` 的共用 `bootstrap_logging()`，由 Web、MCP、CLI 與所有 Python scripts 統一初始化。logging 設定改為 env-driven，支援 `log level`、`debug switch`、`JSON console`、`rotation` 與 `run_id` context binding；database / repository / service / importer 全部走同一套結構化欄位。 |
+| **問題** | 先前只有 Streamlit app 真的呼叫 `configure_logging()`，其他入口不是沒初始化，就是只有零散 `logger.info()`；這使得 `run_id / doc_id / question_id / provider` 無法沿著 workflow 穩定傳遞，也沒有 rotation 與 debug switch 可支撐長期服務除錯。 |
+| **解決方案** | 抽出 idempotent bootstrap，利用 structlog contextvars 綁 `run_id` 與 workflow metadata；entrypoint 先綁 provider 與 run id，資料層讀操作打 `debug`、寫操作打 `info`、錯誤打 `exception`。同一輪順手把生成頁的長流程狀態聚合到 `st.status`，並把草稿箱低風險提示改用 `st.toast`，減少 UI 雜訊。 |
+| **影響** | 後續新增任何 Python entrypoint、background script 或 repository/service 補點，都必須走 `bootstrap_logging()` 與 context binding，不要再各自手刻 logging 初始化。若要繼續收斂 Streamlit UX，優先使用 `st.fragment` / `st.dialog` 這類新版 API，把長流程拆成較小互動面。 |
+
 ## 2026-04-15
 
 ### DEC-030: 作答練習的考古題模式應以「年份區間 + 單份/多份考卷」建題池，並沿用同一套 scoring state；另外每次重開回合都必須先清 practice radio widget state

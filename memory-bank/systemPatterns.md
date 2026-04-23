@@ -9,6 +9,8 @@
 - Repository Pattern + SQLite migrations
 - MCP Tool Boundary for closed-loop exam workflows
 - File-based job contract for external-agent backfill
+- Streamlit presentation slice: `app.py` 只保留頁面組裝，局部互動區拆成 controller + fragments，正式 use case 盡量下沉到 application service
+- Asset audit gate: 教材 figure refresh 後必須用固定 audit 腳本驗證 path / tiny / variance / page explosion，不以人工抽樣或單頁 smoke 宣稱完成
 
 ## Common Idioms
 
@@ -23,6 +25,17 @@ UI 層由 Streamlit 直接編排生成流程與互動狀態，使用 session_sta
 ### Examples
 
 - src/presentation/streamlit/app.py
+
+
+## Streamlit Controller + Fragment Split
+
+當單一頁面的某個互動區同時包含大量 render 與 save/promote 行為時，先在 Presentation 層切出 `controller.py` 與 `fragments.py`，並把正式 persistence use case 下沉到 Application service；這是比「一次拆完整頁面」更安全的 DDD 收斂方式。
+
+### Examples
+
+- src/presentation/streamlit/generation/controller.py
+- src/presentation/streamlit/generation/fragments.py
+- src/application/services/question_review_service.py
 
 
 ## Repository + Audit Trail
@@ -54,3 +67,14 @@ heartbeat 不直接在 Web UI 內呼叫 agent；它只分析 coverage gap / back
 - src/application/services/heartbeat_service.py
 - scripts/run_heartbeat.py
 - src/presentation/streamlit/app.py
+
+
+## Asset Refresh + Audit Gate
+
+教材圖像修復採「只刷新 figure assets，再以 audit 報告驗證」的可重跑模式。全章節刷新不應重建 markdown/blocks/tables/KG，避免為了修圖污染已可用的文字資料面；品質判斷則以機器可重跑的 path/size/variance/page-density 指標為準。
+
+### Examples
+
+- scripts/refresh_miller_figures.py
+- scripts/audit_miller_image_quality.py
+- configs/asset-aware/miller_marker_hq.json
