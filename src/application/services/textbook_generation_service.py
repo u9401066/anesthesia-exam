@@ -8,9 +8,11 @@ from pathlib import Path
 from typing import Any
 
 from src.application.services.past_exam_extraction_service import PastExamExtractionService
+from src.infrastructure.logging import get_logger
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_DATA_DIR = PROJECT_ROOT / "data"
+logger = get_logger(__name__)
 
 MATCH_STOPWORDS = {
     "about",
@@ -71,13 +73,15 @@ class TextbookGenerationService:
     def __init__(self, data_dir: Path | None = None):
         self.data_dir = data_dir or DEFAULT_DATA_DIR
         self.asset_loader = PastExamExtractionService(self.data_dir)
+        logger.debug("textbook_generation_service_initialized", data_dir=str(self.data_dir))
 
     def assess_document_source_readiness(self, doc_id: str) -> dict[str, Any]:
         """Check whether a document has searchable blocks with persisted line metadata."""
+        log = logger.bind(doc_id=doc_id)
         doc_dir = self.data_dir / doc_id
         blocks_path = doc_dir / "blocks.json"
         if not blocks_path.exists():
-            return {
+            result = {
                 "doc_id": doc_id,
                 "source_ready": False,
                 "has_blocks": False,
@@ -85,11 +89,13 @@ class TextbookGenerationService:
                 "precise_block_count": 0,
                 "gate_reasons": ["缺少 blocks.json"],
             }
+            log.info("textbook_source_readiness_checked", **result)
+            return result
 
         try:
             blocks = json.loads(blocks_path.read_text(encoding="utf-8"))
         except Exception as exc:  # noqa: BLE001
-            return {
+            result = {
                 "doc_id": doc_id,
                 "source_ready": False,
                 "has_blocks": True,
@@ -97,6 +103,8 @@ class TextbookGenerationService:
                 "precise_block_count": 0,
                 "gate_reasons": [f"blocks.json 無法讀取: {exc}"],
             }
+            log.info("textbook_source_readiness_checked", **result)
+            return result
 
         searchable_blocks = [block for block in blocks if self._block_has_searchable_text(block)]
         precise_blocks = [
@@ -113,7 +121,7 @@ class TextbookGenerationService:
         if not precise_blocks:
             gate_reasons.append("blocks.json 缺少 line metadata")
 
-        return {
+        result = {
             "doc_id": doc_id,
             "source_ready": not gate_reasons,
             "has_blocks": True,
@@ -121,6 +129,8 @@ class TextbookGenerationService:
             "precise_block_count": len(precise_blocks),
             "gate_reasons": gate_reasons,
         }
+        log.info("textbook_source_readiness_checked", **result)
+        return result
 
     def build_prompt_context(
         self,
@@ -130,6 +140,12 @@ class TextbookGenerationService:
         max_chars: int = 8000,
     ) -> dict[str, Any]:
         """Build section/chapter/full-text context for preview or formal generation prompts."""
+        logger.debug(
+            "textbook_prompt_context_start",
+            document_count=len(doc_ids),
+            selected_section_count=len(selected_sections or []),
+            max_chars=max_chars,
+        )
         if not doc_ids:
             return {"documents": [], "prompt_context": "", "selected_section_titles": []}
 
@@ -187,11 +203,18 @@ class TextbookGenerationService:
                     prompt_chunks.append(limited)
                     remaining_chars = max(0, remaining_chars - len(limited))
 
-        return {
+        result = {
             "documents": documents,
             "prompt_context": "\n\n".join(prompt_chunks),
             "selected_section_titles": _dedupe_preserve_order(selected_titles),
         }
+        logger.info(
+            "textbook_prompt_context_complete",
+            document_count=len(documents),
+            selected_section_count=len(result["selected_section_titles"]),
+            prompt_chars=len(result["prompt_context"]),
+        )
+        return result
 
     def enrich_generated_questions(
         self,
@@ -204,6 +227,13 @@ class TextbookGenerationService:
         """Attach preview metadata or formal evidence packs to generated question dicts."""
         if not questions:
             return []
+
+        logger.info(
+            "textbook_question_enrichment_start",
+            question_count=len(questions),
+            document_count=len(selected_doc_ids),
+            preview_only=preview_only,
+        )
 
         prompt_context = self.build_prompt_context(
             selected_doc_ids,
@@ -231,10 +261,52 @@ class TextbookGenerationService:
                         readiness_by_doc,
                     )
                 )
+        logger.info(
+            "textbook_question_enrichment_complete",
+            question_count=len(enriched_questions),
+            formal_ready_count=sum(1 for question in enriched_questions if question.get("formal_save_ready")),
+            preview_only=preview_only,
+        )
         return enriched_questions
+
+    def build_evidence_pack_for_question(
+        self,
+        question: dict,
+        *,
+        selected_doc_ids: list[str],
+        selected_sections: list[dict] | None = None,
+    ) -> dict[str, Any]:
+        """Build a formal evidence pack for an existing question without mutating it."""
+        if not selected_doc_ids:
+            return {
+                "source_ready": False,
+                "matched_doc_id": None,
+                "matched_doc_title": None,
+                "gate_reasons": ["缺少教材 doc_id"],
+                "source": {},
+            }
+
+        prompt_context = self.build_prompt_context(
+            selected_doc_ids,
+            selected_sections,
+            max_chars=6000,
+        )
+        readiness_by_doc = {
+            doc_id: self.assess_document_source_readiness(doc_id) for doc_id in selected_doc_ids
+        }
+        return self._build_evidence_pack(
+            question,
+            selected_doc_ids,
+            selected_sections or [],
+            readiness_by_doc,
+            prompt_context,
+        )
 
     def question_formal_save_ready(self, question: dict) -> bool:
         """Return whether a question has a complete formal-save evidence pack."""
+        if str(question.get("pattern") or "").strip().lower() == "image_based":
+            return False
+
         if "formal_save_ready" in question:
             return bool(question.get("formal_save_ready"))
 
@@ -315,9 +387,15 @@ class TextbookGenerationService:
         prompt_context: dict[str, Any],
     ) -> dict[str, Any]:
         gate_reasons: list[str] = []
+        log = logger.bind(
+            question_id=question.get("id"),
+            question_text=_truncate_text(str(question.get("question_text") or ""), 120),
+        )
         if not selected_doc_ids:
             gate_reasons.append("缺少教材 doc_id")
-            return {"source_ready": False, "gate_reasons": gate_reasons, "source": {}}
+            result = {"source_ready": False, "gate_reasons": gate_reasons, "source": {}}
+            log.info("textbook_evidence_pack_built", source_ready=False, matched_doc_id=None, gate_reasons=gate_reasons)
+            return result
 
         preferred_sections = [section.get("title", "") for section in selected_sections if section.get("title")]
         best_pack: dict[str, Any] | None = None
@@ -385,22 +463,40 @@ class TextbookGenerationService:
                 "score": score,
                 "context_sections": prompt_context.get("selected_section_titles", []),
             }
-            if best_pack is None or pack["score"] > best_pack["score"]:
+            if best_pack is None:
+                best_pack = pack
+            elif pack["source_ready"] and not best_pack.get("source_ready"):
+                best_pack = pack
+            elif pack["source_ready"] == bool(best_pack.get("source_ready")) and pack["score"] > best_pack["score"]:
                 best_pack = pack
 
         if best_pack is None:
-            return {
+            result = {
                 "source_ready": False,
                 "matched_doc_id": None,
                 "matched_doc_title": None,
                 "gate_reasons": _dedupe_preserve_order(gate_reasons or ["沒有可用的 source-ready 文件"]),
                 "source": {},
             }
+            log.info(
+                "textbook_evidence_pack_built",
+                source_ready=False,
+                matched_doc_id=None,
+                gate_reasons=result["gate_reasons"],
+            )
+            return result
 
         if not best_pack.get("source_ready"):
             best_pack["gate_reasons"] = _dedupe_preserve_order(
                 list(best_pack.get("gate_reasons", [])) + gate_reasons
             )
+        log.info(
+            "textbook_evidence_pack_built",
+            source_ready=bool(best_pack.get("source_ready")),
+            matched_doc_id=best_pack.get("matched_doc_id"),
+            score=best_pack.get("score"),
+            gate_reasons=best_pack.get("gate_reasons", []),
+        )
         return best_pack
 
     def _build_source_payload(
@@ -640,4 +736,10 @@ def get_textbook_generation_service() -> TextbookGenerationService:
     global _service
     if _service is None:
         _service = TextbookGenerationService()
+        logger.debug("textbook_generation_service_singleton_created")
     return _service
+
+
+def question_formal_save_ready(question: dict) -> bool:
+    """Convenience facade for UI/controller callers that need the formal-save gate."""
+    return get_textbook_generation_service().question_formal_save_ready(question)

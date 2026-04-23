@@ -15,11 +15,11 @@ from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import TextContent, Tool
 
+from src.application.services.exam_tool_application_service import ExamToolApplicationService
 from src.application.services.past_exam_extraction_service import PastExamExtractionService
 from src.domain.entities.past_exam import Concept, PastExam
-from src.domain.entities.question import Difficulty, Question, Source, SourceLocation
-from src.domain.value_objects.audit import ActorType
-from src.infrastructure.logging import get_logger
+from src.infrastructure.logging import bootstrap_logging, get_logger, new_run_id
+from src.infrastructure.mcp.exam_tool_handlers import build_tool_handler_registry, dispatch_tool
 from src.infrastructure.persistence.sqlite_past_exam_repo import get_past_exam_repository
 from src.infrastructure.persistence.sqlite_question_repo import get_question_repository
 
@@ -412,6 +412,16 @@ def _ensure_ingest_phase_for_run(run_id: str | None, doc_id: str, title: str) ->
         metrics={"doc_count": 1},
         artifacts={"doc_ids": [doc_id], "titles": [title]},
         next_action="進入 normalize_questions",
+    )
+
+
+def _build_question_tool_service() -> ExamToolApplicationService:
+    """Create an application adapter using the current module-level dependencies."""
+    return ExamToolApplicationService(
+        repo=repo,
+        project_root=PROJECT_ROOT,
+        exams_dir=EXAMS_DIR,
+        questions_dir=QUESTIONS_DIR,
     )
 
 
@@ -860,60 +870,25 @@ def create_exam_mcp_server() -> Server:
         log.info("mcp_tool_call_start", arguments=_safe_args(arguments))
 
         try:
-            if name == "exam_save_question":
-                result = save_question(arguments)
-            elif name == "exam_list_questions":
-                result = list_questions(arguments)
-            elif name == "exam_create_exam":
-                result = create_exam(arguments)
-            elif name == "exam_get_stats":
-                result = get_stats()
-            elif name == "exam_get_question":
-                result = get_question(arguments)
-            elif name == "exam_delete_question":
-                result = delete_question(arguments)
-            elif name == "exam_validate_question":
-                result = validate_question(arguments)
-            elif name == "exam_update_question":
-                result = update_question(arguments)
-            elif name == "exam_get_audit_log":
-                result = get_audit_log(arguments)
-            elif name == "exam_mark_validated":
-                result = mark_validated(arguments)
-            elif name == "exam_search":
-                result = search_questions(arguments)
-            elif name == "exam_restore_question":
-                result = restore_question(arguments)
-            elif name == "exam_get_generation_guide":
-                result = get_generation_guide(arguments)
-            elif name == "exam_get_topics":
-                result = get_topics()
-            elif name == "exam_bulk_save":
-                result = bulk_save(arguments)
-            elif name == "exam_get_past_exam":
-                result = get_past_exam(arguments)
-            elif name == "exam_extract_past_exam_questions":
-                result = extract_past_exam_questions(arguments)
-            elif name == "exam_classify_past_exam_patterns":
-                result = classify_past_exam_patterns(arguments)
-            elif name == "exam_build_past_exam_blueprint":
-                result = build_past_exam_blueprint(arguments)
-            elif name == "exam_run_past_exam_extraction":
-                result = run_past_exam_extraction(arguments)
-            elif name == "exam_get_pipeline_blueprint":
-                result = get_pipeline_blueprint(arguments)
-            elif name == "exam_start_pipeline_run":
-                result = start_pipeline_run(arguments)
-            elif name == "exam_get_pipeline_run":
-                result = get_pipeline_run(arguments)
-            elif name == "exam_record_phase_result":
-                result = record_phase_result(arguments)
-            elif name == "exam_validate_phase_gate":
-                result = validate_phase_gate(arguments)
-            elif name == "exam_list_pipeline_runs":
-                result = list_pipeline_runs(arguments)
-            else:
-                result = {"error": f"Unknown tool: {name}"}
+            registry = build_tool_handler_registry(
+                app_service=_build_question_tool_service(),
+                legacy_handlers={
+                    "exam_get_generation_guide": get_generation_guide,
+                    "exam_get_topics": lambda _arguments: get_topics(),
+                    "exam_get_past_exam": get_past_exam,
+                    "exam_extract_past_exam_questions": extract_past_exam_questions,
+                    "exam_classify_past_exam_patterns": classify_past_exam_patterns,
+                    "exam_build_past_exam_blueprint": build_past_exam_blueprint,
+                    "exam_run_past_exam_extraction": run_past_exam_extraction,
+                    "exam_get_pipeline_blueprint": get_pipeline_blueprint,
+                    "exam_start_pipeline_run": start_pipeline_run,
+                    "exam_get_pipeline_run": get_pipeline_run,
+                    "exam_record_phase_result": record_phase_result,
+                    "exam_validate_phase_gate": validate_phase_gate,
+                    "exam_list_pipeline_runs": list_pipeline_runs,
+                },
+            )
+            result = dispatch_tool(name, arguments, registry)
 
             elapsed_ms = int((time.monotonic() - t0) * 1000)
             success = result.get("success", not result.get("error"))
@@ -933,428 +908,64 @@ def create_exam_mcp_server() -> Server:
     return server
 
 
-def _parse_source_location(data: dict | None) -> SourceLocation | None:
-    """解析 SourceLocation 物件"""
-    if not data:
-        return None
-
-    return SourceLocation(
-        page=data.get("page", 0),
-        line_start=data.get("line_start", 0),
-        line_end=data.get("line_end", 0),
-        bbox=tuple(data["bbox"]) if data.get("bbox") else None,
-        original_text=data.get("original_text", ""),
-    )
-
-
-def _has_precise_source_location(location: SourceLocation | None) -> bool:
-    """Return whether a source location is usable for formal save."""
-    return bool(
-        location
-        and location.page > 0
-        and location.line_start > 0
-        and location.line_end >= location.line_start
-        and location.original_text.strip()
-    )
-
-
 def save_question(args: dict) -> dict:
     """儲存考題到 SQLite（支援完整 Source 結構）"""
-
-    # 建立來源（優先使用新結構）
-    source = None
-    if args.get("source_doc"):
-        # 解析精確來源
-        stem_source = _parse_source_location(args.get("stem_source"))
-        answer_source = _parse_source_location(args.get("answer_source"))
-        explanation_sources = [
-            parsed for s in args.get("explanation_sources", []) if s and (parsed := _parse_source_location(s))
-        ]
-
-        if args.get("preview_only"):
-            return {
-                "success": False,
-                "error": "preview-only 題目不可正式入庫，請先送進草稿箱。",
-            }
-
-        missing_fields = []
-        if not _has_precise_source_location(stem_source):
-            missing_fields.append("stem_source")
-        if not _has_precise_source_location(answer_source):
-            missing_fields.append("answer_source")
-        if not any(_has_precise_source_location(source) for source in explanation_sources):
-            missing_fields.append("explanation_sources")
-        if missing_fields:
-            return {
-                "success": False,
-                "error": "教材題目正式入庫需要完整 evidence pack，缺少: " + ", ".join(missing_fields),
-            }
-
-        source = Source(
-            document=args.get("source_doc", ""),
-            chapter=args.get("source_chapter"),
-            section=args.get("source_section"),
-            stem_source=stem_source,
-            answer_source=answer_source,
-            explanation_sources=explanation_sources,
-            # 向後相容：如果沒有新結構，使用舊欄位
-            page=args.get("source_page") if not stem_source else None,
-            lines=args.get("source_lines") if not stem_source else None,
-            original_text=args.get("source_text") if not stem_source else None,
-        )
-
-    # 建立 Question 實體
-    question = Question(
-        question_text=args.get("question_text", ""),
-        options=args.get("options", []),
-        correct_answer=args.get("correct_answer", ""),
-        explanation=args.get("explanation", ""),
-        source=source,
-        difficulty=Difficulty(args.get("difficulty", "medium")),
-        topics=args.get("topics", []),
-        created_by=args.get("actor_name", "crush"),
-    )
-
-    # 生成上下文（記錄題目如何產生）
-    generation_context = {
-        "user_prompt": args.get("user_prompt"),
-        "source_documents": [args.get("source_doc")] if args.get("source_doc") else [],
-        "skill_used": args.get("skill_used", "mcq-generator"),
-        "reasoning": args.get("reasoning"),
-    }
-
-    # 儲存到 Repository
-    question_id = repo.save(
-        question=question,
-        actor_type=ActorType.AGENT,
-        actor_name=args.get("actor_name", "crush"),
-        generation_context=generation_context if any(generation_context.values()) else None,
-    )
-
-    # 計算來源完整度
-    source_completeness = "none"
-    if source:
-        if source.stem_source and source.stem_source.original_text:
-            source_completeness = "full"  # 有精確來源
-        elif source.page:
-            source_completeness = "partial"  # 只有頁碼
-        else:
-            source_completeness = "doc_only"  # 只有文件名
-
-    return {
-        "success": True,
-        "question_id": question_id,
-        "message": "題目已儲存到 SQLite 資料庫",
-        "source_completeness": source_completeness,
-    }
+    return _build_question_tool_service().save_question(args)
 
 
 def list_questions(args: dict) -> dict:
     """列出考題 (使用 Repository)"""
-    topic_filter = args.get("topic")
-    difficulty_filter = args.get("difficulty")
-    limit = args.get("limit", 20)
-
-    # 從 Repository 取得
-    difficulty = Difficulty(difficulty_filter) if difficulty_filter else None
-    questions = repo.list_all(
-        limit=limit,
-        difficulty=difficulty,
-        topic=topic_filter,
-    )
-
-    return {
-        "total": len(questions),
-        "questions": [
-            {
-                "id": q.id,
-                "question_text": q.question_text[:50] + "..." if len(q.question_text) > 50 else q.question_text,
-                "difficulty": q.difficulty.value,
-                "topics": q.topics,
-                "created_at": q.created_at.isoformat() if q.created_at else None,
-            }
-            for q in questions
-        ],
-    }
+    return _build_question_tool_service().list_questions(args)
 
 
 def create_exam(args: dict) -> dict:
     """建立考卷"""
-    import random
-    import uuid
-
-    exam_name = args.get("name", "新考卷")
-    question_count = args.get("question_count", 10)
-    topic_filter = args.get("topics", [])
-
-    # 讀取所有題目
-    all_questions = []
-    for filepath in QUESTIONS_DIR.glob("*.json"):
-        with open(filepath, "r", encoding="utf-8") as f:
-            q = json.load(f)
-
-        # 套用篩選
-        if topic_filter:
-            if not any(t in q.get("topics", []) for t in topic_filter):
-                continue
-
-        all_questions.append(q)
-
-    # 隨機選題
-    if len(all_questions) < question_count:
-        selected = all_questions
-    else:
-        selected = random.sample(all_questions, question_count)
-
-    # 建立考卷
-    exam_id = str(uuid.uuid4())[:8]
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-
-    exam_data = {
-        "id": exam_id,
-        "name": exam_name,
-        "questions": selected,
-        "question_count": len(selected),
-        "created_at": datetime.now().isoformat(),
-    }
-
-    filepath = EXAMS_DIR / f"exam_{timestamp}_{exam_id}.json"
-    with open(filepath, "w", encoding="utf-8") as f:
-        json.dump(exam_data, f, ensure_ascii=False, indent=2)
-
-    return {
-        "success": True,
-        "exam_id": exam_id,
-        "name": exam_name,
-        "question_count": len(selected),
-        "saved_to": str(filepath.relative_to(PROJECT_ROOT)),
-    }
+    return _build_question_tool_service().create_exam(args)
 
 
 def get_stats() -> dict:
     """取得統計 (使用 Repository)"""
-    stats = repo.get_statistics()
-
-    return {
-        "question_count": stats["total"],
-        "exam_count": len(list(EXAMS_DIR.glob("*.json"))) if EXAMS_DIR.exists() else 0,
-        "difficulty_distribution": stats["by_difficulty"],
-        "topic_distribution": stats["by_topic"],
-        "validated_count": stats["validated"],
-        "deleted_count": stats["deleted"],
-        "recent_7_days": stats["recent_7_days"],
-    }
+    return _build_question_tool_service().get_stats()
 
 
 def get_question(args: dict) -> dict:
     """取得單一題目 (使用 Repository)"""
-    question_id = args.get("question_id", "")
-
-    question = repo.get_by_id(question_id)
-    if question:
-        # 同時取得審計日誌
-        audit_log = repo.get_audit_log(question_id, limit=10)
-        generation_ctx = repo.get_generation_context(question_id)
-
-        return {
-            "success": True,
-            "question": question.to_dict(),
-            "audit_log": [a.to_dict() for a in audit_log],
-            "generation_context": generation_ctx,
-        }
-
-    return {
-        "success": False,
-        "error": f"Question not found: {question_id}",
-    }
+    return _build_question_tool_service().get_question(args)
 
 
 def delete_question(args: dict) -> dict:
     """刪除題目 (使用 Repository，軟刪除)"""
-    question_id = args.get("question_id", "")
-    actor_name = args.get("actor_name", "user")
-    reason = args.get("reason")
-
-    success = repo.delete(
-        question_id=question_id,
-        actor_type=ActorType.USER,
-        actor_name=actor_name,
-        reason=reason,
-        soft_delete=True,
-    )
-
-    if success:
-        return {
-            "success": True,
-            "deleted_id": question_id,
-            "message": "題目已標記為刪除（可還原）",
-        }
-
-    return {
-        "success": False,
-        "error": f"Question not found: {question_id}",
-    }
+    return _build_question_tool_service().delete_question(args)
 
 
 def validate_question(args: dict) -> dict:
     """驗證題目格式"""
-    errors = []
-    warnings = []
-
-    # 必要欄位檢查
-    question_text = args.get("question_text", "")
-    if not question_text or len(question_text) < 10:
-        errors.append("題目文字過短或為空")
-
-    options = args.get("options", [])
-    if len(options) < 2:
-        errors.append("選項數量不足（至少需要 2 個選項）")
-    elif len(options) < 4:
-        warnings.append("建議提供 4 個選項")
-
-    correct_answer = args.get("correct_answer", "")
-    if not correct_answer:
-        errors.append("缺少正確答案")
-    else:
-        # 檢查答案是否在選項範圍內
-        valid_answers = [chr(65 + i) for i in range(len(options))]  # A, B, C, D...
-        for ans in correct_answer.replace(",", "").replace(" ", ""):
-            if ans.upper() not in valid_answers:
-                errors.append(f"答案 '{ans}' 不在選項範圍內")
-
-    question_type = args.get("question_type", "single_choice")
-    if question_type == "single_choice" and "," in correct_answer:
-        errors.append("單選題不應有多個答案")
-
-    return {
-        "valid": len(errors) == 0,
-        "errors": errors,
-        "warnings": warnings,
-    }
+    return _build_question_tool_service().validate_question(args)
 
 
 def update_question(args: dict) -> dict:
     """更新已存在的題目"""
-    question_id = args.get("question_id", "")
-
-    # 先取得現有題目
-    existing = repo.get_by_id(question_id)
-    if not existing:
-        return {
-            "success": False,
-            "error": f"Question not found: {question_id}",
-        }
-
-    # 更新欄位（只更新有提供的）
-    if args.get("question_text"):
-        existing.question_text = args["question_text"]
-    if args.get("options"):
-        existing.options = args["options"]
-    if args.get("correct_answer"):
-        existing.correct_answer = args["correct_answer"]
-    if args.get("explanation"):
-        existing.explanation = args["explanation"]
-    if args.get("difficulty"):
-        existing.difficulty = Difficulty(args["difficulty"])
-    if args.get("topics"):
-        existing.topics = args["topics"]
-
-    # 儲存更新
-    success = repo.update(
-        question=existing,
-        actor_type=ActorType.SKILL,
-        actor_name=args.get("actor_name", "unknown"),
-        reason=args.get("reason"),
-    )
-
-    return {
-        "success": success,
-        "question_id": question_id,
-        "message": "題目已更新" if success else "更新失敗",
-    }
+    return _build_question_tool_service().update_question(args)
 
 
 def get_audit_log(args: dict) -> dict:
     """取得題目的審計日誌"""
-    question_id = args.get("question_id", "")
-    limit = args.get("limit", 20)
-
-    entries = repo.get_audit_log(question_id, limit=limit)
-
-    return {
-        "question_id": question_id,
-        "total": len(entries),
-        "entries": [
-            {
-                "action": e.action.value,
-                "actor": f"{e.actor_type.value}:{e.actor_name}",
-                "timestamp": e.timestamp.isoformat() if e.timestamp else None,
-                "changes": e.changes,
-                "reason": e.reason,
-            }
-            for e in entries
-        ],
-    }
+    return _build_question_tool_service().get_audit_log(args)
 
 
 def mark_validated(args: dict) -> dict:
     """標記題目驗證結果"""
-    question_id = args.get("question_id", "")
-    passed = args.get("passed", False)
-    notes = args.get("notes")
-
-    success = repo.mark_validated(
-        question_id=question_id,
-        passed=passed,
-        actor_name="question-validator",
-        notes=notes,
-    )
-
-    return {
-        "success": success,
-        "question_id": question_id,
-        "validated": passed,
-        "message": "驗證結果已記錄" if success else "題目不存在",
-    }
+    return _build_question_tool_service().mark_validated(args)
 
 
 def search_questions(args: dict) -> dict:
     """搜尋題目"""
-    keyword = args.get("keyword", "")
-    limit = args.get("limit", 20)
-
-    questions = repo.search(keyword, limit=limit)
-
-    return {
-        "keyword": keyword,
-        "total": len(questions),
-        "questions": [
-            {
-                "id": q.id,
-                "question_text": q.question_text[:80] + "..." if len(q.question_text) > 80 else q.question_text,
-                "difficulty": q.difficulty.value,
-                "topics": q.topics,
-            }
-            for q in questions
-        ],
-    }
+    return _build_question_tool_service().search_questions(args)
 
 
 def restore_question(args: dict) -> dict:
     """還原已刪除的題目"""
-    question_id = args.get("question_id", "")
-
-    success = repo.restore(
-        question_id=question_id,
-        actor_type=ActorType.USER,
-        actor_name="user",
-    )
-
-    return {
-        "success": success,
-        "question_id": question_id,
-        "message": "題目已還原" if success else "題目不存在或未被刪除",
-    }
+    return _build_question_tool_service().restore_question(args)
 
 
 def get_generation_guide(args: dict) -> dict:
@@ -1603,53 +1214,7 @@ def _suggest_topics(sorted_topics: list, total: int) -> str:
 
 def bulk_save(args: dict) -> dict:
     """批次儲存多道考題"""
-    questions_data = args.get("questions", [])
-
-    if not questions_data:
-        return {"success": False, "error": "未提供任何題目"}
-
-    results = []
-    success_count = 0
-    fail_count = 0
-
-    for i, q_args in enumerate(questions_data):
-        try:
-            result = save_question(q_args)
-            if result.get("success"):
-                success_count += 1
-                results.append(
-                    {
-                        "index": i,
-                        "success": True,
-                        "question_id": result["question_id"],
-                    }
-                )
-            else:
-                fail_count += 1
-                results.append(
-                    {
-                        "index": i,
-                        "success": False,
-                        "error": result.get("error", "未知錯誤"),
-                    }
-                )
-        except Exception as e:
-            fail_count += 1
-            results.append(
-                {
-                    "index": i,
-                    "success": False,
-                    "error": str(e),
-                }
-            )
-
-    return {
-        "success": fail_count == 0,
-        "total": len(questions_data),
-        "saved": success_count,
-        "failed": fail_count,
-        "results": results,
-    }
+    return _build_question_tool_service().bulk_save(args)
 
 
 def get_past_exam(args: dict) -> dict:
@@ -2049,10 +1614,19 @@ def list_pipeline_runs(args: dict) -> dict:
 
 async def main():
     """啟動 MCP Server"""
+    run_id = new_run_id("mcp")
+    bootstrap_logging(__name__, extra_context={"run_id": run_id, "provider": "mcp"})
+    logger.info("mcp_server_start", transport="stdio")
     server = create_exam_mcp_server()
 
-    async with stdio_server() as (read_stream, write_stream):
-        await server.run(read_stream, write_stream, server.create_initialization_options())
+    try:
+        async with stdio_server() as (read_stream, write_stream):
+            await server.run(read_stream, write_stream, server.create_initialization_options())
+    except Exception as exc:
+        logger.exception("mcp_server_failed", error=str(exc))
+        raise
+    finally:
+        logger.info("mcp_server_stop")
 
 
 if __name__ == "__main__":

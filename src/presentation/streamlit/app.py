@@ -25,20 +25,48 @@ if str(PROJECT_DIR) not in sys.path:
 
 import json
 import random
+import shutil
 import subprocess
 import uuid
 from datetime import datetime
-from typing import Optional
+from typing import Any, Optional
 
 import streamlit as st
 
-from src.infrastructure.agent import AgentProviderConfig, create_agent_provider
-from src.infrastructure.logging import configure_logging, get_logger
+from src.application.services.past_exam_explanation_service import get_past_exam_explanation_service
+from src.application.services.past_exam_figure_service import get_past_exam_figure_service
+from src.application.services.textbook_generation_service import get_textbook_generation_service
+from src.infrastructure import agent as agent_module
+from src.infrastructure.logging import bootstrap_logging, new_run_id
+from src.presentation.streamlit.generation.fragments import (
+    render_question_card_inline,
+    render_question_review_form,
+    render_source_info,
+)
+from src.presentation.streamlit.generation.controller import autosave_generated_questions_to_drafts
+from src.presentation.streamlit.generation.orchestration import (
+    build_generation_prompt,
+    create_generation_execution_ui,
+    extract_questions_from_response,
+    stream_agent_generate,
+)
+from src.presentation.streamlit.past_exam_fragments import render_past_exam_question_assets
+
+AgentProviderConfig = agent_module.AgentProviderConfig
+create_agent_provider = agent_module.create_agent_provider
+collect_opencode_available_models = getattr(agent_module, "collect_opencode_available_models", lambda config: [])
+resolve_opencode_default_model = getattr(agent_module, "resolve_opencode_default_model", lambda config: None)
+collect_openclaw_available_models = getattr(agent_module, "collect_openclaw_available_models", lambda config: [])
+resolve_openclaw_default_model = getattr(agent_module, "resolve_openclaw_default_model", lambda config: None)
 
 # 初始化結構化 logging（JSON 寫入 logs/）
 LOG_DIR = PROJECT_DIR / "logs"
-configure_logging(log_dir=LOG_DIR, level="INFO")
-logger = get_logger(__name__)
+APP_RUN_ID = new_run_id("web")
+logger = bootstrap_logging(
+    __name__,
+    log_dir=LOG_DIR,
+    extra_context={"run_id": APP_RUN_ID, "provider": "streamlit"},
+)
 
 # 設定頁面
 st.set_page_config(
@@ -63,16 +91,29 @@ PROMPT_PRESETS = {
     "教學詳解題": "每題請提供教學式詳解：核心觀念、臨床應用、常見誤解。",
 }
 
-PAGE_OPTIONS = ["📝 生成考題", "🗃️ 草稿箱", "✍️ 作答練習", "📚 題庫管理", "📋 出題需求", "📊 統計"]
+SOURCE_MODE_EXISTING = "使用既有已拆解教材"
+SOURCE_MODE_UPLOAD = "先上傳新教材再出題"
+SOURCE_MODE_TEMPLATE = "直接拿考古題模板改寫"
+SOURCE_MODE_OPTIONS = [SOURCE_MODE_EXISTING, SOURCE_MODE_UPLOAD, SOURCE_MODE_TEMPLATE]
+
+WORKBENCH_PAGE = "📝 出題工作台"
+LEGACY_GENERATE_PAGE = "📝 生成考題"
+LEGACY_DRAFT_PAGE = "🗃️ 草稿箱"
+
+PAGE_OPTIONS = [WORKBENCH_PAGE, "✍️ 作答練習", "📚 題庫管理", "📋 出題需求", "📊 統計"]
 PAGE_LABEL_TO_PARAM = {
-    "📝 生成考題": "generate",
-    "🗃️ 草稿箱": "drafts",
+    WORKBENCH_PAGE: "generate",
     "✍️ 作答練習": "practice",
     "📚 題庫管理": "library",
     "📋 出題需求": "scope",
     "📊 統計": "stats",
 }
 PAGE_PARAM_TO_LABEL = {value: key for key, value in PAGE_LABEL_TO_PARAM.items()}
+PAGE_PARAM_TO_LABEL["drafts"] = "📚 題庫管理"
+PAGE_LABEL_ALIASES = {
+    LEGACY_GENERATE_PAGE: WORKBENCH_PAGE,
+    LEGACY_DRAFT_PAGE: "📚 題庫管理",
+}
 
 CHAT_QUICK_PROMPTS = [
     "幫我說明這個頁面的最佳操作順序。",
@@ -83,6 +124,7 @@ CHAT_QUICK_PROMPTS = [
 PRACTICE_SOURCE_GENERAL = "general_bank"
 PRACTICE_SOURCE_GENERATED = "generated_preview"
 PRACTICE_SOURCE_PAST_EXAM = "past_exam"
+SUPPORTED_AGENT_PROVIDERS = ("crush", "opencode", "copilot-sdk", "codex", "openclaw")
 PRACTICE_PATTERN_LABELS = {
     "direct_recall": "直接記憶",
     "clinical_scenario": "臨床情境",
@@ -96,25 +138,164 @@ PRACTICE_PATTERN_LABELS = {
 }
 
 
+def get_configured_agent_provider_name() -> str:
+    """Read the server-controlled agent provider used by the UI."""
+    provider_name = str(os.getenv("EXAM_AGENT_PROVIDER", "opencode") or "opencode").strip().lower()
+    return provider_name or "opencode"
+
+
+def get_configured_agent_model(provider_name: str, agent_meta: Optional[dict] = None) -> str:
+    """Read the server-controlled model used by the UI."""
+    meta = agent_meta or {}
+
+    if provider_name == "opencode":
+        return str(os.getenv("EXAM_OPENCODE_MODEL") or meta.get("model") or "").strip()
+    if provider_name == "crush":
+        return str(os.getenv("EXAM_CRUSH_MODEL") or meta.get("model") or "").strip()
+    if provider_name == "copilot-sdk":
+        return str(os.getenv("EXAM_COPILOT_SDK_MODEL") or meta.get("model") or "").strip()
+    if provider_name == "codex":
+        return str(
+            os.getenv("EXAM_CODEX_MODEL")
+            or os.getenv("EXAM_OPENAI_MODEL")
+            or os.getenv("EXAM_AGENT_MODEL")
+            or meta.get("model")
+            or "gpt-5.3-codex"
+        ).strip()
+    if provider_name == "openclaw":
+        return str(
+            os.getenv("EXAM_OPENCLAW_MODEL")
+            or os.getenv("EXAM_AGENT_MODEL")
+            or meta.get("model")
+            or ""
+        ).strip()
+
+    return str(os.getenv("EXAM_AGENT_MODEL") or meta.get("model") or "").strip()
+
+
+def question_formal_save_ready(question: dict) -> bool:
+    """Use the singleton service directly to avoid brittle symbol-level imports."""
+    return get_textbook_generation_service().question_formal_save_ready(question)
+
+
+def _empty_textbook_evidence_pack(reason: str) -> dict[str, Any]:
+    return {
+        "source_ready": False,
+        "matched_doc_id": None,
+        "matched_doc_title": None,
+        "gate_reasons": [reason] if reason else [],
+        "source": {},
+    }
+
+
+def _normalize_textbook_evidence_pack(evidence_pack: Any) -> dict[str, Any]:
+    if isinstance(evidence_pack, tuple):
+        for item in evidence_pack:
+            if isinstance(item, dict):
+                evidence_pack = item
+                break
+
+    if not isinstance(evidence_pack, dict):
+        return _empty_textbook_evidence_pack("教材證據格式不支援")
+
+    normalized = _empty_textbook_evidence_pack("")
+    normalized.update({key: value for key, value in evidence_pack.items() if key != "source"})
+    normalized["source"] = dict(evidence_pack.get("source") or {}) if isinstance(evidence_pack.get("source"), dict) else {}
+    normalized["source_ready"] = bool(normalized.get("source_ready"))
+
+    gate_reasons = normalized.get("gate_reasons")
+    if isinstance(gate_reasons, list):
+        normalized["gate_reasons"] = [str(reason) for reason in gate_reasons if str(reason).strip()]
+    elif gate_reasons:
+        normalized["gate_reasons"] = [str(gate_reasons)]
+    else:
+        normalized["gate_reasons"] = []
+
+    return normalized
+
+
+def _resolve_textbook_evidence(explanation_service, question: dict) -> dict[str, Any]:
+    lookup = getattr(explanation_service, "safe_find_textbook_evidence", None)
+    if not callable(lookup):
+        lookup = getattr(explanation_service, "find_textbook_evidence", None)
+
+    if callable(lookup):
+        try:
+            return _normalize_textbook_evidence_pack(lookup(question))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "streamlit_textbook_evidence_lookup_failed",
+                question_id=question.get("id"),
+                error=str(exc),
+            )
+
+    textbook_generation_service = getattr(explanation_service, "textbook_generation_service", None)
+    catalog_lookup = getattr(explanation_service, "list_textbook_doc_catalog", None)
+    build_lookup = getattr(textbook_generation_service, "build_evidence_pack_for_question", None)
+
+    if callable(catalog_lookup) and callable(build_lookup):
+        try:
+            doc_catalog = catalog_lookup()
+            candidate_doc_ids = [
+                str(doc.get("doc_id") or "").strip()
+                for doc in doc_catalog
+                if isinstance(doc, dict) and str(doc.get("doc_id") or "").strip()
+            ]
+            if candidate_doc_ids:
+                return _normalize_textbook_evidence_pack(
+                    build_lookup(
+                        question,
+                        selected_doc_ids=candidate_doc_ids,
+                        selected_sections=None,
+                    )
+                )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "streamlit_textbook_evidence_fallback_failed",
+                question_id=question.get("id"),
+                error=str(exc),
+            )
+
+    return _empty_textbook_evidence_pack("目前無法解析教材證據")
+
+
+def _truncate_text(value: str, limit: int) -> str:
+    compact = re.sub(r"\s+", " ", str(value or "")).strip()
+    if len(compact) <= limit:
+        return compact
+    return compact[: max(limit - 3, 0)].rstrip() + "..."
+
+
 def sync_current_page_from_nav() -> None:
     """Keep page navigation state in one place when the sidebar radio changes."""
-    selected_page = st.session_state.get("page_nav")
+    selected_page = PAGE_LABEL_ALIASES.get(st.session_state.get("page_nav"), st.session_state.get("page_nav"))
     if selected_page in PAGE_OPTIONS:
         st.session_state.current_page = selected_page
         sync_query_params_with_page(selected_page)
 
 
 def navigate_to(page: str) -> None:
-    """Programmatically switch pages without fighting the sidebar widget state."""
+    """Queue a page switch so the next rerun applies it before widgets render."""
+    page = PAGE_LABEL_ALIASES.get(page, page)
     if page not in PAGE_OPTIONS:
         return
     st.session_state.current_page = page
-    sync_query_params_with_page(page)
+    st.session_state.pending_page_navigation = page
+
+
+def navigate_to_without_query_sync(page: str) -> None:
+    """Switch pages on the next rerun without forcing an immediate URL-param update."""
+    page = PAGE_LABEL_ALIASES.get(page, page)
+    if page not in PAGE_OPTIONS:
+        return
+    st.session_state.current_page = page
+    st.session_state.pending_page_navigation = page
+    st.session_state.skip_query_param_sync_once = True
 
 
 def sync_nav_widget_state() -> None:
     """Ensure the sidebar radio reflects the current programmatic page state."""
-    current_page = st.session_state.get("current_page")
+    current_page = PAGE_LABEL_ALIASES.get(st.session_state.get("current_page"), st.session_state.get("current_page"))
     if current_page in PAGE_OPTIONS and st.session_state.get("page_nav") != current_page:
         st.session_state.page_nav = current_page
 
@@ -155,13 +336,16 @@ def render_draft_flash() -> None:
         return
 
     level = str(st.session_state.get("draft_flash_level", "success") or "success")
-    flash_renderers = {
-        "success": st.success,
-        "warning": st.warning,
-        "error": st.error,
-        "info": st.info,
-    }
-    flash_renderers.get(level, st.info)(message)
+    if hasattr(st, "toast") and level in {"success", "info"}:
+        st.toast(message, icon="✅" if level == "success" else "ℹ️")
+    else:
+        flash_renderers = {
+            "success": st.success,
+            "warning": st.warning,
+            "error": st.error,
+            "info": st.info,
+        }
+        flash_renderers.get(level, st.info)(message)
     st.session_state.draft_flash = ""
     st.session_state.draft_flash_level = "success"
 
@@ -280,29 +464,6 @@ def schedule_draft_batch_selection_reset() -> None:
     st.session_state.draft_batch_selection_override = []
 
 
-def ensure_review_question_widget_key(question: dict, fallback_index: int) -> str:
-    """Attach a stable UI key to generated-review questions across reruns."""
-    question_id = str(question.get("id") or "").strip()
-    if question_id:
-        return question_id
-
-    existing_widget_key = str(question.get("_review_widget_key") or "").strip()
-    if existing_widget_key:
-        return existing_widget_key
-
-    key_seed = "|".join(
-        [
-            question.get("question_text", ""),
-            json.dumps(question.get("options", []), ensure_ascii=False),
-            question.get("explanation", ""),
-            str(fallback_index),
-        ]
-    )
-    widget_key = hashlib.sha1(key_seed.encode("utf-8")).hexdigest()[:12]
-    question["_review_widget_key"] = widget_key
-    return widget_key
-
-
 def get_practice_question_key(question: dict, fallback_index: int) -> str:
     """Return a stable key for practice widgets and answer mapping."""
     question_id = str(question.get("id") or "").strip()
@@ -358,6 +519,13 @@ def start_practice_session(questions: list[dict], context: Optional[dict] = None
     st.session_state.practice_context = dict(context or {})
 
 
+def queue_practice_session(questions: list[dict], context: Optional[dict] = None) -> None:
+    """Defer practice-session setup to the next rerun before widgets are rebuilt."""
+    st.session_state.pending_practice_questions = list(questions)
+    st.session_state.pending_practice_context = dict(context or {})
+    navigate_to("✍️ 作答練習")
+
+
 def clear_practice_session(clear_questions: bool = True) -> None:
     """Reset the current practice round and optionally clear the question set."""
     current_questions = list(st.session_state.get("practice_questions", []))
@@ -411,6 +579,11 @@ def summarize_practice_results(questions: list[dict], practice_answers: dict[str
                 "is_correct": is_correct,
                 "explanation": question.get("explanation", ""),
                 "source_page": question.get("source_page"),
+                "figure_assets": question.get("figure_assets", []),
+                "option_figure_assets": question.get("option_figure_assets", []),
+                "source_page_image_path": question.get("source_page_image_path"),
+                "image_asset_status": question.get("image_asset_status"),
+                "image_asset_note": question.get("image_asset_note"),
             }
         )
 
@@ -432,6 +605,102 @@ def summarize_practice_results(questions: list[dict], practice_answers: dict[str
         "score": score,
         "answered_accuracy": answered_accuracy,
     }
+
+
+def build_practice_download_markdown(
+    questions: list[dict],
+    practice_answers: dict[str, str],
+    practice_context: Optional[dict] = None,
+    practice_result: Optional[dict] = None,
+) -> str:
+    """Build a markdown export for the current practice set without persisting it."""
+    context = practice_context or {}
+    source_label = str(context.get("label") or "未標記來源")
+    exported_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    lines = [
+        "# 練習考卷匯出",
+        "",
+        f"- 匯出時間：{exported_at}",
+        f"- 來源：{source_label}",
+        f"- 題數：{len(questions)}",
+    ]
+
+    if practice_result is not None:
+        lines.extend(
+            [
+                f"- 作答題數：{practice_result['answered_count']}/{practice_result['total_questions']}",
+                f"- 成績：{practice_result['correct_count']}/{practice_result['total_questions']} ({practice_result['score']:.1f}%)",
+            ]
+        )
+
+    lines.append("")
+
+    for index, question in enumerate(questions, start=1):
+        question_key = get_practice_question_key(question, index - 1)
+        user_answer = str(practice_answers.get(question_key, "") or "")
+        user_letter = user_answer[0] if user_answer else "-"
+        correct_answer = str(question.get("correct_answer", "") or "-")
+        exam_year = question.get("exam_year")
+        exam_name = str(question.get("exam_name", "") or "")
+        exam_label = f"{exam_year} 年 {exam_name}".strip() if exam_year or exam_name else "未標記考卷"
+        source_page = question.get("source_page")
+
+        lines.extend(
+            [
+                f"## 第 {index} 題",
+                "",
+                question.get("question_text", ""),
+                "",
+                f"- 來源考卷：{exam_label}",
+                f"- 題號：{question.get('question_number') or index}",
+                f"- 你的答案：{user_letter}",
+                f"- 正確答案：{correct_answer}",
+                f"- 難度：{question.get('difficulty', 'medium')}",
+            ]
+        )
+
+        topics = [str(topic).strip() for topic in question.get("topics", []) if str(topic).strip()]
+        if topics:
+            lines.append(f"- 主題：{', '.join(topics)}")
+        if source_page:
+            lines.append(f"- 來源頁碼：p.{source_page}")
+        if question.get("source_page_image_path"):
+            lines.append(f"- 原題頁面預覽：{question['source_page_image_path']}")
+
+        lines.append("")
+        lines.append("### 選項")
+        lines.append("")
+        for option_index, option in enumerate(question.get("options", [])):
+            lines.append(f"- {chr(65 + option_index)}. {option}")
+
+        option_figure_assets = question.get("option_figure_assets", []) or []
+        if option_figure_assets:
+            lines.extend(["", "### 圖像選項", ""])
+            for asset in option_figure_assets:
+                lines.append(f"- {asset.get('label', '?')}: {asset.get('path', '')}")
+
+        figure_assets = question.get("figure_assets", []) or []
+        if figure_assets:
+            lines.extend(["", "### 題目相關圖像", ""])
+            for asset in figure_assets:
+                lines.append(f"- {asset.get('caption') or asset.get('id')}: {asset.get('path', '')}")
+
+        explanation = str(question.get("explanation", "") or "").strip()
+        if explanation:
+            lines.extend(["", "### 詳解", "", explanation])
+
+        lines.extend(["", "---", ""])
+
+    return "\n".join(lines).strip() + "\n"
+
+
+def build_practice_download_filename(practice_context: Optional[dict] = None) -> str:
+    """Build a readable filename for the current practice export."""
+    context = practice_context or {}
+    source_label = str(context.get("label") or "practice").strip().lower()
+    safe_label = re.sub(r"[^a-z0-9_-]+", "-", source_label).strip("-") or "practice"
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return f"{safe_label}_{timestamp}.md"
 
 
 def build_practice_breakdown_rows(
@@ -533,6 +802,15 @@ def inject_app_styles() -> None:
                 --radius: 22px;
             }
 
+            html, body, [data-testid="stAppViewContainer"], .stApp {
+                color-scheme: light !important;
+            }
+
+            body {
+                color: var(--text);
+                background: #fcfaf5;
+            }
+
             .stApp {
                 background:
                     radial-gradient(circle at top left, rgba(15, 118, 110, 0.10), transparent 28%),
@@ -559,8 +837,114 @@ def inject_app_styles() -> None:
                 border-right: 1px solid rgba(15, 118, 110, 0.10);
             }
 
+            [data-testid="stSidebar"],
+            [data-testid="stSidebar"] * {
+                color: var(--text) !important;
+            }
+
             [data-testid="stSidebar"] .block-container {
                 padding-top: 1.8rem;
+            }
+
+            [data-testid="stMarkdownContainer"],
+            [data-testid="stMarkdownContainer"] p,
+            [data-testid="stMarkdownContainer"] li,
+            label,
+            .stRadio p,
+            .stCheckbox p,
+            .stSelectbox label,
+            .stMultiSelect label,
+            .stTextInput label,
+            .stNumberInput label,
+            .stTextArea label,
+            .stFileUploader label,
+            .stSlider label {
+                color: var(--text) !important;
+            }
+
+            [data-baseweb="input"] input,
+            [data-baseweb="base-input"],
+            .stTextInput input,
+            .stTextArea textarea,
+            .stNumberInput input,
+            .stSelectbox [data-baseweb="select"] > div,
+            .stMultiSelect [data-baseweb="select"] > div,
+            .stFileUploader [data-testid="stFileUploaderDropzone"] {
+                background: rgba(255, 255, 255, 0.92) !important;
+                color: var(--text) !important;
+                border: 1px solid rgba(18, 82, 76, 0.14) !important;
+            }
+
+            [data-baseweb="input"] input::placeholder,
+            .stTextInput input::placeholder,
+            .stTextArea textarea::placeholder {
+                color: var(--muted) !important;
+                opacity: 1;
+            }
+
+            .stButton > button,
+            .stDownloadButton > button,
+            .stFileUploader button {
+                background: linear-gradient(180deg, rgba(255, 255, 255, 0.98) 0%, rgba(247, 250, 249, 0.96) 100%) !important;
+                color: var(--text) !important;
+                border: 1px solid rgba(18, 82, 76, 0.16) !important;
+                box-shadow: 0 8px 20px rgba(22, 53, 50, 0.08);
+            }
+
+            .stButton > button p,
+            .stDownloadButton > button p,
+            .stFileUploader button p,
+            .stButton > button span,
+            .stDownloadButton > button span,
+            .stFileUploader button span {
+                color: inherit !important;
+            }
+
+            .stButton > button:hover,
+            .stDownloadButton > button:hover,
+            .stFileUploader button:hover {
+                background: rgba(15, 118, 110, 0.10) !important;
+                color: var(--accent) !important;
+                border-color: rgba(15, 118, 110, 0.22) !important;
+            }
+
+            [data-testid="stExpander"] summary {
+                background: linear-gradient(180deg, rgba(255, 255, 255, 0.98) 0%, rgba(247, 250, 249, 0.96) 100%) !important;
+                color: var(--text) !important;
+                border: 1px solid rgba(18, 82, 76, 0.14) !important;
+                border-radius: 16px !important;
+                box-shadow: 0 8px 20px rgba(22, 53, 50, 0.06);
+            }
+
+            [data-testid="stExpander"] summary:hover {
+                background: rgba(15, 118, 110, 0.08) !important;
+                color: var(--accent) !important;
+                border-color: rgba(15, 118, 110, 0.20) !important;
+            }
+
+            [data-testid="stExpander"] summary p,
+            [data-testid="stExpander"] summary span,
+            [data-testid="stExpander"] summary svg {
+                color: inherit !important;
+                fill: currentColor !important;
+            }
+
+            .stNumberInput button {
+                background: linear-gradient(180deg, rgba(255, 255, 255, 0.98) 0%, rgba(247, 250, 249, 0.96) 100%) !important;
+                color: var(--text) !important;
+                border: 1px solid rgba(18, 82, 76, 0.16) !important;
+            }
+
+            .stNumberInput button:hover {
+                background: rgba(15, 118, 110, 0.10) !important;
+                color: var(--accent) !important;
+                border-color: rgba(15, 118, 110, 0.22) !important;
+            }
+
+            .stNumberInput button svg,
+            .stNumberInput button span {
+                color: inherit !important;
+                fill: currentColor !important;
             }
 
             div[data-testid="stVerticalBlockBorderWrapper"] {
@@ -728,6 +1112,46 @@ def render_empty_state(title: str, body: str) -> None:
     )
 
 
+def _normalize_project_path_string(path_str: str) -> str:
+    """Map stale absolute repo paths back onto the current workspace root."""
+    normalized = str(path_str or "").strip()
+    if not normalized:
+        return normalized
+
+    path = Path(normalized)
+    if not path.is_absolute() or path.exists():
+        return normalized
+
+    parts = path.parts
+    if "anesthesia-exam" not in parts:
+        return normalized
+
+    project_index = parts.index("anesthesia-exam")
+    relative_parts = parts[project_index + 1 :]
+    if not relative_parts:
+        return normalized
+
+    return str(PROJECT_DIR.joinpath(*relative_parts))
+
+
+def _normalize_manifest_paths(value):
+    """Normalize stale persisted path fields inside manifest payloads."""
+    if isinstance(value, dict):
+        normalized: dict = {}
+        for key, item in value.items():
+            normalized_item = _normalize_manifest_paths(item)
+            if isinstance(normalized_item, str) and (key == "path" or key.endswith("_path")):
+                normalized[key] = _normalize_project_path_string(normalized_item)
+            else:
+                normalized[key] = normalized_item
+        return normalized
+
+    if isinstance(value, list):
+        return [_normalize_manifest_paths(item) for item in value]
+
+    return value
+
+
 def _resolve_doc_root(manifest: dict) -> Path | None:
     """從 manifest 推回對應的 doc_* 目錄。"""
     explicit_paths = [manifest.get("manifest_path"), manifest.get("markdown_path")]
@@ -793,13 +1217,6 @@ def question_has_precise_source(question: dict) -> bool:
     return bool(source.get("document") and stem_source.get("page") and stem_source.get("original_text"))
 
 
-def question_formal_save_ready(question: dict) -> bool:
-    """判斷題目是否已滿足 formal-save evidence gate。"""
-    from src.application.services.textbook_generation_service import get_textbook_generation_service
-
-    return get_textbook_generation_service().question_formal_save_ready(question)
-
-
 def render_selected_docs_summary(selected_docs_info: list[dict]) -> tuple[int, int]:
     """顯示已選教材摘要與 source readiness 狀態。"""
     if not selected_docs_info:
@@ -845,7 +1262,10 @@ def load_indexed_documents() -> list[dict]:
                 continue
             try:
                 with open(manifest_files[0], "r", encoding="utf-8") as f:
-                    m = json.load(f)
+                    raw_manifest = _normalize_manifest_paths(json.load(f))
+                if not isinstance(raw_manifest, dict):
+                    raise ValueError("教材 manifest 內容格式錯誤")
+                m = raw_manifest
                 doc_id = m.get("doc_id", doc_dir.name)
                 if doc_id not in seen_ids:
                     seen_ids.add(doc_id)
@@ -857,7 +1277,10 @@ def load_indexed_documents() -> list[dict]:
     if SOURCES_MANIFEST.exists():
         try:
             with open(SOURCES_MANIFEST, "r", encoding="utf-8") as f:
-                global_manifest = json.load(f)
+                raw_global_manifest = _normalize_manifest_paths(json.load(f))
+            if not isinstance(raw_global_manifest, dict):
+                raise ValueError("全域來源 manifest 內容格式錯誤")
+            global_manifest = raw_global_manifest
             for src in global_manifest.get("sources", []):
                 doc_id = src.get("doc_id", "")
                 if doc_id and doc_id not in seen_ids:
@@ -882,15 +1305,11 @@ def load_agent_metadata(provider_name: str = "crush") -> dict:
         try:
             with open(OPENCODE_CONFIG_PATH, "r", encoding="utf-8") as f:
                 data = json.load(f)
-            meta["model"] = data.get("model")
+            meta["model"] = resolve_opencode_default_model(data)
             meta["mcp_servers"] = data.get("mcp", {})
-            # 收集 opencode.json 中定義的自訂模型
-            for prov_cfg in data.get("provider", {}).values():
-                for model_key in prov_cfg.get("models", {}):
-                    prov_id = list(data.get("provider", {}).keys())[0]
-                    meta["available_models"].append(f"{prov_id}/{model_key}")
+            meta["available_models"] = collect_opencode_available_models(data)
             # 嘗試從 opencode CLI 取得完整模型清單
-            try:
+            if shutil.which("opencode") or shutil.which("opencode.exe"):
                 result = subprocess.run(
                     ["opencode", "models"],
                     capture_output=True,
@@ -905,13 +1324,57 @@ def load_agent_metadata(provider_name: str = "crush") -> dict:
                         for line in result.stdout.strip().splitlines()
                         if "/" in line.strip() and not line.strip().startswith("Error")
                     ]
-                    # 合併去重，CLI 結果為主
                     if cli_models:
                         meta["available_models"] = cli_models
-            except Exception:
-                pass
         except Exception as e:
             logger.warning("opencode_config_load_error", error=str(e))
+    elif provider_name == "codex":
+        codex_model = (
+            os.getenv("EXAM_CODEX_MODEL")
+            or os.getenv("EXAM_OPENAI_MODEL")
+            or os.getenv("EXAM_AGENT_MODEL")
+            or "gpt-5.3-codex"
+        ).strip()
+        meta["model"] = codex_model
+        meta["available_models"] = [codex_model]
+    elif provider_name == "openclaw":
+        openclaw_config_path = Path(
+            os.getenv("EXAM_OPENCLAW_CONFIG_PATH")
+            or os.getenv("OPENCLAW_CONFIG_PATH")
+            or (PROJECT_DIR / "vendor" / "openclaw-state" / "openclaw.json")
+        )
+        openclaw_executable = Path(os.getenv("EXAM_OPENCLAW_PATH") or (PROJECT_DIR / "scripts" / "openclaw.sh"))
+
+        if openclaw_config_path.exists():
+            try:
+                with open(openclaw_config_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                meta["model"] = resolve_openclaw_default_model(data)
+                meta["available_models"] = collect_openclaw_available_models(data)
+            except Exception as e:
+                logger.warning("openclaw_config_load_error", error=str(e), path=str(openclaw_config_path))
+
+        if openclaw_executable.exists():
+            try:
+                result = subprocess.run(
+                    [str(openclaw_executable), "models", "status", "--plain"],
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                    encoding="utf-8",
+                    errors="replace",
+                )
+                if result.returncode == 0:
+                    cli_model = ""
+                    for line in result.stdout.strip().splitlines():
+                        if line.strip():
+                            cli_model = line.strip()
+                    if cli_model:
+                        meta["model"] = cli_model
+                        if cli_model not in meta["available_models"]:
+                            meta["available_models"] = [cli_model, *meta["available_models"]]
+            except Exception as e:
+                logger.warning("openclaw_model_status_error", error=str(e), path=str(openclaw_executable))
     elif CRUSH_CONFIG_PATH.exists():
         try:
             with open(CRUSH_CONFIG_PATH, "r", encoding="utf-8") as f:
@@ -924,6 +1387,12 @@ def load_agent_metadata(provider_name: str = "crush") -> dict:
         except Exception as e:
             logger.warning("crush_config_load_error", error=str(e))
 
+    configured_model = get_configured_agent_model(provider_name, meta)
+    if configured_model:
+        meta["model"] = configured_model
+        if configured_model not in meta["available_models"]:
+            meta["available_models"] = [configured_model, *meta["available_models"]]
+
     return meta
 
 
@@ -935,7 +1404,10 @@ def get_agent_status(provider_name: str, model_override: Optional[str] = None) -
         provider_override=provider_name,
         model_override=model_override,
     )
-    provider = create_agent_provider(config)
+    try:
+        provider = create_agent_provider(config)
+    except ValueError as e:
+        return False, str(e), None
     available, reason = provider.is_available()
     return available, reason, provider
 
@@ -1075,298 +1547,6 @@ def build_discussion_prompt(user_prompt: str, selected_question: dict | None) ->
     )
 
 
-def extract_questions_from_response(text: str) -> list[dict]:
-    """
-    從 AI 混合文字輸出中提取所有 JSON 題目物件。
-
-    AI 回應通常包含敘述文字 + JSON code blocks，需要找出所有
-    包含 question_text & options 的 JSON 物件。
-    """
-    questions: list[dict] = []
-    seen_texts: set[str] = set()  # 去重
-
-    # 策略 1：提取 ```json ... ``` 或 ``` ... ``` code blocks
-    code_blocks = re.findall(r"```(?:json)?\s*(\{.+?\})\s*```", text, re.DOTALL)
-
-    # 策略 2：找獨立的 JSON 物件（以 { 開頭且包含 question_text）
-    # 使用平衡括號匹配
-    brace_objects: list[str] = []
-    i = 0
-    while i < len(text):
-        if text[i] == "{":
-            depth = 0
-            start = i
-            for j in range(i, len(text)):
-                if text[j] == "{":
-                    depth += 1
-                elif text[j] == "}":
-                    depth -= 1
-                    if depth == 0:
-                        candidate = text[start : j + 1]
-                        if "question_text" in candidate and "options" in candidate:
-                            brace_objects.append(candidate)
-                        i = j + 1
-                        break
-            else:
-                i += 1
-        else:
-            i += 1
-
-    # 合併兩種策略的結果
-    for raw_json in code_blocks + brace_objects:
-        try:
-            obj = json.loads(raw_json)
-        except json.JSONDecodeError:
-            # 嘗試修復常見問題（trailing comma）
-            cleaned = re.sub(r",\s*}", "}", raw_json)
-            cleaned = re.sub(r",\s*]", "]", cleaned)
-            try:
-                obj = json.loads(cleaned)
-            except json.JSONDecodeError:
-                continue
-
-        if not isinstance(obj, dict):
-            continue
-        if not obj.get("question_text") or not obj.get("options"):
-            continue
-
-        # 去重（同一題可能在 code block 和 brace 都被找到）
-        fingerprint = obj["question_text"][:80]
-        if fingerprint in seen_texts:
-            continue
-        seen_texts.add(fingerprint)
-
-        questions.append(normalize_ai_question(obj))
-
-    return questions
-
-
-def normalize_ai_question(raw: dict) -> dict:
-    """
-    將 AI 輸出的 JSON 格式正規化為我們的 Question schema。
-
-    AI 可能輸出：
-      source_doc, source_chapter, stem_source, ...
-    我們需要：
-      source: { document, chapter, stem_source: {...}, ... }
-    """
-    q: dict = {
-        "id": raw.get("id", str(uuid.uuid4())),
-        "question_text": raw.get("question_text", ""),
-        "options": raw.get("options", []),
-        "correct_answer": raw.get("correct_answer", ""),
-        "explanation": raw.get("explanation", ""),
-        "difficulty": raw.get("difficulty", "medium"),
-        "topics": raw.get("topics", []),
-    }
-
-    # 清理選項（移除 "A. " 前綴，因為 UI 會自動加）
-    cleaned_options = []
-    for opt in q["options"]:
-        cleaned = re.sub(r"^[A-Da-d][.、:：]\s*", "", str(opt))
-        cleaned_options.append(cleaned)
-    q["options"] = cleaned_options
-
-    # 組裝 source
-    source: dict = {}
-    if raw.get("source_doc"):
-        source["document"] = raw["source_doc"]
-    elif raw.get("source") and isinstance(raw["source"], dict):
-        source = raw["source"]
-    if raw.get("source_chapter"):
-        source["chapter"] = raw["source_chapter"]
-    if raw.get("stem_source") and isinstance(raw["stem_source"], dict):
-        source["stem_source"] = raw["stem_source"]
-    if raw.get("answer_source") and isinstance(raw["answer_source"], dict):
-        source["answer_source"] = raw["answer_source"]
-    if raw.get("explanation_sources") and isinstance(raw["explanation_sources"], list):
-        source["explanation_sources"] = raw["explanation_sources"]
-
-    if source:
-        q["source"] = source
-
-    for key in ("preview_only", "formal_save_ready", "generation_mode", "evidence_pack"):
-        if key in raw:
-            q[key] = raw[key]
-
-    return q
-
-
-def parse_mcp_result(text: str) -> Optional[dict]:
-    """
-    從 Crush 輸出中解析 MCP 工具調用結果
-    """
-    # 尋找 JSON 格式的結果
-    patterns = [
-        r'\{[^{}]*"question_id"\s*:\s*"[^"]+?"[^{}]*\}',
-        r'\{[^{}]*"success"\s*:\s*true[^{}]*\}',
-    ]
-
-    for pattern in patterns:
-        matches = re.findall(pattern, text, re.DOTALL | re.IGNORECASE)
-        for match in matches:
-            try:
-                result = json.loads(match)
-                if result.get("question_id"):
-                    return result
-            except json.JSONDecodeError:
-                continue
-
-    # 尋找題目 ID 格式
-    id_match = re.search(r'題目\s*ID[：:]\s*[`"]?([a-f0-9-]{36})[`"]?', text)
-    if id_match:
-        return {"question_id": id_match.group(1), "success": True}
-
-    return None
-
-
-def parse_question_from_output(text: str) -> Optional[dict]:
-    """從 AI 輸出中解析題目內容"""
-    question = {}
-
-    # 解析題目文字
-    q_patterns = [
-        r"\*\*題目[：:]\*\*\s*(.+?)(?=\*\*選項|\*\*Options|[A-D][.、]|$)",
-        r"題目[：:]\s*(.+?)(?=選項|[A-D][.、]|$)",
-    ]
-
-    for pattern in q_patterns:
-        match = re.search(pattern, text, re.DOTALL | re.IGNORECASE)
-        if match:
-            question["question_text"] = match.group(1).strip()
-            break
-
-    # 解析選項
-    options = []
-    opt_pattern = r"([A-D])[.、:：]\s*(.+?)(?=[A-D][.、:：]|\*\*答案|\*\*正確|答案[：:]|$)"
-    for match in re.finditer(opt_pattern, text, re.DOTALL):
-        opt_text = match.group(2).strip()
-        if opt_text and len(opt_text) > 1:
-            options.append(opt_text)
-    if options:
-        question["options"] = options
-
-    # 解析答案
-    ans_patterns = [
-        r"\*\*(?:答案|正確答案)[：:]\*\*\s*([A-D])",
-        r"(?:答案|正確答案)[：:]\s*([A-D])",
-    ]
-
-    for pattern in ans_patterns:
-        match = re.search(pattern, text, re.IGNORECASE)
-        if match:
-            question["correct_answer"] = match.group(1).upper()
-            break
-
-    # 解析難度
-    diff_match = re.search(r"難度[：:]\s*(easy|medium|hard|簡單|中等|困難)", text, re.IGNORECASE)
-    if diff_match:
-        diff_map = {"簡單": "easy", "中等": "medium", "困難": "hard"}
-        question["difficulty"] = diff_map.get(diff_match.group(1), diff_match.group(1).lower())
-
-    # 解析詳解
-    exp_patterns = [
-        r"\*\*(?:解析|詳解)[：:]\*\*\s*(.+?)(?=\*\*|題目 ID|$)",
-        r"(?:解析|詳解)[：:]\s*(.+?)(?=題目|$)",
-    ]
-
-    for pattern in exp_patterns:
-        match = re.search(pattern, text, re.DOTALL | re.IGNORECASE)
-        if match:
-            question["explanation"] = match.group(1).strip()
-            break
-
-    if question.get("question_text") and question.get("options"):
-        return question
-
-    return None
-
-
-def stream_agent_generate(
-    prompt: str,
-    provider,
-    output_placeholder,
-    questions_container,
-    progress_placeholder,
-) -> tuple[str, list[dict]]:
-    """
-    真正的流式生成 - 不使用 st.spinner，持續更新 UI
-
-    Returns:
-        (full_output, saved_questions)
-    """
-    logger.info("generation_start", provider=getattr(provider, "name", "unknown"), prompt_len=len(prompt))
-    t0 = time.monotonic()
-
-    full_response = ""
-    current_question_buffer = ""
-    saved_questions = []
-    last_update_time = time.time()
-
-    try:
-        for line in provider.stream(prompt):
-            if not line:
-                continue
-
-            full_response += line
-            current_question_buffer += line
-
-            # 每 100ms 更新一次 UI，避免過於頻繁
-            current_time = time.time()
-            if current_time - last_update_time > 0.1:
-                # 更新 AI 輸出顯示
-                display_text = full_response[-3000:] if len(full_response) > 3000 else full_response
-                output_placeholder.markdown(f"```\n{display_text}\n```")
-
-                # 更新進度
-                progress_placeholder.markdown(f"⏳ 已接收 {len(full_response)} 字元，已儲存 {len(saved_questions)} 題")
-
-                last_update_time = current_time
-
-            # 檢查是否有新題目被儲存
-            mcp_result = parse_mcp_result(current_question_buffer)
-            if mcp_result and mcp_result.get("question_id"):
-                qid = mcp_result.get("question_id")
-                logger.info("mcp_result_detected", question_id=qid)
-
-                # 解析題目內容
-                parsed_q = parse_question_from_output(current_question_buffer)
-                if parsed_q:
-                    parsed_q["id"] = qid
-                    saved_questions.append(parsed_q)
-
-                    logger.info(
-                        "question_saved",
-                        index=len(saved_questions),
-                        question_id=qid,
-                        question_text=parsed_q.get("question_text", "")[:80],
-                    )
-
-                    # 即時顯示題目卡片
-                    with questions_container:
-                        render_question_card_inline(parsed_q, len(saved_questions))
-
-                # 重置緩衝區
-                current_question_buffer = ""
-
-        # 最終更新
-        output_placeholder.markdown(f"```\n{full_response[-3000:]}\n```")
-
-    except Exception as e:
-        logger.exception("generation_error", error=str(e))
-        output_placeholder.error(f"生成錯誤: {e}")
-
-    elapsed_ms = int((time.monotonic() - t0) * 1000)
-    logger.info(
-        "generation_done",
-        duration_ms=elapsed_ms,
-        total_questions=len(saved_questions),
-        total_chars=len(full_response),
-    )
-
-    return full_response, saved_questions
-
-
 def stream_agent_response(prompt: str, provider):
     """聊天用流式回應"""
     for chunk in provider.stream(prompt):
@@ -1376,443 +1556,6 @@ def stream_agent_response(prompt: str, provider):
 def run_agent_sync(prompt: str, provider) -> str:
     """聊天用同步回應"""
     return provider.run(prompt)
-
-
-def render_source_info(source: dict | None, expanded: bool = False):
-    """渲染來源資訊（可展開式）"""
-    if not source:
-        return
-
-    # 檢查是否有任何來源資訊
-    has_info = source.get("document") or source.get("stem_source") or source.get("page")
-    if not has_info:
-        return
-
-    with st.expander("📚 來源資訊", expanded=expanded):
-        # 基本資訊
-        doc = source.get("document", "未知文件")
-        st.markdown(f"**📖 教材:** {doc}")
-
-        if source.get("chapter"):
-            chapter_str = str(source.get("chapter") or "")
-            if source.get("section"):
-                chapter_str += f" - {source.get('section')}"
-            st.markdown(f"**📑 章節:** {chapter_str}")
-
-        # 精確來源（新格式）
-        if source.get("stem_source"):
-            st.markdown("---")
-            _render_source_location("📍 題幹來源", source["stem_source"])
-
-        if source.get("answer_source"):
-            _render_source_location("📍 答案依據", source["answer_source"])
-
-        if source.get("explanation_sources"):
-            for i, src in enumerate(source["explanation_sources"]):
-                _render_source_location(f"📍 詳解來源 {i + 1}", src)
-
-        # 向後相容（舊格式）
-        elif source.get("page") and not source.get("stem_source"):
-            st.markdown("---")
-            page_info = f"**P.{source['page']}**"
-            if source.get("lines"):
-                page_info += f", 第 {source['lines']} 行"
-            st.markdown(page_info)
-
-            if source.get("original_text"):
-                text = source["original_text"]
-                if len(text) > 200:
-                    text = text[:200] + "..."
-                st.markdown(f"> _{text}_")
-
-        # 驗證狀態
-        if source.get("is_verified"):
-            st.success("✅ 來源已驗證")
-
-
-def _render_source_location(label: str, loc: dict):
-    """渲染單一來源位置"""
-    if not loc:
-        return
-
-    page = loc.get("page", 0)
-    line_start = loc.get("line_start", 0)
-    line_end = loc.get("line_end", 0)
-    original_text = loc.get("original_text", "")
-
-    # 位置資訊
-    loc_str = f"**{label}:** P.{page}"
-    if line_start and line_end:
-        loc_str += f", 第 {line_start}-{line_end} 行"
-    st.markdown(loc_str)
-
-    # 原文引用
-    if original_text:
-        text = original_text
-        if len(text) > 200:
-            text = text[:200] + "..."
-        st.markdown(f"> _{text}_")
-
-
-def render_question_card_inline(question: dict, index: int):
-    """在容器內渲染題目卡片（用於流式生成時）"""
-    st.markdown("---")
-    st.markdown(f"### ✅ 第 {index} 題 (已儲存)")
-    st.markdown(f"**{question.get('question_text', '')}**")
-
-    options = question.get("options", [])
-    for j, opt in enumerate(options):
-        prefix = chr(65 + j)
-        if prefix == question.get("correct_answer"):
-            st.markdown(f"✅ **{prefix}. {opt}**")
-        else:
-            st.markdown(f"　{prefix}. {opt}")
-
-    col1, col2 = st.columns(2)
-    with col1:
-        st.caption(f"📝 答案: {question.get('correct_answer', 'N/A')}")
-    with col2:
-        diff = question.get("difficulty", "medium")
-        diff_emoji = {"easy": "🟢", "medium": "🟡", "hard": "🔴"}.get(diff, "⚪")
-        st.caption(f"{diff_emoji} 難度: {diff}")
-
-    if question.get("explanation"):
-        with st.expander("📖 查看詳解"):
-            st.write(question.get("explanation"))
-
-    # 顯示來源資訊
-    source = question.get("source")
-    if source:
-        render_source_info(source)
-
-    st.caption(f"🆔 {question.get('id', 'N/A')}")
-
-
-def render_question_review_form(questions: list[dict]) -> None:
-    """
-    渲染題目審閱/編輯表單。
-
-    顯示從 AI 回應中提取的題目，讓使用者可以：
-    1. 預覽完整題目卡片
-    2. 編輯題目文字、選項、答案、難度
-    3. 查看來源資訊
-    4. 先送進草稿箱，再批次整理或正式入庫
-    """
-    from src.application.services.question_draft_service import get_question_draft_service
-    from src.application.services.question_similarity_service import get_question_similarity_service
-    from src.infrastructure.persistence.sqlite_question_repo import get_question_repository
-
-    if not questions:
-        return
-
-    st.markdown(f"### 📝 AI 生成結果：共 {len(questions)} 題")
-    st.caption("建議先送進草稿箱，再用批次編修整理後正式入庫；若確認品質足夠，也可直接正式入庫。")
-
-    preview_only_count = sum(1 for question in questions if question.get("preview_only"))
-    formal_ready_count = sum(1 for question in questions if question_formal_save_ready(question))
-    blocked_formal_count = len(questions) - formal_ready_count
-
-    if preview_only_count:
-        st.warning(
-            f"本批有 {preview_only_count} 題屬於 preview-only 草稿，只能送進草稿箱，不能直接正式入庫。"
-        )
-    elif blocked_formal_count:
-        st.warning(
-            f"本批有 {blocked_formal_count} 題尚未通過 formal-save gate。請先補足 evidence pack 或改送草稿箱。"
-        )
-    elif formal_ready_count:
-        st.success("本批題目都已具備 formal-save evidence pack，可直接正式入庫。")
-
-    similarity_service = get_question_similarity_service()
-    similarity_corpus = similarity_service.build_corpus()
-    similar_warning_count = sum(
-        1
-        for question in questions
-        if similarity_service.find_similar(
-            question.get("question_text", ""),
-            corpus=similarity_corpus,
-            threshold=0.78,
-        )
-    )
-    if similar_warning_count:
-        st.warning(f"本批候選題中有 {similar_warning_count} 題偵測到相似題，建議先送進草稿箱比對後再正式入庫。")
-
-    # 草稿箱 / 正式入庫 / 清除
-    col_draft_all, col_save_all, col_clear = st.columns([1, 1, 1])
-    with col_draft_all:
-        if st.button("📥 全部送進草稿箱", width="stretch", type="primary", key="save_all_to_drafts"):
-            draft_service = get_question_draft_service()
-            saved_count = draft_service.save_review_questions_as_drafts(questions, origin="generated_review")
-            if saved_count > 0:
-                st.session_state.generated_questions = []
-                st.session_state.draft_flash = f"已新增 {saved_count}/{len(questions)} 題到草稿箱。"
-                navigate_to("🗃️ 草稿箱")
-                st.rerun()
-            st.error("❌ 無法送進草稿箱，請檢查題目格式")
-    with col_save_all:
-        if st.button(
-            "✅ 全部正式入庫",
-            width="stretch",
-            key="save_all_reviewed",
-            disabled=formal_ready_count != len(questions),
-        ):
-            repo = get_question_repository()
-            saved_count = 0
-            for q in questions:
-                try:
-                    question_entity = _dict_to_question_entity(q)
-                    repo.save(question_entity)
-                    saved_count += 1
-                except Exception as e:
-                    logger.warning("save_question_failed", error=str(e), question_text=q.get("question_text", "")[:50])
-            if saved_count > 0:
-                st.success(f"✅ 已儲存 {saved_count}/{len(questions)} 題到題庫！")
-                logger.info("batch_save_completed", saved=saved_count, total=len(questions))
-            else:
-                st.error("❌ 儲存失敗，請檢查題目格式")
-    with col_clear:
-        if st.button("🗑️ 清除結果", width="stretch", key="clear_reviewed"):
-            st.session_state.generated_questions = []
-            st.rerun()
-
-    st.markdown("---")
-
-    # 逐題顯示
-    for idx, q in enumerate(questions):
-        q_num = idx + 1
-        review_key = ensure_review_question_widget_key(q, idx)
-        with st.expander(f"第 {q_num} 題：{q.get('question_text', '')[:60]}...", expanded=(idx < 3)):
-            evidence_pack = q.get("evidence_pack") or {}
-            if q.get("preview_only"):
-                st.info("preview-only：這題是從教材 section/chapter/full text 產生的草稿，不可直接正式入庫。")
-            elif question_formal_save_ready(q):
-                st.success("formal-save ready：stem_source、answer_source、explanation_sources 已齊備。")
-            else:
-                st.warning("尚未達到 formal-save gate。請先補齊 evidence pack 或先送進草稿箱。")
-
-            gate_reasons = evidence_pack.get("gate_reasons") or []
-            if gate_reasons:
-                st.caption("Gate: " + " | ".join(str(reason) for reason in gate_reasons))
-
-            # ---- 題目文字（可編輯）----
-            edited_text = st.text_area(
-                "題目",
-                value=q.get("question_text", ""),
-                height=100,
-                key=f"review_q_text_{review_key}",
-            )
-            q["question_text"] = edited_text
-
-            # ---- 選項（可編輯）----
-            options = q.get("options", [])
-            for opt_idx in range(4):
-                prefix = chr(65 + opt_idx)
-                default_val = options[opt_idx] if opt_idx < len(options) else ""
-                edited_opt = st.text_input(
-                    f"選項 {prefix}",
-                    value=default_val,
-                    key=f"review_opt_{review_key}_{opt_idx}",
-                )
-                if opt_idx < len(options):
-                    options[opt_idx] = edited_opt
-                elif edited_opt:
-                    options.append(edited_opt)
-            q["options"] = options
-
-            # ---- 答案 + 難度 ----
-            r_col1, r_col2 = st.columns(2)
-            with r_col1:
-                answer_opts = ["A", "B", "C", "D"]
-                current_ans = q.get("correct_answer", "A").upper()
-                ans_idx = answer_opts.index(current_ans) if current_ans in answer_opts else 0
-                q["correct_answer"] = st.selectbox(
-                    "正確答案",
-                    answer_opts,
-                    index=ans_idx,
-                    key=f"review_ans_{review_key}",
-                )
-            with r_col2:
-                diff_opts = ["easy", "medium", "hard"]
-                diff_labels = ["🟢 簡單", "🟡 中等", "🔴 困難"]
-                current_diff = q.get("difficulty", "medium")
-                diff_idx = diff_opts.index(current_diff) if current_diff in diff_opts else 1
-                selected_diff = st.selectbox(
-                    "難度",
-                    diff_labels,
-                    index=diff_idx,
-                    key=f"review_diff_{review_key}",
-                )
-                q["difficulty"] = diff_opts[diff_labels.index(selected_diff)]
-
-            # ---- 詳解（可編輯）----
-            edited_exp = st.text_area(
-                "詳解",
-                value=q.get("explanation", ""),
-                height=80,
-                key=f"review_exp_{review_key}",
-            )
-            q["explanation"] = edited_exp
-
-            # ---- 主題標籤 ----
-            topics_str = ", ".join(q.get("topics", []))
-            edited_topics = st.text_input(
-                "主題標籤（逗號分隔）",
-                value=topics_str,
-                key=f"review_topics_{review_key}",
-            )
-            q["topics"] = [t.strip() for t in edited_topics.split(",") if t.strip()]
-
-            # ---- 來源資訊（唯讀顯示）----
-            source = q.get("source")
-            if source:
-                render_source_info(source, expanded=False)
-
-            similar_matches = similarity_service.find_similar(
-                q.get("question_text", ""),
-                corpus=similarity_corpus,
-                threshold=0.78,
-            )
-            if similar_matches:
-                st.warning("偵測到相似題，送進草稿箱或正式入庫前請先比對。")
-                match_lines = []
-                for match in similar_matches:
-                    source_label = "正式題庫" if match["source_type"] == "bank" else "草稿箱"
-                    similarity_pct = int(round(match["similarity"] * 100))
-                    preview_text = match["question_text"][:72].strip()
-                    if len(match["question_text"]) > 72:
-                        preview_text += "..."
-                    match_lines.append(f"- [{source_label}] {similarity_pct}% 相似: {preview_text}")
-                st.markdown("\n".join(match_lines))
-
-            action_col1, action_col2 = st.columns(2)
-            with action_col1:
-                if st.button("📥 送進草稿箱", key=f"save_single_draft_{review_key}", width="stretch"):
-                    try:
-                        draft_service = get_question_draft_service()
-                        saved_count = draft_service.save_review_questions_as_drafts([q], origin="review_single")
-                        if saved_count:
-                            st.success("✅ 已送進草稿箱")
-                    except Exception as e:
-                        st.error(f"❌ 送進草稿箱失敗: {e}")
-            with action_col2:
-                if st.button(
-                    "💾 正式入庫",
-                    key=f"save_single_{review_key}",
-                    width="stretch",
-                    disabled=not question_formal_save_ready(q),
-                ):
-                    try:
-                        repo = get_question_repository()
-                        question_entity = _dict_to_question_entity(q)
-                        qid = repo.save(question_entity)
-                        st.success(f"✅ 已儲存！ID: {qid[:8]}...")
-                        logger.info("single_question_saved", question_id=qid)
-                    except Exception as e:
-                        st.error(f"❌ 儲存失敗: {e}")
-
-
-def _dict_to_question_entity(q: dict):
-    """將審閱表單的 dict 轉為 Question entity"""
-    from src.domain.entities.question import (
-        Difficulty,
-        Question,
-        QuestionType,
-        Source,
-        SourceLocation,
-    )
-
-    source = None
-    src_data = q.get("source")
-    if src_data and isinstance(src_data, dict):
-        stem_loc = None
-        if src_data.get("stem_source"):
-            sl = src_data["stem_source"]
-            stem_loc = SourceLocation(
-                page=sl.get("page", 0),
-                line_start=sl.get("line_start", 0),
-                line_end=sl.get("line_end", 0),
-                bbox=tuple(sl["bbox"]) if sl.get("bbox") else None,
-                original_text=sl.get("original_text", ""),
-            )
-        answer_loc = None
-        if src_data.get("answer_source"):
-            al = src_data["answer_source"]
-            answer_loc = SourceLocation(
-                page=al.get("page", 0),
-                line_start=al.get("line_start", 0),
-                line_end=al.get("line_end", 0),
-                bbox=tuple(al["bbox"]) if al.get("bbox") else None,
-                original_text=al.get("original_text", ""),
-            )
-        explanation_locs = []
-        for explanation_source in src_data.get("explanation_sources", []) or []:
-            explanation_locs.append(
-                SourceLocation(
-                    page=explanation_source.get("page", 0),
-                    line_start=explanation_source.get("line_start", 0),
-                    line_end=explanation_source.get("line_end", 0),
-                    bbox=tuple(explanation_source["bbox"]) if explanation_source.get("bbox") else None,
-                    original_text=explanation_source.get("original_text", ""),
-                )
-            )
-        source = Source(
-            document=src_data.get("document", ""),
-            chapter=src_data.get("chapter"),
-            section=src_data.get("section"),
-            stem_source=stem_loc,
-            answer_source=answer_loc,
-            explanation_sources=explanation_locs,
-        )
-
-    return Question(
-        id=q.get("id", str(uuid.uuid4())),
-        question_text=q.get("question_text", ""),
-        options=q.get("options", []),
-        correct_answer=q.get("correct_answer", ""),
-        explanation=q.get("explanation", ""),
-        source=source,
-        question_type=QuestionType.SINGLE_CHOICE,
-        difficulty=Difficulty(q.get("difficulty", "medium")),
-        topics=q.get("topics", []),
-    )
-
-
-def render_question_card(question: dict, index: int, show_answer: bool = False):
-    """渲染題目卡片"""
-    with st.container():
-        st.markdown(f"### 📝 第 {index} 題")
-        st.markdown(question.get("question_text", ""))
-
-        options = question.get("options", [])
-        for j, opt in enumerate(options):
-            prefix = chr(65 + j)
-            if show_answer and prefix == question.get("correct_answer"):
-                st.markdown(f"✅ **{prefix}. {opt}**")
-            else:
-                st.markdown(f"- {prefix}. {opt}")
-
-        if show_answer:
-            st.info(f"**答案:** {question.get('correct_answer', 'N/A')}")
-            if question.get("explanation"):
-                st.caption(f"📖 {question.get('explanation')}")
-
-        # 顯示元資料
-        col1, col2 = st.columns(2)
-        with col1:
-            diff = question.get("difficulty", "medium")
-            diff_emoji = {"easy": "🟢", "medium": "🟡", "hard": "🔴"}.get(diff, "⚪")
-            st.caption(f"{diff_emoji} 難度: {diff}")
-        with col2:
-            topics = question.get("topics", [])
-            if topics:
-                st.caption(f"🏷️ {', '.join(topics)}")
-
-        # 顯示來源資訊（可展開）
-        source = question.get("source")
-        if source:
-            render_source_info(source)
-
-        st.markdown("---")
 
 
 def load_past_exam_catalog(limit: int = 20) -> list[dict]:
@@ -1828,24 +1571,28 @@ def load_past_exam_questions(past_exam_id: str) -> list[dict]:
     from src.infrastructure.persistence.sqlite_past_exam_repo import get_past_exam_repository
 
     repo = get_past_exam_repository()
+    figure_service = get_past_exam_figure_service()
     questions = repo.list_questions(past_exam_id)
     return [
-        {
-            "id": question.id,
-            "past_exam_id": question.past_exam_id,
-            "question_number": question.question_number,
-            "question_text": question.question_text,
-            "options": question.options,
-            "correct_answer": question.correct_answer,
-            "explanation": question.explanation,
-            "pattern": question.pattern.value,
-            "difficulty": question.difficulty,
-            "topics": question.topics,
-            "source_doc_id": question.source_doc_id,
-            "source_page": question.source_page,
-            "exam_name": question.exam_name,
-            "exam_year": question.exam_year,
-        }
+        figure_service.enrich_question(
+            {
+                "id": question.id,
+                "past_exam_id": question.past_exam_id,
+                "question_number": question.question_number,
+                "question_text": question.question_text,
+                "options": question.options,
+                "correct_answer": question.correct_answer,
+                "explanation": question.explanation,
+                "pattern": question.pattern.value,
+                "difficulty": question.difficulty,
+                "topics": question.topics,
+                "concept_names": question.concept_names,
+                "source_doc_id": question.source_doc_id,
+                "source_page": question.source_page,
+                "exam_name": question.exam_name,
+                "exam_year": question.exam_year,
+            }
+        )
         for question in questions
     ]
 
@@ -1925,6 +1672,18 @@ def build_past_exam_scan_rows(past_exams: list[dict]) -> list[dict]:
     return rows
 
 
+def update_question_explanation_in_place(questions: list[dict], question_id: str, explanation: str) -> None:
+    """Reflect a newly generated explanation inside the current UI payload."""
+    cleaned_explanation = str(explanation or "").strip()
+    if not cleaned_explanation:
+        return
+
+    for question in questions:
+        if str(question.get("id") or "") == question_id:
+            question["explanation"] = cleaned_explanation
+            break
+
+
 def build_draft_similarity_map(drafts: list[dict], similarity_service, similarity_corpus: list[dict]) -> dict[str, dict]:
     """預先計算草稿列表的相似題摘要，供列表與 promote 摘要重用。"""
     similarity_map: dict[str, dict] = {}
@@ -1992,6 +1751,546 @@ def build_draft_scan_rows(drafts: list[dict], similarity_map: dict[str, dict] | 
             }
         )
     return rows
+
+
+def render_draft_workspace(*, show_hero: bool = True) -> None:
+    """Render the pending-draft workspace used by the authoring flow."""
+    from src.application.services.question_draft_service import get_question_draft_service
+    from src.application.services.question_similarity_service import get_question_similarity_service
+
+    draft_service = get_question_draft_service()
+    similarity_service = get_question_similarity_service()
+    similarity_corpus = similarity_service.build_corpus()
+    historical_templates = draft_service.list_historical_templates(limit=12)
+    template_map = {template["template_id"]: template for template in historical_templates}
+    template_ids = list(template_map.keys())
+    draft_status_options = ["全部", "draft", "promoted", "archived"]
+    draft_status_labels = {
+        "全部": "全部",
+        "draft": "草稿",
+        "promoted": "已入庫",
+        "archived": "已封存",
+    }
+    qa_status_labels = {
+        "pending": "待審",
+        "ready": "可入庫",
+        "needs_revision": "需修訂",
+    }
+    qa_check_labels = {
+        "pending": "待檢",
+        "pass": "通過",
+        "revise": "需修訂",
+    }
+    qa_status_options = ["pending", "ready", "needs_revision"]
+    qa_check_options = ["pending", "pass", "revise"]
+
+    render_draft_flash()
+
+    draft_stats = get_draft_stats()
+    if show_hero:
+        render_page_hero(
+            "待審草稿區",
+            "生成結果會先落到這裡，再做 QA、批次編修、相似題比對與正式入庫。",
+            [
+                f"待整理草稿 {draft_stats.get('draft', 0)} 題",
+                f"已加星 {draft_stats.get('starred', 0)} 題",
+                f"已送入題庫 {draft_stats.get('promoted', 0)} 題",
+            ],
+        )
+    else:
+        st.subheader("🗃️ 待審草稿")
+        st.caption("生成結果會自動進到這裡；整理好之後再正式入庫。")
+
+    with st.container(border=True):
+        st.subheader("歷史題型模板")
+        st.caption("可直接拿考古題骨架建立新草稿，或把模板套用到既有待審草稿。")
+        if historical_templates:
+            selected_template_id = st.selectbox(
+                "選擇歷史模板",
+                template_ids,
+                format_func=lambda template_id: (
+                    f"{template_map[template_id]['label']} · {template_map[template_id]['source_exam_year']} 年第 {template_map[template_id]['source_question_number']} 題"
+                )
+                if template_id in template_map
+                else str(template_id),
+                key="draft_workspace_selected_template_id",
+            ) or template_ids[0]
+            selected_template = template_map[selected_template_id]
+            template_col1, template_col2 = st.columns([1.55, 1])
+            with template_col1:
+                st.markdown(f"**骨架題幹:** {selected_template.get('stem_scaffold', '-')}")
+                st.caption(
+                    f"參考來源：{selected_template.get('source_exam_year', '-')} {selected_template.get('source_exam_name', '')} 第 {selected_template.get('source_question_number', '-')} 題"
+                )
+                reference_text = selected_template.get("reference_question_text", "")
+                if reference_text:
+                    if len(reference_text) > 140:
+                        reference_text = reference_text[:140].rstrip() + "..."
+                    st.caption(f"原始題幹：{reference_text}")
+            with template_col2:
+                st.markdown(f"**題型:** {selected_template.get('pattern_label', '-')}")
+                st.markdown(f"**建議難度:** {selected_template.get('difficulty', '-')}")
+                st.markdown(f"**主題:** {', '.join(selected_template.get('topics', [])) or '-'}")
+                st.markdown(f"**Bloom:** {selected_template.get('bloom_level', '-')}")
+
+            template_blueprint = selected_template.get("blueprint", {})
+            if template_blueprint.get("recommended_rules"):
+                st.markdown("**Blueprint 指引**")
+                st.markdown(
+                    "\n".join(
+                        f"- {rule}" for rule in template_blueprint.get("recommended_rules", [])[:3]
+                    )
+                )
+
+            if st.button("📐 以歷史模板建立新草稿", width="stretch", key="draft_workspace_create_from_template"):
+                draft_id = draft_service.create_draft_from_template(selected_template_id)
+                if draft_id:
+                    set_draft_flash(
+                        f"已從 {selected_template.get('source_exam_year', '-')} 年第 {selected_template.get('source_question_number', '-')} 題建立模板草稿。"
+                    )
+                    st.rerun()
+                st.error("無法建立模板草稿，請重新整理後再試。")
+        else:
+            st.info("目前找不到可用的歷史模板，請先確認歷屆題庫是否已匯入。")
+
+    with st.container(border=True):
+        filter_col1, filter_col2, filter_col3 = st.columns([1.4, 1, 1])
+        with filter_col1:
+            draft_search = st.text_input("搜尋草稿", placeholder="輸入題幹、主題或草稿備註", key="draft_workspace_search")
+        with filter_col2:
+            draft_status = st.selectbox(
+                "草稿狀態",
+                draft_status_options,
+                format_func=lambda x: draft_status_labels.get(x) or str(x),
+                index=0,
+                key="draft_workspace_status",
+            )
+        with filter_col3:
+            draft_starred_only = st.checkbox("⭐ 只看加星草稿", value=False, key="draft_workspace_starred_only")
+
+    drafts = load_question_drafts(
+        status=None if draft_status == "全部" else draft_status,
+        starred_only=draft_starred_only,
+    )
+
+    if draft_search:
+        query = draft_search.strip().lower()
+        drafts = [
+            draft
+            for draft in drafts
+            if query in draft.get("question", {}).get("question_text", "").lower()
+            or query in " ".join(draft.get("question", {}).get("topics", [])).lower()
+            or query in draft.get("notes", "").lower()
+        ]
+
+    draft_similarity_map = build_draft_similarity_map(drafts, similarity_service, similarity_corpus)
+
+    if not drafts:
+        render_empty_state("待審草稿區目前沒有符合條件的題目", "先在需求/生成分頁出題，或放寬搜尋與篩選條件。")
+        return
+
+    st.dataframe(build_draft_scan_rows(drafts, similarity_map=draft_similarity_map), width="stretch", hide_index=True)
+
+    selection_labels = {
+        draft["id"]: f"{'⭐ ' if draft.get('is_starred') else ''}[{draft_status_labels.get(draft.get('status', 'draft'), draft.get('status', 'draft'))}] {draft.get('question', {}).get('question_text', '')[:55]}"
+        for draft in drafts
+    }
+    selection_options = list(selection_labels.keys())
+    if st.session_state.get("draft_batch_selection_reset_pending"):
+        st.session_state.draft_batch_selection_widget = []
+        st.session_state.draft_batch_selection_override = []
+        st.session_state.draft_batch_selection_reset_pending = False
+    st.session_state.draft_batch_selection_widget = [
+        draft_id
+        for draft_id in st.session_state.get("draft_batch_selection_widget", [])
+        if draft_id in selection_options
+    ]
+    widget_selected_draft_ids = st.multiselect(
+        "批次選取草稿",
+        options=selection_options,
+        format_func=lambda draft_id: selection_labels.get(draft_id) or str(draft_id),
+        key="draft_batch_selection_widget",
+    )
+    selected_draft_ids = widget_selected_draft_ids
+    if is_e2e_test_mode() and st.session_state.get("draft_batch_selection_override"):
+        selected_draft_ids = list(st.session_state["draft_batch_selection_override"])
+
+    if is_e2e_test_mode():
+        if st.button("🧪 E2E 全選目前草稿", width="stretch", key="draft_workspace_e2e_select_all"):
+            selected_ids = selection_options.copy()
+            st.session_state.draft_batch_selection_override = selected_ids
+            st.rerun()
+
+    if selected_draft_ids:
+        selected_drafts = [draft for draft in drafts if draft["id"] in selected_draft_ids]
+        qa_ready_count = sum(
+            1 for draft in selected_drafts if (draft.get("qa_metadata") or {}).get("overall_status") == "ready"
+        )
+        qa_revision_count = sum(
+            1
+            for draft in selected_drafts
+            if (draft.get("qa_metadata") or {}).get("overall_status") == "needs_revision"
+        )
+        similarity_warning_drafts = sum(
+            1
+            for draft in selected_drafts
+            if (draft_similarity_map.get(draft["id"], {}).get("count", 0) or 0) > 0
+        )
+        with st.container(border=True):
+            st.subheader("送入正式題庫前摘要")
+            summary_col1, summary_col2, summary_col3, summary_col4 = st.columns(4)
+            with summary_col1:
+                st.metric("已選草稿", len(selected_drafts))
+            with summary_col2:
+                st.metric("QA 可入庫", qa_ready_count)
+            with summary_col3:
+                st.metric("QA 需修訂", qa_revision_count)
+            with summary_col4:
+                st.metric("相似題警示", similarity_warning_drafts)
+
+            attention_lines = []
+            for draft in selected_drafts[:8]:
+                qa_status = (draft.get("qa_metadata") or {}).get("overall_status", "pending")
+                qa_label = qa_status_labels.get(qa_status, qa_status)
+                similarity_entry = draft_similarity_map.get(draft["id"], {})
+                similarity_count = int(similarity_entry.get("count", 0) or 0)
+                top_similarity = int(round(float(similarity_entry.get("top_similarity", 0.0) or 0.0) * 100))
+                if qa_status != "ready" or similarity_count:
+                    attention_lines.append(
+                        f"- {draft.get('question', {}).get('question_text', '')[:52]}...｜QA: {qa_label}｜相似題: {similarity_count} 筆{f' / {top_similarity}%' if similarity_count else ''}"
+                    )
+
+            if attention_lines:
+                st.warning("以下草稿在 promote 前建議再確認一次：")
+                st.markdown("\n".join(attention_lines))
+            else:
+                st.info("目前選取草稿沒有相似題或 QA 阻塞訊號，可直接進入 promote。")
+
+    with st.container(border=True):
+        st.subheader("批次編修 / 操作")
+        edit_col1, edit_col2, edit_col3 = st.columns(3)
+        with edit_col1:
+            batch_difficulty = st.selectbox("批次難度", ["不變更", "easy", "medium", "hard"], index=0, key="draft_workspace_batch_difficulty")
+            batch_validated = st.selectbox(
+                "批次審查狀態",
+                ["不變更", "設為已審查", "設為待審查"],
+                index=0,
+                key="draft_workspace_batch_validated",
+            )
+        with edit_col2:
+            batch_exam_track = st.selectbox(
+                "批次考試類型",
+                ["不變更", "ite", "pgy", "clerk", "specialist", "board", "custom"],
+                index=0,
+                key="draft_workspace_batch_exam_track",
+            )
+            batch_starred = st.selectbox(
+                "批次星號",
+                ["不變更", "加星", "取消加星"],
+                index=0,
+                key="draft_workspace_batch_starred",
+            )
+        with edit_col3:
+            batch_topics = st.text_input(
+                "批次主題標籤",
+                placeholder="逗號分隔；留空表示不變更",
+                key="draft_workspace_batch_topics",
+            )
+            batch_notes = st.text_input(
+                "批次草稿備註",
+                placeholder="留空表示不變更",
+                key="draft_workspace_batch_notes",
+            )
+
+        template_apply_col1, template_apply_col2 = st.columns([1.8, 1])
+        with template_apply_col1:
+            batch_template_id = st.selectbox(
+                "套用歷史模板到既有草稿",
+                ["不套用", *template_ids],
+                format_func=lambda template_id: (
+                    f"{template_map[template_id]['label']} · {template_map[template_id]['source_exam_year']} 年第 {template_map[template_id]['source_question_number']} 題"
+                    if template_id in template_map
+                    else str(template_id)
+                ),
+                key="draft_workspace_batch_template_id",
+            )
+        with template_apply_col2:
+            batch_replace_content = st.checkbox(
+                "以模板骨架覆蓋題幹/選項",
+                value=False,
+                help="若不勾選，只更新模板引用、blueprint 與建議難度/主題。",
+                disabled=not template_ids,
+                key="draft_workspace_batch_replace_content",
+            )
+
+        action_col1, action_col2, action_col3 = st.columns(3)
+        with action_col1:
+            if st.button("🛠️ 套用批次編修", width="stretch", disabled=not selected_draft_ids, key="draft_workspace_apply_batch_edit"):
+                updated = draft_service.bulk_update(
+                    draft_ids=selected_draft_ids,
+                    difficulty=None if batch_difficulty == "不變更" else batch_difficulty,
+                    topics=None if not batch_topics.strip() else [t.strip() for t in batch_topics.split(",") if t.strip()],
+                    exam_track=None if batch_exam_track == "不變更" else batch_exam_track,
+                    is_validated=None if batch_validated == "不變更" else batch_validated == "設為已審查",
+                    is_starred=None if batch_starred == "不變更" else batch_starred == "加星",
+                    notes=None if not batch_notes.strip() else batch_notes.strip(),
+                )
+                schedule_draft_batch_selection_reset()
+                set_draft_flash(f"已更新 {updated} 題草稿。")
+                st.rerun()
+        with action_col2:
+            if st.button("📎 套用歷史模板", width="stretch", disabled=not selected_draft_ids or batch_template_id == "不套用", key="draft_workspace_apply_template"):
+                updated = draft_service.apply_template_to_drafts(
+                    selected_draft_ids,
+                    batch_template_id,
+                    replace_content=batch_replace_content,
+                )
+                schedule_draft_batch_selection_reset()
+                set_draft_flash(f"已將歷史模板套用到 {updated} 題草稿。")
+                st.rerun()
+        with action_col3:
+            if st.button("✅ 送入正式題庫", width="stretch", disabled=not selected_draft_ids, key="draft_workspace_promote"):
+                result = draft_service.promote_drafts(selected_draft_ids)
+                schedule_draft_batch_selection_reset()
+                promoted_count = int(result.get("promoted", 0) or 0)
+                failed_count = len(result.get("failed", []))
+                if promoted_count and failed_count:
+                    set_draft_flash(
+                        f"已正式入庫 {promoted_count} 題，另有 {failed_count} 題入庫失敗。",
+                        level="warning",
+                    )
+                elif promoted_count:
+                    set_draft_flash(f"已正式入庫 {promoted_count} 題。")
+                elif failed_count:
+                    set_draft_flash(f"有 {failed_count} 題入庫失敗。", level="warning")
+                st.rerun()
+
+        archive_col1, archive_col2, archive_col3 = st.columns(3)
+        with archive_col3:
+            if st.button("🗂️ 封存選取", width="stretch", disabled=not selected_draft_ids, key="draft_workspace_archive"):
+                archived = draft_service.archive_drafts(selected_draft_ids)
+                schedule_draft_batch_selection_reset()
+                set_draft_flash(f"已封存 {archived} 題草稿。")
+                st.rerun()
+
+    for index, draft in enumerate(drafts[:40], start=1):
+        question = draft.get("question", {})
+        template_data = draft.get("template_data") or {}
+        blueprint_data = draft.get("blueprint_data") or {}
+        qa_data = draft.get("qa_metadata") or {}
+        status_label = draft_status_labels.get(draft.get("status", "draft"), draft.get("status", "draft"))
+        title_prefix = "⭐ " if draft.get("is_starred") else ""
+        with st.expander(f"#{index} {title_prefix}[{status_label}] {question.get('question_text', '')[:58]}..."):
+            badges = []
+            confidence = draft.get("source_confidence", "none")
+            if confidence == "precise":
+                badges.append('<span class="status-chip-good">精確來源</span>')
+            elif confidence == "contextual":
+                badges.append('<span class="status-chip-warn">全文來源</span>')
+            else:
+                badges.append('<span class="status-chip-warn">無來源</span>')
+            if question.get("is_validated"):
+                badges.append('<span class="status-chip-good">✅ 已審查</span>')
+            else:
+                badges.append('<span class="status-chip-warn">待審查</span>')
+            if question.get("exam_track"):
+                badges.append(f'<span class="status-chip-good">{question["exam_track"].upper()}</span>')
+            qa_status = qa_data.get("overall_status", "pending")
+            qa_status_label = qa_status_labels.get(qa_status, qa_status)
+            if qa_status == "ready":
+                badges.append(f'<span class="status-chip-good">QA {qa_status_label}</span>')
+            else:
+                badges.append(f'<span class="status-chip-warn">QA {qa_status_label}</span>')
+            st.markdown(" ".join(badges), unsafe_allow_html=True)
+
+            st.markdown(f"**題目:** {question.get('question_text', '')}")
+            for opt_idx, option in enumerate(question.get("options", [])):
+                st.markdown(f"- {chr(65 + opt_idx)}. {option}")
+
+            detail_col1, detail_col2, detail_col3 = st.columns(3)
+            with detail_col1:
+                st.markdown(f"**答案:** {question.get('correct_answer', '-')}")
+            with detail_col2:
+                st.markdown(f"**難度:** {question.get('difficulty', 'medium')}")
+            with detail_col3:
+                st.markdown(f"**主題:** {', '.join(question.get('topics', [])) or '-'}")
+
+            if question.get("explanation"):
+                st.markdown(f"**解析:** {question.get('explanation', '')}")
+            if draft.get("notes"):
+                st.caption(f"草稿備註：{draft['notes']}")
+            if draft.get("promoted_question_id"):
+                st.caption(f"正式題庫 ID：{draft['promoted_question_id'][:8]}...")
+
+            if template_data:
+                st.markdown("**歷史模板來源**")
+                st.caption(
+                    f"{template_data.get('label', '-') } · {template_data.get('source_exam_year', '-')} {template_data.get('source_exam_name', '')} 第 {template_data.get('source_question_number', '-')} 題"
+                )
+                if template_data.get("stem_scaffold"):
+                    st.caption(f"模板骨架：{template_data.get('stem_scaffold')}")
+
+            if blueprint_data:
+                st.markdown("**Blueprint 摘要**")
+                blueprint_col1, blueprint_col2, blueprint_col3 = st.columns(3)
+                with blueprint_col1:
+                    st.markdown(f"**題型:** {blueprint_data.get('pattern_label') or blueprint_data.get('pattern') or '-'}")
+                with blueprint_col2:
+                    st.markdown(f"**Bloom:** {blueprint_data.get('bloom_level', '-')}")
+                with blueprint_col3:
+                    st.markdown(f"**Blueprint 難度:** {blueprint_data.get('difficulty', '-')}")
+                if blueprint_data.get("target_topics"):
+                    st.caption(f"目標主題：{', '.join(blueprint_data.get('target_topics', []))}")
+                if blueprint_data.get("reference_concepts"):
+                    st.caption(f"參考概念：{', '.join(blueprint_data.get('reference_concepts', []))}")
+                if blueprint_data.get("sample_source_refs"):
+                    st.caption(f"歷史參考：{'；'.join(blueprint_data.get('sample_source_refs', []))}")
+                if blueprint_data.get("recommended_rules"):
+                    st.markdown("\n".join(f"- {rule}" for rule in blueprint_data.get("recommended_rules", [])[:3]))
+
+            similar_matches = draft_similarity_map.get(draft["id"], {}).get("matches", [])
+            if similar_matches:
+                st.info("相似題提醒")
+                match_lines = []
+                for match in similar_matches:
+                    source_label = "正式題庫" if match["source_type"] == "bank" else "草稿箱"
+                    similarity_pct = int(round(match["similarity"] * 100))
+                    preview_text = match["question_text"][:72].strip()
+                    if len(match["question_text"]) > 72:
+                        preview_text += "..."
+                    match_lines.append(f"- [{source_label}] {similarity_pct}% 相似: {preview_text}")
+                st.markdown("\n".join(match_lines))
+
+            with st.container(border=True):
+                st.markdown("**QA 審閱**")
+                qa_col1, qa_col2, qa_col3 = st.columns(3)
+                with qa_col1:
+                    qa_overall = st.selectbox(
+                        "整體狀態",
+                        qa_status_options,
+                        index=qa_status_options.index(qa_data.get("overall_status", "pending"))
+                        if qa_data.get("overall_status", "pending") in qa_status_options
+                        else 0,
+                        format_func=lambda value: qa_status_labels.get(value) or str(value),
+                        key=f"draft_qa_overall_{draft['id']}",
+                    )
+                    qa_stem = st.selectbox(
+                        "題幹品質",
+                        qa_check_options,
+                        index=qa_check_options.index(qa_data.get("stem_quality", "pending"))
+                        if qa_data.get("stem_quality", "pending") in qa_check_options
+                        else 0,
+                        format_func=lambda value: qa_check_labels.get(value) or str(value),
+                        key=f"draft_qa_stem_{draft['id']}",
+                    )
+                with qa_col2:
+                    qa_option = st.selectbox(
+                        "選項品質",
+                        qa_check_options,
+                        index=qa_check_options.index(qa_data.get("option_quality", "pending"))
+                        if qa_data.get("option_quality", "pending") in qa_check_options
+                        else 0,
+                        format_func=lambda value: qa_check_labels.get(value) or str(value),
+                        key=f"draft_qa_option_{draft['id']}",
+                    )
+                    qa_answer = st.selectbox(
+                        "答案對齊",
+                        qa_check_options,
+                        index=qa_check_options.index(qa_data.get("answer_alignment", "pending"))
+                        if qa_data.get("answer_alignment", "pending") in qa_check_options
+                        else 0,
+                        format_func=lambda value: qa_check_labels.get(value) or str(value),
+                        key=f"draft_qa_answer_{draft['id']}",
+                    )
+                with qa_col3:
+                    qa_source = st.selectbox(
+                        "來源對齊",
+                        qa_check_options,
+                        index=qa_check_options.index(qa_data.get("source_alignment", "pending"))
+                        if qa_data.get("source_alignment", "pending") in qa_check_options
+                        else 0,
+                        format_func=lambda value: qa_check_labels.get(value) or str(value),
+                        key=f"draft_qa_source_{draft['id']}",
+                    )
+                    qa_explanation = st.selectbox(
+                        "解析品質",
+                        qa_check_options,
+                        index=qa_check_options.index(qa_data.get("explanation_quality", "pending"))
+                        if qa_data.get("explanation_quality", "pending") in qa_check_options
+                        else 0,
+                        format_func=lambda value: qa_check_labels.get(value) or str(value),
+                        key=f"draft_qa_explanation_{draft['id']}",
+                    )
+
+                qa_note = st.text_area(
+                    "QA 備註",
+                    value=qa_data.get("review_notes", ""),
+                    key=f"draft_qa_note_{draft['id']}",
+                )
+                if qa_data.get("reviewed_at"):
+                    reviewer = qa_data.get("reviewer") or "-"
+                    st.caption(f"最近審閱：{qa_data.get('reviewed_at')} by {reviewer}")
+                st.caption(f"相似題提醒數：{qa_data.get('similarity_warning_count', 0)}")
+
+                if st.button("💾 儲存 QA", key=f"draft_qa_save_{draft['id']}", width="stretch"):
+                    saved = draft_service.update_qa_metadata(
+                        draft_id=draft["id"],
+                        overall_status=qa_overall,
+                        stem_quality=qa_stem,
+                        option_quality=qa_option,
+                        answer_alignment=qa_answer,
+                        source_alignment=qa_source,
+                        explanation_quality=qa_explanation,
+                        review_notes=(qa_note or "").strip(),
+                        similarity_warning_count=len(similar_matches),
+                    )
+                    if saved:
+                        st.success("QA metadata 已更新。")
+                        st.rerun()
+                    st.error("QA metadata 更新失敗。")
+
+            history_entries = draft_service.get_draft_history(draft["id"], limit=8)
+            if history_entries:
+                with st.container(border=True):
+                    st.markdown("**版本歷史**")
+                    for entry in history_entries:
+                        snapshot = entry.get("snapshot_data") or {}
+                        snapshot_question = snapshot.get("question") or {}
+                        snapshot_template = snapshot.get("template_data") or {}
+                        snapshot_qa = snapshot.get("qa_metadata") or {}
+                        qa_summary = qa_status_labels.get(
+                            snapshot_qa.get("overall_status", "pending"),
+                            snapshot_qa.get("overall_status", "pending"),
+                        )
+                        template_summary = snapshot_template.get("label", "-")
+                        reason_text = entry.get("reason") or "-"
+                        st.caption(
+                            f"v{entry.get('version_number', '-')} · {entry.get('action', '-')} · {entry.get('created_at', '-') } · {entry.get('actor_name', '-') }"
+                        )
+                        st.markdown(f"- 題目：{snapshot_question.get('question_text', '')[:72] or '-'}")
+                        st.markdown(f"- 模板：{template_summary}｜QA：{qa_summary}｜原因：{reason_text}")
+
+            quick_col1, quick_col2 = st.columns(2)
+            with quick_col1:
+                if st.button(
+                    "⭐ 取消加星" if draft.get("is_starred") else "⭐ 加星",
+                    key=f"draft_star_{draft['id']}",
+                    width="stretch",
+                ):
+                    draft_service.bulk_update([draft["id"]], is_starred=not draft.get("is_starred", False))
+                    st.rerun()
+            with quick_col2:
+                if draft.get("status") == "draft" and st.button(
+                    "✅ 立即入庫",
+                    key=f"draft_promote_{draft['id']}",
+                    width="stretch",
+                ):
+                    draft_service.promote_drafts([draft["id"]])
+                    st.rerun()
+
+            source = question.get("source") or {}
+            if source:
+                render_source_info(source, expanded=False)
 
 
 def render_question_review_expander(question: dict, display_number: int, key_prefix: str = "bank") -> None:
@@ -2105,14 +2404,20 @@ def get_heartbeat_summary() -> dict:
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
-if "agent_provider_name" not in st.session_state:
-    st.session_state.agent_provider_name = "opencode"
+configured_agent_provider_name = get_configured_agent_provider_name()
+configured_agent_meta = load_agent_metadata(configured_agent_provider_name)
+configured_agent_model = get_configured_agent_model(configured_agent_provider_name, configured_agent_meta)
 
-if "agent_meta" not in st.session_state:
-    st.session_state.agent_meta = load_agent_metadata(st.session_state.agent_provider_name)
+if st.session_state.get("agent_provider_name") != configured_agent_provider_name:
+    st.session_state.agent_provider_name = configured_agent_provider_name
 
-if "agent_model" not in st.session_state:
-    st.session_state.agent_model = st.session_state.agent_meta.get("model") or ""
+if st.session_state.get("_agent_meta_provider_name") != configured_agent_provider_name:
+    st.session_state.agent_meta = configured_agent_meta
+    st.session_state._agent_meta_provider_name = configured_agent_provider_name
+
+if st.session_state.get("agent_model") != configured_agent_model:
+    st.session_state.agent_model = configured_agent_model
+    st.session_state.agent_meta["model"] = configured_agent_model
 
 if (
     "agent_available" not in st.session_state
@@ -2128,16 +2433,35 @@ if (
 
 if "current_page" not in st.session_state:
     st.session_state.current_page = get_page_from_query_params()
+pending_practice_questions = st.session_state.pop("pending_practice_questions", None)
+pending_practice_context = st.session_state.pop("pending_practice_context", None)
+if pending_practice_questions is not None:
+    start_practice_session(pending_practice_questions, pending_practice_context)
+pending_page_navigation = st.session_state.pop("pending_page_navigation", None)
+if pending_page_navigation in PAGE_OPTIONS:
+    st.session_state.current_page = pending_page_navigation
 if "page_nav" not in st.session_state:
     st.session_state.page_nav = st.session_state.current_page
-sync_query_params_with_page(st.session_state.current_page)
+skip_query_param_sync_once = bool(st.session_state.pop("skip_query_param_sync_once", False))
+if not skip_query_param_sync_once:
+    sync_query_params_with_page(st.session_state.current_page)
 sync_nav_widget_state()
 
 # 生成狀態
 if "generated_questions" not in st.session_state:
     st.session_state.generated_questions = []
+if "generated_questions_auto_saved" not in st.session_state:
+    st.session_state.generated_questions_auto_saved = False
 if "is_generating" not in st.session_state:
     st.session_state.is_generating = False
+if st.session_state.pop("pending_generated_review_practice", False) and st.session_state.generated_questions:
+    start_practice_session(
+        list(st.session_state.generated_questions),
+        {
+            "source_type": PRACTICE_SOURCE_GENERATED,
+            "label": "生成結果",
+        },
+    )
 
 # 作答練習狀態
 if "practice_questions" not in st.session_state:
@@ -2168,8 +2492,8 @@ if "draft_batch_selection_reset_pending" not in st.session_state:
     st.session_state.draft_batch_selection_reset_pending = False
 
 
-# ===== 側邊欄 (左側導航) =====
 content_stats = get_questions_stats()
+
 
 with st.sidebar:
     st.title("🩺 考卷生成系統")
@@ -2191,46 +2515,12 @@ with st.sidebar:
 
     with st.container(border=True):
         st.subheader("🤖 Agent 控制台")
-        provider_name = st.selectbox(
-            "🤖 Agent Provider",
-            options=["crush", "opencode", "copilot-sdk"],
-            index=["crush", "opencode", "copilot-sdk"].index(st.session_state.agent_provider_name),
-            help="切換底層 agent provider（UI 只作為包裝層）",
-        )
+        st.caption("Provider / 模型由伺服器設定固定，前端不提供切換。")
+        st.markdown(f"**固定 Provider:** {st.session_state.agent_provider_name}")
+        st.markdown(f"**固定模型:** {st.session_state.agent_model or 'N/A'}")
 
-        if provider_name != st.session_state.agent_provider_name:
-            st.session_state.agent_provider_name = provider_name
-            st.session_state.agent_meta = load_agent_metadata(provider_name)
-            st.session_state.agent_model = st.session_state.agent_meta.get("model") or ""
-            available, reason, provider = get_agent_status(provider_name, st.session_state.agent_model or None)
-            st.session_state.agent_available = available
-            st.session_state.agent_status_reason = reason
-            st.session_state.agent_provider = provider
-            st.rerun()
-
-        if st.session_state.agent_provider_name == "opencode":
-            available_models = st.session_state.agent_meta.get("available_models", [])
-            if available_models:
-                current_model = st.session_state.agent_model or ""
-                if current_model and current_model not in available_models:
-                    available_models = [current_model] + available_models
-                model_index = available_models.index(current_model) if current_model in available_models else 0
-
-                selected_model = st.selectbox(
-                    "🧠 模型",
-                    options=available_models,
-                    index=model_index,
-                    help="切換 OpenCode 使用的 LLM 模型",
-                )
-
-                if selected_model != st.session_state.agent_model:
-                    st.session_state.agent_model = selected_model
-                    st.session_state.agent_meta["model"] = selected_model
-                    available, reason, provider = get_agent_status(st.session_state.agent_provider_name, selected_model)
-                    st.session_state.agent_available = available
-                    st.session_state.agent_status_reason = reason
-                    st.session_state.agent_provider = provider
-                    st.rerun()
+        if st.session_state.agent_provider_name not in SUPPORTED_AGENT_PROVIDERS:
+            st.warning("目前 repo 尚未實作此 provider；需補 provider adapter 與可用執行環境後才能連線。")
 
         status = "🟢 已連線" if st.session_state.agent_available else "🔴 未連線"
         st.markdown(f"**Agent 狀態:** {status}")
@@ -2274,13 +2564,13 @@ main_col, chat_col = st.columns([2, 1], gap="medium")
 
 # ===== 左欄：操作區內容 =====
 with main_col:
-    if page == "📝 生成考題":
+    if page == WORKBENCH_PAGE:
         # ===== 考題生成頁面 =====
         indexed_docs_snapshot = load_indexed_documents()
         precise_doc_count = sum(1 for doc in indexed_docs_snapshot if doc.get("has_precise_sources"))
         render_page_hero(
             "AI 考題生成",
-            "把教材索引、來源追蹤、題目草擬與審閱收進同一個工作台，正式出題與 preview 草稿會在頁面上明確分流。",
+            "把需求填寫、教材選擇、考古題骨架與生成結果預覽收進同一個工作台；待審、QA 與正式入庫統一在題庫管理處理。",
             [
                 f"已索引教材 {len(indexed_docs_snapshot)} 份",
                 f"精確來源教材 {precise_doc_count} 份",
@@ -2299,97 +2589,173 @@ with main_col:
         selected_doc_ids: list[str] = []
         selected_section_details: list[dict] = []
         source_doc = ""
+        source_mode = SOURCE_MODE_OPTIONS[0]
         strict_source_tracking = False
         preview_only_mode = False
         missing_precise_docs: list[dict] = []
+        selected_template_context: dict | None = None
 
         with config_section:
             with st.container(border=True):
-                st.subheader("Step 1. 先索引教材")
-                st.caption("先上傳 PDF 並完成 ETL；若要正式來源追蹤，請使用 Marker 模式。")
-                st.markdown(
-                    '<div class="section-note">正式來源追蹤建議開啟 Marker 模式。它比較慢，但會保留 blocks.json，之後才能做 page / line / bbox 級的題目來源驗證。</div>',
-                    unsafe_allow_html=True,
+                st.subheader("Step 1. 選擇來源模式")
+                source_mode = st.selectbox(
+                    "來源模式",
+                    SOURCE_MODE_OPTIONS,
+                    index=0,
+                    help="明確指定這一批題目要依據既有教材、先 ingest 新教材，或用歷史考古題骨架改寫。",
                 )
 
-                etl_col1, etl_col2 = st.columns([1.4, 1])
-                with etl_col1:
-                    uploaded_pdf = st.file_uploader("上傳教材 PDF", type=["pdf"], key="etl_pdf")
-                    etl_title = st.text_input("教材標題", placeholder="如：Miller's Anesthesia 9th", key="etl_title")
-                    etl_page_ranges = st.text_input(
-                        "頁段範圍（可選）",
-                        placeholder="例：1-50,120-160（留空 = 全文）",
-                        key="etl_page_ranges",
-                        help="指定 ingest_documents 的 page_ranges；可用單頁（8）或區間（1-50），多段以逗號分隔。",
+                if source_mode == SOURCE_MODE_EXISTING:
+                    st.caption("直接使用 server 內已拆解完成的教材與章節範圍出題。")
+                    st.markdown(
+                        '<div class="section-note">這個模式適合已完成 ETL 的教材；若教材具備 Marker blocks，可進行 page / line / bbox 級的來源驗證。</div>',
+                        unsafe_allow_html=True,
                     )
-                with etl_col2:
-                    etl_use_marker = st.toggle(
-                        "精確來源模式（Marker）",
-                        value=True,
-                        help="開啟後會以 Marker 解析 PDF，保留 blocks.json，供正式出題時做精確來源追蹤。",
-                    )
-                    if etl_use_marker:
-                        st.caption("適合正式出題與詳解引用，速度較慢。")
-                    else:
-                        st.caption("適合快速預覽，通常只保留全文 markdown。")
-
-                    etl_chunk_pages = st.number_input(
-                        "大檔分塊頁數（0 = 自動/整本）",
-                        min_value=0,
-                        max_value=400,
-                        value=0,
-                        step=10,
-                        disabled=not etl_use_marker,
-                        help="對應 marker_max_pages_per_chunk。建議超大 PDF 可設 50-120。",
-                    )
-                    etl_extract_figures = st.toggle(
-                        "擷取圖像 assets",
-                        value=True,
-                        disabled=not etl_use_marker,
-                        help="對應 extract_figures。圖片很多時可先關閉以降低記憶體壓力。",
+                elif source_mode == SOURCE_MODE_UPLOAD:
+                    st.caption("先上傳新教材完成 ETL，再回到下方從已索引教材清單挑選這次要用的來源。")
+                    st.markdown(
+                        '<div class="section-note">正式來源追蹤建議開啟 Marker 模式。它比較慢，但會保留 blocks.json，之後才能做 page / line / bbox 級的題目來源驗證。</div>',
+                        unsafe_allow_html=True,
                     )
 
-                if st.button("⚙️ 執行 ETL（ingest_documents）", width="stretch"):
-                    if st.session_state.agent_provider_name not in ("crush", "opencode"):
-                        st.error("ETL 需要支援 MCP 的 agent（crush 或 opencode）。")
-                    elif not st.session_state.agent_available:
-                        st.error("Agent 未連線，無法執行 ETL。")
-                    elif uploaded_pdf is None:
-                        st.error("請先上傳 PDF 檔案。")
-                    elif not etl_title.strip():
-                        st.error("請輸入教材標題。")
-                    else:
-                        mcp_ok, mcp_msg = check_asset_aware_ready()
-                        if not mcp_ok:
-                            st.error(f"asset-aware MCP 不可用：{mcp_msg}")
+                    etl_col1, etl_col2 = st.columns([1.4, 1])
+                    with etl_col1:
+                        uploaded_pdf = st.file_uploader("上傳教材 PDF", type=["pdf"], key="etl_pdf")
+                        etl_title = st.text_input(
+                            "教材標題",
+                            placeholder="如：Miller's Anesthesia 9th",
+                            key="etl_title",
+                        )
+                        etl_page_ranges = st.text_input(
+                            "頁段範圍（可選）",
+                            placeholder="例：1-50,120-160（留空 = 全文）",
+                            key="etl_page_ranges",
+                            help="指定 ingest_documents 的 page_ranges；可用單頁（8）或區間（1-50），多段以逗號分隔。",
+                        )
+                    with etl_col2:
+                        etl_use_marker = st.toggle(
+                            "精確來源模式（Marker）",
+                            value=True,
+                            help="開啟後會以 Marker 解析 PDF，保留 blocks.json，供正式出題時做精確來源追蹤。",
+                        )
+                        if etl_use_marker:
+                            st.caption("適合正式出題與詳解引用，速度較慢。")
                         else:
-                            with st.spinner("正在上傳並觸發 ingest_documents..."):
-                                try:
-                                    saved_path = save_uploaded_pdf(uploaded_pdf, etl_title)
-                                    result_text = ingest_pdf_via_agent(
-                                        st.session_state.agent_provider,
-                                        saved_path,
-                                        etl_title.strip(),
-                                        etl_use_marker,
-                                        etl_page_ranges,
-                                        int(etl_chunk_pages),
-                                        bool(etl_extract_figures),
-                                    )
-                                    st.session_state.etl_last_result = result_text
-                                    st.success("ETL 已觸發，請確認下方結果與已索引教材清單。")
-                                    st.code(result_text)
-                                except ValueError as e:
-                                    st.error(f"ETL 參數錯誤：{e}")
-                                except Exception as e:
-                                    st.error(f"ETL 失敗：{e}")
+                            st.caption("適合快速預覽，通常只保留全文 markdown。")
 
-            if st.session_state.etl_last_result:
-                with st.expander("最近一次 ETL 回傳", expanded=False):
-                    st.code(st.session_state.etl_last_result)
+                        etl_chunk_pages = st.number_input(
+                            "大檔分塊頁數（0 = 自動/整本）",
+                            min_value=0,
+                            max_value=400,
+                            value=0,
+                            step=10,
+                            disabled=not etl_use_marker,
+                            help="對應 marker_max_pages_per_chunk。建議超大 PDF 可設 50-120。",
+                        )
+                        etl_extract_figures = st.toggle(
+                            "擷取圖像 assets",
+                            value=True,
+                            disabled=not etl_use_marker,
+                            help="對應 extract_figures。圖片很多時可先關閉以降低記憶體壓力。",
+                        )
+
+                    if st.button("⚙️ 執行 ETL（ingest_documents）", width="stretch"):
+                        if st.session_state.agent_provider_name not in ("crush", "opencode"):
+                            st.error("ETL 需要支援 MCP 的 agent（crush 或 opencode）。")
+                        elif not st.session_state.agent_available:
+                            st.error("Agent 未連線，無法執行 ETL。")
+                        elif uploaded_pdf is None:
+                            st.error("請先上傳 PDF 檔案。")
+                        elif not etl_title.strip():
+                            st.error("請輸入教材標題。")
+                        else:
+                            mcp_ok, mcp_msg = check_asset_aware_ready()
+                            if not mcp_ok:
+                                st.error(f"asset-aware MCP 不可用：{mcp_msg}")
+                            else:
+                                with st.spinner("正在上傳並觸發 ingest_documents..."):
+                                    try:
+                                        saved_path = save_uploaded_pdf(uploaded_pdf, etl_title)
+                                        result_text = ingest_pdf_via_agent(
+                                            st.session_state.agent_provider,
+                                            saved_path,
+                                            etl_title.strip(),
+                                            etl_use_marker,
+                                            etl_page_ranges,
+                                            int(etl_chunk_pages),
+                                            bool(etl_extract_figures),
+                                        )
+                                        st.session_state.etl_last_result = result_text
+                                        st.success("ETL 已觸發，請在下方已索引教材清單選擇剛剛 ingest 的教材。")
+                                        st.code(result_text)
+                                    except ValueError as e:
+                                        st.error(f"ETL 參數錯誤：{e}")
+                                    except Exception as e:
+                                        st.error(f"ETL 失敗：{e}")
+
+                    if st.session_state.etl_last_result:
+                        with st.expander("最近一次 ETL 回傳", expanded=False):
+                            st.code(st.session_state.etl_last_result)
+                else:
+                    from src.application.services.question_draft_service import get_question_draft_service
+
+                    preview_only_mode = True
+                    draft_service = get_question_draft_service()
+                    historical_templates = draft_service.list_historical_templates(limit=12)
+                    template_map = {template["template_id"]: template for template in historical_templates}
+                    template_ids = list(template_map.keys())
+
+                    st.caption("直接拿歷史考古題的題型骨架改寫；這批結果會先保留為預覽，後續在題庫管理補來源與 QA。")
+                    if historical_templates:
+                        selected_template_id = st.selectbox(
+                            "歷史模板",
+                            template_ids,
+                            format_func=lambda template_id: (
+                                f"{template_map[template_id]['label']} · {template_map[template_id]['source_exam_year']} 年第 {template_map[template_id]['source_question_number']} 題"
+                            )
+                            if template_id in template_map
+                            else str(template_id),
+                            key="generation_selected_template_id",
+                        )
+                        selected_template_context = template_map.get(selected_template_id)
+
+                        if selected_template_context:
+                            template_col1, template_col2 = st.columns([1.45, 1])
+                            with template_col1:
+                                st.markdown(
+                                    f"**骨架題幹:** {selected_template_context.get('stem_scaffold', '-')}"
+                                )
+                                st.caption(
+                                    f"參考來源：{selected_template_context.get('source_exam_year', '-')} 年 {selected_template_context.get('source_exam_name', '')} 第 {selected_template_context.get('source_question_number', '-')} 題"
+                                )
+                                reference_text = selected_template_context.get("reference_question_text", "")
+                                if reference_text:
+                                    if len(reference_text) > 160:
+                                        reference_text = reference_text[:160].rstrip() + "..."
+                                    st.caption(f"原始題幹：{reference_text}")
+                            with template_col2:
+                                st.markdown(f"**題型骨架:** {selected_template_context.get('pattern_label', '-')}")
+                                st.markdown(f"**建議難度:** {selected_template_context.get('difficulty', '-')}")
+                                st.markdown(
+                                    f"**主題:** {', '.join(selected_template_context.get('topics', [])) or '-'}"
+                                )
+                                st.markdown(f"**Bloom:** {selected_template_context.get('bloom_level', '-')}")
+
+                            template_blueprint = selected_template_context.get("blueprint", {})
+                            if template_blueprint.get("recommended_rules"):
+                                st.markdown("**Blueprint 指引**")
+                                st.markdown(
+                                    "\n".join(
+                                        f"- {rule}"
+                                        for rule in template_blueprint.get("recommended_rules", [])[:4]
+                                    )
+                                )
+                    else:
+                        st.info("目前找不到可用的歷史模板，請先確認歷屆題庫是否已匯入。")
 
             with st.container(border=True):
                 st.subheader("Step 2. 設定出題條件")
-                st.caption("先定義題型與難度，再選教材與章節範圍。")
+                st.caption("先定義題型與難度，再依來源模式補齊教材或模板範圍。每題生成時就必須一併產出詳解。")
                 st.markdown("##### 2-1 出題條件")
 
                 col1, col2 = st.columns(2)
@@ -2431,9 +2797,9 @@ with main_col:
                 st.markdown("---")
 
                 indexed_docs = load_indexed_documents()
-                st.markdown("##### 2-2 選擇教材與章節")
+                st.markdown("##### 2-2 依來源模式設定題材")
 
-                if indexed_docs:
+                if source_mode in (SOURCE_MODE_EXISTING, SOURCE_MODE_UPLOAD) and indexed_docs:
                     doc_label_map: dict[str, dict] = {}
                     doc_labels: list[str] = []
                     for d in indexed_docs:
@@ -2444,6 +2810,11 @@ with main_col:
                         label = f"{title} ({pages}p / {mode}) [{doc_id[:12]}]"
                         doc_labels.append(label)
                         doc_label_map[label] = d
+
+                    if source_mode == SOURCE_MODE_UPLOAD:
+                        st.caption("ETL 完成後，請在這裡選擇剛剛 ingest 的教材；也可以同時搭配其他已索引教材。")
+                    else:
+                        st.caption("選擇已拆解教材後，可再細選章節範圍。")
 
                     selected_doc_labels = st.multiselect(
                         "📚 參考教材（已索引，可多選）",
@@ -2498,7 +2869,7 @@ with main_col:
                         strict_source_tracking = st.toggle(
                             "嚴格來源追蹤（正式題庫模式）",
                             value=True,
-                            help="開啟後，若教材缺少 Marker blocks，就不允許正式生成；關閉後可改為 preview 草稿模式。",
+                            help="開啟後，若教材缺少 Marker blocks，就不允許正式生成；關閉後可改為 preview-only 模式。",
                         )
 
                         precise_ready_count, _missing_precise_count = render_selected_docs_summary(selected_docs_info)
@@ -2509,22 +2880,28 @@ with main_col:
                             missing_titles = ", ".join(doc["title"] for doc in missing_precise_docs)
                             if strict_source_tracking:
                                 st.error(
-                                    f"正式模式無法使用目前教材：{missing_titles}。請先用 Marker 重新 ingest，或切換為 preview 草稿模式。"
+                                    f"正式模式無法使用目前教材：{missing_titles}。請先用 Marker 重新 ingest，或切換為 preview-only 模式。"
                                 )
                             else:
                                 st.warning(
-                                    f"目前為 preview 草稿模式：{missing_titles} 缺少精確來源，系統只會生成可審閱草稿，不應直接視為正式入庫題。"
+                                    f"目前為 preview-only 模式：{missing_titles} 缺少精確來源，系統只會生成可審閱題目，不應直接視為正式入庫題。"
                                 )
                         elif precise_ready_count:
                             st.success("已選教材都具備精確來源能力，可走正式來源追蹤流程。")
-                else:
-                    st.warning("⚠️ 尚無已索引教材。請上傳 PDF 並執行 ETL 索引。")
-                    source_doc = st.text_input(
-                        "參考教材（可選，無來源追蹤）",
-                        placeholder="如：Miller's Anesthesia 第9版",
-                        help="手動輸入的教材名稱無法進行精確來源追蹤，只適合 preview 草稿。",
-                    )
+                elif source_mode in (SOURCE_MODE_EXISTING, SOURCE_MODE_UPLOAD):
+                    if source_mode == SOURCE_MODE_UPLOAD:
+                        st.warning("⚠️ 尚無已索引教材。請先在上方上傳 PDF 並執行 ETL。")
+                    else:
+                        st.warning("⚠️ 尚無已拆解教材可選。若要用教材出題，請先切到「先上傳新教材再出題」完成 ETL。")
                     preview_only_mode = True
+                else:
+                    preview_only_mode = True
+                    if selected_template_context:
+                        st.success(
+                            "目前將以歷史模板改寫模式生成；結果會先保留為預覽，後續請到題庫管理做相似題比對與正式入庫。"
+                        )
+                    else:
+                        st.warning("⚠️ 目前尚未選定歷史模板。")
 
                 additional_instructions = st.text_area(
                     "額外指示（可選）",
@@ -2532,12 +2909,23 @@ with main_col:
                     height=100,
                 )
 
-                generation_blocked = bool(selected_doc_ids and strict_source_tracking and missing_precise_docs)
+                generation_blocked = False
+                if source_mode == SOURCE_MODE_TEMPLATE:
+                    generation_blocked = selected_template_context is None
+                elif not selected_doc_ids:
+                    generation_blocked = True
+                elif strict_source_tracking and missing_precise_docs:
+                    generation_blocked = True
+
                 st.markdown("##### Step 3. 確認模式並開始生成")
-                if preview_only_mode:
-                    st.info("目前是 preview 草稿模式：可先驗證內容方向，但不應視為正式入庫題。")
+                if source_mode == SOURCE_MODE_TEMPLATE:
+                    st.info("目前是模板改寫模式：會先生成預覽題目，審題與正式入庫請到題庫管理。")
+                elif preview_only_mode:
+                    st.info("目前是 preview-only 模式：可先驗證內容方向，但不應視為正式入庫題。")
                 elif selected_doc_ids:
                     st.success("目前符合正式來源追蹤條件，可直接開始正式生成。")
+                else:
+                    st.warning("請先依來源模式完成來源選擇，再開始生成。")
 
                 submitted = st.button(
                     "🚀 開始生成",
@@ -2552,6 +2940,10 @@ with main_col:
             if submitted:
                 if not st.session_state.agent_available:
                     st.error("❌ Agent 未連線，無法生成")
+                elif source_mode == SOURCE_MODE_TEMPLATE and not selected_template_context:
+                    st.error("❌ 目前尚未選定歷史模板。")
+                elif source_mode != SOURCE_MODE_TEMPLATE and not selected_doc_ids:
+                    st.error("❌ 請先依來源模式選擇至少一份已索引教材。")
                 elif selected_doc_ids and strict_source_tracking and missing_precise_docs:
                     missing_titles = ", ".join(doc["title"] for doc in missing_precise_docs)
                     st.error(f"❌ 目前選到的教材仍缺少精確來源：{missing_titles}")
@@ -2569,227 +2961,33 @@ with main_col:
                             selected_section_details,
                         )
 
-                    # 構建 prompt
-                    diff_map = {"簡單": "easy", "中等": "medium", "困難": "hard"}
-                    type_map = {"單選題": "MCQ 選擇題", "多選題": "多選題", "是非題": "是非題"}
-                    skill_trigger = type_map.get(question_type, "選擇題")
-                    diff_en = diff_map.get(difficulty, "medium")
+                    prompt = build_generation_prompt(
+                        num_questions=num_questions,
+                        question_type=question_type,
+                        difficulty=difficulty,
+                        topics=topics,
+                        source_doc=source_doc,
+                        selected_doc_ids=selected_doc_ids,
+                        preview_only_mode=preview_only_mode,
+                        selected_section_details=selected_section_details,
+                        additional_instructions=additional_instructions,
+                        prompt_preset=prompt_preset,
+                        prompt_presets=PROMPT_PRESETS,
+                        prompt_context=textbook_context_bundle.get("prompt_context", ""),
+                        source_mode=source_mode,
+                        template_context=selected_template_context,
+                    )
 
-                    prompt = f"""請生成 {num_questions} 道{skill_trigger}。
-
-## 考題配置
-- 題型: {question_type}
-- 難度: {difficulty} ({diff_en})
-- 題數: {num_questions}
-"""
-                    if topics:
-                        prompt += f"- 知識點範圍: {', '.join(topics)}\n"
-                    if source_doc:
-                        prompt += f"- 參考教材: {source_doc}\n"
-                        if selected_doc_ids:
-                            prompt += f"- 文件 ID: {', '.join(selected_doc_ids)}\n"
-                    prompt += f"- 生成模式: {'preview 草稿' if preview_only_mode else '正式來源追蹤'}\n"
-                    if selected_section_details:
-                        sec_names = [s["title"] for s in selected_section_details]
-                        prompt += f"- 指定章節: {', '.join(sec_names)}\n"
-                    if additional_instructions:
-                        prompt += f"- 額外要求: {additional_instructions}\n"
-                    if prompt_preset != "無":
-                        prompt += f"- preset: {prompt_preset} / {PROMPT_PRESETS[prompt_preset]}\n"
-                    if textbook_context_bundle.get("prompt_context"):
-                        prompt += (
-                            "\n## 教材內容上下文（請直接依據以下 section / chapter / full text 出題）\n"
-                            + textbook_context_bundle["prompt_context"]
-                            + "\n"
-                        )
-
-                    # 根據是否有已索引教材來選擇不同的生成流程
-                    if source_doc and selected_doc_ids:
-                        doc_probe_steps = ""
-                        doc_query_steps = ""
-                        for did in selected_doc_ids:
-                            doc_probe_steps += (
-                                f'search_source_location(doc_id="{did}", query="[其中一個 target concept]")\n'
-                            )
-                            doc_query_steps += f'search_source_location(doc_id="{did}", query="[概念關鍵字]")\n'
-
-                        # 組合章節聚焦指引
-                        section_focus = ""
-                        if selected_section_details:
-                            sec_list = "\n".join(
-                                f"  - {s['title']} (P.{s.get('page', '?')}, doc: {s['doc_id'][:12]})"
-                                for s in selected_section_details
-                            )
-                            section_focus = f"""
-### 📑 聚焦章節
-用戶指定了以下章節，請**優先**從這些章節中提取知識點出題：
-{sec_list}
-
-使用 `get_section_content` 讀取指定章節內容：
-```
-get_section_content(doc_id="<doc_id>", section_id="<section_id>")
-```
-可用的 section_id：
-{chr(10).join(f"  - {s['id']} ({s['title']})" for s in selected_section_details)}
-"""
-
-                        if preview_only_mode:
-                            prompt += f"""
-## Preview 草稿模式（不得假裝有精確來源）
-
-已選教材目前**沒有完整精確來源能力**，因此這次只能生成可審閱草稿：
-
-1. 先做 readiness probe：
-```
-{doc_probe_steps}```
-2. 如果 `consult_knowledge_graph` 可用，可輔助閱讀；若失敗，改以全文/章節內容理解教材。
-3. **不得編造頁碼、行號、bbox、original_text。**
-4. **不得呼叫 `exam_save_question` 或 `exam_bulk_save` 正式入庫。**
-5. 請直接輸出 JSON 題目物件，方便使用者在 UI 內預覽與人工審閱。
-
-{section_focus}
-每題仍需提供完整 explanation，包含：
-- 為何正解正確
-- 每個錯誤選項為何錯
-- 一句臨床/考試重點
-"""
-                        else:
-                            prompt += f"""
-## 🚨 正式來源追蹤流程（必須遵守）
-
-已選教材具備精確來源能力，請走正式流程：
-
-1. `exam_get_generation_guide(question_type=\"mcq\")`
-2. `exam_get_pipeline_blueprint(pipeline_type=\"exam-generation\")`
-3. `exam_start_pipeline_run(...)`
-4. `exam_get_topics()` 避免重複
-5. 先做 readiness probe：
-```
-{doc_probe_steps}```
-6. 查知識：`consult_knowledge_graph(query="[知識點關鍵字]")`
-7. 取精確來源：
-```
-{doc_query_steps}```
-8. 若任何 probe 顯示缺少 Marker blocks，必須停止並記錄 blocked，不能假裝完成。
-9. 只有在取得真實來源後，才能產生題目與 explanation。
-
-{section_focus}
-正式儲存 payload 必須包含真實來源：
-```json
-{{
-    "question_text": "...",
-    "options": [...],
-    "correct_answer": "A",
-    "explanation": "逐一說明選項對錯",
-    "source_doc": "{source_doc}",
-    "source_chapter": "[章節]",
-    "stem_source": {{
-        "page": [MCP返回的頁碼],
-        "line_start": [起始行],
-        "line_end": [結束行],
-        "original_text": "[MCP返回的原文]"
-    }},
-    "difficulty": "{diff_en}",
-    "topics": {json.dumps(topics if topics else ["麻醉學"], ensure_ascii=False)}
-}}
-```
-"""
-                    elif source_doc:
-                        # 有手動輸入的教材名稱，但未索引（提醒需要先索引）
-                        prompt += f"""
-## ⚠️ 注意：教材未索引
-
-你指定了參考教材「{source_doc}」，但此教材**尚未索引**，無法使用 RAG 查詢精確來源。
-
-### 兩種處理方式：
-
-**方式 A：先索引教材（推薦）**
-請用戶上傳 PDF 檔案，然後使用 `ingest_documents` 工具索引：
-```
-ingest_documents(
-    file_paths=["path/to/pdf"],
-    async_mode=false,
-    use_marker=true,
-    page_ranges=["1-120"],
-    marker_max_pages_per_chunk=100,
-    extract_figures=false
-)
-```
-索引完成後，重新開始生成流程。
-
-**方式 B：直接生成（無來源追蹤）**
-如果用戶確認要繼續，可以直接生成題目，但：
-- ⚠️ 來源資訊將不完整
-- ⚠️ 無法進行來源驗證
-
-請詢問用戶選擇哪種方式。"""
-                    else:
-                        prompt += (
-                            """
-## 重要指示
-1. 每生成一題，**立即**使用 `exam_save_question` MCP 工具儲存
-2. 儲存後繼續生成下一題
-3. 每題必須包含完整資訊
-
-## 每題格式
-**題目:** [題目文字]
-**選項:**
-A. [選項A]
-B. [選項B]
-C. [選項C]
-D. [選項D]
-**答案:** [A/B/C/D]
-**難度:** [easy/medium/hard]
-**解析:** [詳細解說]
-
-## MCP 工具參數
-exam_save_question 需要：
-- question_text: 題目文字
-- options: ["選項A", "選項B", "選項C", "選項D"]
-- correct_answer: "A" (或 B/C/D)
-- explanation: 詳解
-- difficulty: \""""
-                            + diff_en
-                            + """\"
-- topics: """
-                            + json.dumps(topics if topics else ["麻醉學"], ensure_ascii=False)
-                            + """
-
-請開始生成第 1 題。"""
-                        )
-
-                    logger.info("ui_generation_start", num_questions=num_questions)
-
-                    # 建立 UI 元素
-                    st.markdown("---")
-                    st.subheader("🚀 生成中...")
-
-                    # 進度顯示（在最上方）
-                    progress_placeholder = st.empty()
-                    progress_placeholder.info("⏳ 正在初始化 AI Agent...")
-
-                    # 建立兩欄：左邊 AI 輸出，右邊題目預覽
-                    output_col, preview_col = st.columns([1, 1])
-
-                    with output_col:
-                        st.markdown("#### 🤖 AI 輸出")
-                        output_placeholder = st.empty()
-                        output_placeholder.code("等待 AI 回應...", language="text")
-
-                    with preview_col:
-                        st.markdown("#### 📋 已儲存的題目")
-                        questions_container = st.container()
-                        with questions_container:
-                            st.caption("題目將在儲存後顯示於此...")
-
-                    # 執行流式生成（不使用 st.spinner）
                     provider = st.session_state.agent_provider
+                    provider_name = getattr(provider, "name", "unknown")
+                    logger.info("ui_generation_start", num_questions=num_questions, provider=provider_name)
+
+                    generation_ui = create_generation_execution_ui()
+
                     full_response, saved_questions = stream_agent_generate(
                         prompt=prompt,
                         provider=provider,
-                        output_placeholder=output_placeholder,
-                        questions_container=questions_container,
-                        progress_placeholder=progress_placeholder,
+                        execution_ui=generation_ui,
                     )
 
                     # 更新 session state
@@ -2820,10 +3018,12 @@ exam_save_question 需要：
                         )
 
                     st.session_state.generated_questions = all_questions
+                    st.session_state.generated_questions_auto_saved = False
                     st.session_state.last_generation_response = full_response
 
                     logger.info(
                         "ui_generation_completed",
+                        provider=provider_name,
                         mcp_saved=len(saved_questions),
                         json_extracted=len(extracted),
                         total=len(all_questions),
@@ -2831,25 +3031,40 @@ exam_save_question 需要：
 
                     # 完成訊息
                     if all_questions:
+                        autosaved_count = autosave_generated_questions_to_drafts(all_questions)
+                        st.session_state.generated_questions_auto_saved = autosaved_count > 0
                         formal_ready_count = sum(1 for question in all_questions if question_formal_save_ready(question))
                         preview_only_count = sum(1 for question in all_questions if question.get("preview_only"))
-                        progress_placeholder.success(
+                        generation_ui.progress_placeholder.success(
                             f"✅ 生成完成！共提取 {len(all_questions)} 題"
                             f"（MCP 即存: {len(saved_questions)}, JSON 提取: {len(extracted)}）"
                         )
+                        if autosaved_count:
+                            st.success(f"本批生成結果已同步到題庫管理 {autosaved_count} 題。")
                         if preview_only_count:
-                            st.info(f"其中 {preview_only_count} 題已標記為 preview-only 草稿。")
+                            st.info(f"其中 {preview_only_count} 題已標記為 preview-only，請到題庫管理審閱。")
                         elif formal_ready_count < len(all_questions):
                             st.warning(
-                                f"其中 {len(all_questions) - formal_ready_count} 題尚未通過 formal-save gate，請先補 evidence pack 或改送草稿箱。"
+                                f"其中 {len(all_questions) - formal_ready_count} 題尚未通過 formal-save gate，請先補 evidence pack，或到題庫管理整理。"
                             )
+                        generation_ui.status_container.update(
+                            label=f"✅ 生成完成，共 {len(all_questions)} 題",
+                            state="complete",
+                            expanded=False,
+                        )
                     else:
-                        progress_placeholder.warning("⚠️ 生成完成，但未偵測到題目。")
+                        st.session_state.generated_questions_auto_saved = False
+                        generation_ui.progress_placeholder.warning("⚠️ 生成完成，但未偵測到題目。")
+                        generation_ui.status_container.update(
+                            label="⚠️ 生成完成，但未偵測到題目",
+                            state="error",
+                            expanded=True,
+                        )
                         with st.expander("🔍 除錯資訊"):
                             st.markdown("**可能原因：**")
                             st.markdown("1. AI 沒有以 JSON 格式輸出題目")
-                            st.markdown("2. AI 沒有正確呼叫 `exam_save_question` MCP 工具")
-                            st.markdown("3. MCP Server 沒有正常啟動")
+                            st.markdown("2. AI 輸出了題目，但格式不符合目前的 JSON 提取規則")
+                            st.markdown("3. Agent 或 MCP 工具鏈在查來源 / 讀教材時中途失敗")
                             st.markdown("---")
                             st.markdown("**完整輸出：**")
                             st.code(full_response[-5000:], language="text")
@@ -2861,33 +3076,46 @@ exam_save_question 需要：
                     seed_col1, seed_col2, seed_col3 = st.columns(3)
                     with seed_col1:
                         if st.button("🧪 載入教材 preview-only", width="stretch", key="e2e_textbook_preview"):
-                            st.session_state.generated_questions = build_e2e_textbook_review_questions("preview")
+                            preview_questions = build_e2e_textbook_review_questions("preview")
+                            st.session_state.generated_questions = preview_questions
+                            autosaved_count = autosave_generated_questions_to_drafts(preview_questions)
+                            st.session_state.generated_questions_auto_saved = autosaved_count > 0
                             st.session_state.last_generation_response = "E2E preview-only textbook review payload"
                             st.rerun()
                     with seed_col2:
                         if st.button("🧪 載入教材 formal-save", width="stretch", key="e2e_textbook_formal"):
-                            st.session_state.generated_questions = build_e2e_textbook_review_questions("formal")
+                            formal_questions = build_e2e_textbook_review_questions("formal")
+                            st.session_state.generated_questions = formal_questions
+                            autosaved_count = autosave_generated_questions_to_drafts(formal_questions)
+                            st.session_state.generated_questions_auto_saved = autosaved_count > 0
                             st.session_state.last_generation_response = "E2E formal-save textbook review payload"
                             st.rerun()
                     with seed_col3:
                         if st.button("🧪 清空教材測試資料", width="stretch", key="e2e_textbook_clear"):
                             st.session_state.generated_questions = []
+                            st.session_state.generated_questions_auto_saved = False
                             st.session_state.last_generation_response = ""
                             st.rerun()
 
             if st.session_state.generated_questions:
-                render_question_review_form(st.session_state.generated_questions)
+                render_question_review_form(
+                    st.session_state.generated_questions,
+                    navigate_to=navigate_to,
+                    auto_saved_to_drafts=bool(st.session_state.get("generated_questions_auto_saved")),
+                )
 
                 # 顯示操作按鈕
                 st.markdown("---")
-                col1, col2, col3 = st.columns(3)
+                col1, col2 = st.columns(2)
                 with col1:
-                    if st.button("🔄 再生成一批", width="stretch"):
+                    if st.button("🔄 再生成一批", width="stretch", key="review_regenerate_batch"):
                         st.session_state.generated_questions = []
+                        st.session_state.generated_questions_auto_saved = False
                         st.rerun()
                 with col2:
-                    if st.button("✍️ 立即練習", width="stretch"):
+                    if st.button("✍️ 立即練習", width="stretch", key="review_start_practice"):
                         qs = st.session_state.generated_questions
+                        st.session_state.pending_generated_review_practice = True
                         start_practice_session(
                             qs.copy(),
                             {
@@ -2895,11 +3123,7 @@ exam_save_question 需要：
                                 "label": "生成結果",
                             },
                         )
-                        navigate_to("✍️ 作答練習")
-                        st.rerun()
-                with col3:
-                    if st.button("📚 查看題庫", width="stretch"):
-                        navigate_to("📚 題庫管理")
+                        navigate_to_without_query_sync("✍️ 作答練習")
                         st.rerun()
 
                 # 原始 AI 輸出（可展開）
@@ -2912,551 +3136,13 @@ exam_save_question 需要：
             else:
                 render_empty_state(
                     "等待生成結果",
-                    "先設定教材與生成模式。若你要正式入庫，請確認教材顯示為可精確追來源。",
+                    "先設定教材與生成模式。待審、QA 與正式入庫會在題庫管理完成。",
                 )
 
     elif page == "🗃️ 草稿箱":
-        from src.application.services.question_draft_service import get_question_draft_service
-        from src.application.services.question_similarity_service import get_question_similarity_service
-
-        draft_service = get_question_draft_service()
-        similarity_service = get_question_similarity_service()
-        similarity_corpus = similarity_service.build_corpus()
-        historical_templates = draft_service.list_historical_templates(limit=12)
-        template_map = {template["template_id"]: template for template in historical_templates}
-        template_ids = list(template_map.keys())
-        DRAFT_STATUS_OPTIONS = ["全部", "draft", "promoted", "archived"]
-        DRAFT_STATUS_LABELS = {
-            "全部": "全部",
-            "draft": "草稿",
-            "promoted": "已入庫",
-            "archived": "已封存",
-        }
-        QA_STATUS_LABELS = {
-            "pending": "待審",
-            "ready": "可入庫",
-            "needs_revision": "需修訂",
-        }
-        QA_CHECK_LABELS = {
-            "pending": "待檢",
-            "pass": "通過",
-            "revise": "需修訂",
-        }
-        QA_STATUS_OPTIONS = ["pending", "ready", "needs_revision"]
-        QA_CHECK_OPTIONS = ["pending", "pass", "revise"]
-
-        render_draft_flash()
-
-        draft_stats = get_draft_stats()
-        render_page_hero(
-            "題目草稿箱",
-            "生成結果先進草稿區，整理好再正式入庫。這裡支援加星、批次編修、批次送入題庫與封存。",
-            [
-                f"待整理草稿 {draft_stats.get('draft', 0)} 題",
-                f"已加星 {draft_stats.get('starred', 0)} 題",
-                f"已送入題庫 {draft_stats.get('promoted', 0)} 題",
-            ],
-        )
-
-        with st.container(border=True):
-            st.subheader("歷史題型模板")
-            st.caption("模板直接取自已拆解的歷屆題庫，建立新草稿時會一併帶入歷史來源、blueprint 摘要與 QA 初始欄位。")
-            if historical_templates:
-                selected_template_id = st.selectbox(
-                    "選擇歷史模板",
-                    template_ids,
-                    format_func=lambda template_id: (
-                        f"{template_map[template_id]['label']} · {template_map[template_id]['source_exam_year']} 年第 {template_map[template_id]['source_question_number']} 題"
-                    )
-                    if template_id in template_map
-                    else str(template_id),
-                ) or template_ids[0]
-                selected_template = template_map[selected_template_id]
-                template_col1, template_col2 = st.columns([1.55, 1])
-                with template_col1:
-                    st.markdown(f"**骨架題幹:** {selected_template.get('stem_scaffold', '-')}")
-                    st.caption(
-                        f"參考來源：{selected_template.get('source_exam_year', '-')} {selected_template.get('source_exam_name', '')} 第 {selected_template.get('source_question_number', '-')} 題"
-                    )
-                    reference_text = selected_template.get("reference_question_text", "")
-                    if reference_text:
-                        if len(reference_text) > 140:
-                            reference_text = reference_text[:140].rstrip() + "..."
-                        st.caption(f"原始題幹：{reference_text}")
-                with template_col2:
-                    st.markdown(f"**題型:** {selected_template.get('pattern_label', '-')}")
-                    st.markdown(f"**建議難度:** {selected_template.get('difficulty', '-')}")
-                    st.markdown(
-                        f"**主題:** {', '.join(selected_template.get('topics', [])) or '-'}"
-                    )
-                    st.markdown(f"**Bloom:** {selected_template.get('bloom_level', '-')}")
-
-                template_blueprint = selected_template.get("blueprint", {})
-                if template_blueprint.get("recommended_rules"):
-                    st.markdown("**Blueprint 指引**")
-                    st.markdown(
-                        "\n".join(
-                            f"- {rule}" for rule in template_blueprint.get("recommended_rules", [])[:3]
-                        )
-                    )
-
-                if st.button("📐 以歷史模板建立新草稿", width="stretch"):
-                    draft_id = draft_service.create_draft_from_template(selected_template_id)
-                    if draft_id:
-                        set_draft_flash(
-                            f"已從 {selected_template.get('source_exam_year', '-')} 年第 {selected_template.get('source_question_number', '-')} 題建立模板草稿。"
-                        )
-                        st.rerun()
-                    st.error("無法建立模板草稿，請重新整理後再試。")
-            else:
-                st.info("目前找不到可用的歷史模板，請先確認歷屆題庫是否已匯入。")
-
-        with st.container(border=True):
-            filter_col1, filter_col2, filter_col3 = st.columns([1.4, 1, 1])
-            with filter_col1:
-                draft_search = st.text_input("搜尋草稿", placeholder="輸入題幹、主題或草稿備註")
-            with filter_col2:
-                draft_status = st.selectbox(
-                    "草稿狀態",
-                    DRAFT_STATUS_OPTIONS,
-                    format_func=lambda x: DRAFT_STATUS_LABELS.get(x) or str(x),
-                    index=0,
-                )
-            with filter_col3:
-                draft_starred_only = st.checkbox("⭐ 只看加星草稿", value=False)
-
-        drafts = load_question_drafts(
-            status=None if draft_status == "全部" else draft_status,
-            starred_only=draft_starred_only,
-        )
-
-        if draft_search:
-            query = draft_search.strip().lower()
-            drafts = [
-                draft
-                for draft in drafts
-                if query in draft.get("question", {}).get("question_text", "").lower()
-                or query in " ".join(draft.get("question", {}).get("topics", [])).lower()
-                or query in draft.get("notes", "").lower()
-            ]
-
-        draft_similarity_map = build_draft_similarity_map(drafts, similarity_service, similarity_corpus)
-
-        if not drafts:
-            render_empty_state("草稿箱目前沒有符合條件的題目", "先從生成頁把候選題送進草稿箱，或放寬搜尋與篩選條件。")
-        else:
-            st.dataframe(build_draft_scan_rows(drafts, similarity_map=draft_similarity_map), width="stretch", hide_index=True)
-
-            selection_labels = {
-                draft["id"]: f"{'⭐ ' if draft.get('is_starred') else ''}[{DRAFT_STATUS_LABELS.get(draft.get('status', 'draft'), draft.get('status', 'draft'))}] {draft.get('question', {}).get('question_text', '')[:55]}"
-                for draft in drafts
-            }
-            selection_options = list(selection_labels.keys())
-            if st.session_state.get("draft_batch_selection_reset_pending"):
-                st.session_state.draft_batch_selection_widget = []
-                st.session_state.draft_batch_selection_override = []
-                st.session_state.draft_batch_selection_reset_pending = False
-            st.session_state.draft_batch_selection_widget = [
-                draft_id
-                for draft_id in st.session_state.get("draft_batch_selection_widget", [])
-                if draft_id in selection_options
-            ]
-            widget_selected_draft_ids = st.multiselect(
-                "批次選取草稿",
-                options=selection_options,
-                format_func=lambda draft_id: selection_labels.get(draft_id) or str(draft_id),
-                key="draft_batch_selection_widget",
-            )
-            selected_draft_ids = widget_selected_draft_ids
-            if is_e2e_test_mode() and st.session_state.get("draft_batch_selection_override"):
-                selected_draft_ids = list(st.session_state["draft_batch_selection_override"])
-
-            if is_e2e_test_mode():
-                if st.button("🧪 E2E 全選目前草稿", width="stretch"):
-                    selected_ids = selection_options.copy()
-                    st.session_state.draft_batch_selection_override = selected_ids
-                    st.rerun()
-
-            if selected_draft_ids:
-                selected_drafts = [draft for draft in drafts if draft["id"] in selected_draft_ids]
-                qa_ready_count = sum(
-                    1 for draft in selected_drafts if (draft.get("qa_metadata") or {}).get("overall_status") == "ready"
-                )
-                qa_revision_count = sum(
-                    1
-                    for draft in selected_drafts
-                    if (draft.get("qa_metadata") or {}).get("overall_status") == "needs_revision"
-                )
-                similarity_warning_drafts = sum(
-                    1
-                    for draft in selected_drafts
-                    if (draft_similarity_map.get(draft["id"], {}).get("count", 0) or 0) > 0
-                )
-                with st.container(border=True):
-                    st.subheader("送入正式題庫前摘要")
-                    summary_col1, summary_col2, summary_col3, summary_col4 = st.columns(4)
-                    with summary_col1:
-                        st.metric("已選草稿", len(selected_drafts))
-                    with summary_col2:
-                        st.metric("QA 可入庫", qa_ready_count)
-                    with summary_col3:
-                        st.metric("QA 需修訂", qa_revision_count)
-                    with summary_col4:
-                        st.metric("相似題警示", similarity_warning_drafts)
-
-                    attention_lines = []
-                    for draft in selected_drafts[:8]:
-                        qa_status = (draft.get("qa_metadata") or {}).get("overall_status", "pending")
-                        qa_label = QA_STATUS_LABELS.get(qa_status, qa_status)
-                        similarity_entry = draft_similarity_map.get(draft["id"], {})
-                        similarity_count = int(similarity_entry.get("count", 0) or 0)
-                        top_similarity = int(round(float(similarity_entry.get("top_similarity", 0.0) or 0.0) * 100))
-                        if qa_status != "ready" or similarity_count:
-                            attention_lines.append(
-                                f"- {draft.get('question', {}).get('question_text', '')[:52]}...｜QA: {qa_label}｜相似題: {similarity_count} 筆{f' / {top_similarity}%' if similarity_count else ''}"
-                            )
-
-                    if attention_lines:
-                        st.warning("以下草稿在 promote 前建議再確認一次：")
-                        st.markdown("\n".join(attention_lines))
-                    else:
-                        st.info("目前選取草稿沒有相似題或 QA 阻塞訊號，可直接進入 promote。")
-
-            with st.container(border=True):
-                st.subheader("批次編修 / 操作")
-                edit_col1, edit_col2, edit_col3 = st.columns(3)
-                with edit_col1:
-                    batch_difficulty = st.selectbox("批次難度", ["不變更", "easy", "medium", "hard"], index=0)
-                    batch_validated = st.selectbox(
-                        "批次審查狀態",
-                        ["不變更", "設為已審查", "設為待審查"],
-                        index=0,
-                    )
-                with edit_col2:
-                    batch_exam_track = st.selectbox(
-                        "批次考試類型",
-                        ["不變更", "ite", "pgy", "clerk", "specialist", "board", "custom"],
-                        index=0,
-                    )
-                    batch_starred = st.selectbox(
-                        "批次星號",
-                        ["不變更", "加星", "取消加星"],
-                        index=0,
-                    )
-                with edit_col3:
-                    batch_topics = st.text_input(
-                        "批次主題標籤",
-                        placeholder="逗號分隔；留空表示不變更",
-                    )
-                    batch_notes = st.text_input(
-                        "批次草稿備註",
-                        placeholder="留空表示不變更",
-                    )
-
-                template_apply_col1, template_apply_col2 = st.columns([1.8, 1])
-                with template_apply_col1:
-                    batch_template_id = st.selectbox(
-                        "套用歷史模板到既有草稿",
-                        ["不套用", *template_ids],
-                        format_func=lambda template_id: (
-                            f"{template_map[template_id]['label']} · {template_map[template_id]['source_exam_year']} 年第 {template_map[template_id]['source_question_number']} 題"
-                            if template_id in template_map
-                            else str(template_id)
-                        ),
-                    )
-                with template_apply_col2:
-                    batch_replace_content = st.checkbox(
-                        "以模板骨架覆蓋題幹/選項",
-                        value=False,
-                        help="若不勾選，只更新模板引用、blueprint 與建議難度/主題。",
-                        disabled=not template_ids,
-                    )
-
-                action_col1, action_col2, action_col3 = st.columns(3)
-                with action_col1:
-                    if st.button("🛠️ 套用批次編修", width="stretch", disabled=not selected_draft_ids):
-                        updated = draft_service.bulk_update(
-                            draft_ids=selected_draft_ids,
-                            difficulty=None if batch_difficulty == "不變更" else batch_difficulty,
-                            topics=None if not batch_topics.strip() else [t.strip() for t in batch_topics.split(",") if t.strip()],
-                            exam_track=None if batch_exam_track == "不變更" else batch_exam_track,
-                            is_validated=None
-                            if batch_validated == "不變更"
-                            else batch_validated == "設為已審查",
-                            is_starred=None
-                            if batch_starred == "不變更"
-                            else batch_starred == "加星",
-                            notes=None if not batch_notes.strip() else batch_notes.strip(),
-                        )
-                        schedule_draft_batch_selection_reset()
-                        set_draft_flash(f"已更新 {updated} 題草稿。")
-                        st.rerun()
-                with action_col2:
-                    if st.button(
-                        "📎 套用歷史模板",
-                        width="stretch",
-                        disabled=not selected_draft_ids or batch_template_id == "不套用",
-                    ):
-                        updated = draft_service.apply_template_to_drafts(
-                            selected_draft_ids,
-                            batch_template_id,
-                            replace_content=batch_replace_content,
-                        )
-                        schedule_draft_batch_selection_reset()
-                        set_draft_flash(f"已將歷史模板套用到 {updated} 題草稿。")
-                        st.rerun()
-                with action_col3:
-                    if st.button("✅ 送入正式題庫", width="stretch", disabled=not selected_draft_ids):
-                        result = draft_service.promote_drafts(selected_draft_ids)
-                        schedule_draft_batch_selection_reset()
-                        promoted_count = int(result.get("promoted", 0) or 0)
-                        failed_count = len(result.get("failed", []))
-                        if promoted_count and failed_count:
-                            set_draft_flash(
-                                f"已正式入庫 {promoted_count} 題，另有 {failed_count} 題入庫失敗。",
-                                level="warning",
-                            )
-                        elif promoted_count:
-                            set_draft_flash(f"已正式入庫 {promoted_count} 題。")
-                        elif failed_count:
-                            set_draft_flash(f"有 {failed_count} 題入庫失敗。", level="warning")
-                        st.rerun()
-
-                archive_col1, archive_col2, archive_col3 = st.columns(3)
-                with archive_col3:
-                    if st.button("🗂️ 封存選取", width="stretch", disabled=not selected_draft_ids):
-                        archived = draft_service.archive_drafts(selected_draft_ids)
-                        schedule_draft_batch_selection_reset()
-                        set_draft_flash(f"已封存 {archived} 題草稿。")
-                        st.rerun()
-
-            for index, draft in enumerate(drafts[:40], start=1):
-                question = draft.get("question", {})
-                template_data = draft.get("template_data") or {}
-                blueprint_data = draft.get("blueprint_data") or {}
-                qa_data = draft.get("qa_metadata") or {}
-                status_label = DRAFT_STATUS_LABELS.get(draft.get("status", "draft"), draft.get("status", "draft"))
-                title_prefix = "⭐ " if draft.get("is_starred") else ""
-                with st.expander(f"#{index} {title_prefix}[{status_label}] {question.get('question_text', '')[:58]}..."):
-                    badges = []
-                    confidence = draft.get("source_confidence", "none")
-                    if confidence == "precise":
-                        badges.append('<span class="status-chip-good">精確來源</span>')
-                    elif confidence == "contextual":
-                        badges.append('<span class="status-chip-warn">全文來源</span>')
-                    else:
-                        badges.append('<span class="status-chip-warn">無來源</span>')
-                    if question.get("is_validated"):
-                        badges.append('<span class="status-chip-good">✅ 已審查</span>')
-                    else:
-                        badges.append('<span class="status-chip-warn">待審查</span>')
-                    if question.get("exam_track"):
-                        badges.append(f'<span class="status-chip-good">{question["exam_track"].upper()}</span>')
-                    qa_status = qa_data.get("overall_status", "pending")
-                    qa_status_label = QA_STATUS_LABELS.get(qa_status, qa_status)
-                    if qa_status == "ready":
-                        badges.append(f'<span class="status-chip-good">QA {qa_status_label}</span>')
-                    else:
-                        badges.append(f'<span class="status-chip-warn">QA {qa_status_label}</span>')
-                    st.markdown(" ".join(badges), unsafe_allow_html=True)
-
-                    st.markdown(f"**題目:** {question.get('question_text', '')}")
-                    for opt_idx, option in enumerate(question.get("options", [])):
-                        st.markdown(f"- {chr(65 + opt_idx)}. {option}")
-
-                    detail_col1, detail_col2, detail_col3 = st.columns(3)
-                    with detail_col1:
-                        st.markdown(f"**答案:** {question.get('correct_answer', '-')}")
-                    with detail_col2:
-                        st.markdown(f"**難度:** {question.get('difficulty', 'medium')}")
-                    with detail_col3:
-                        st.markdown(f"**主題:** {', '.join(question.get('topics', [])) or '-'}")
-
-                    if draft.get("notes"):
-                        st.caption(f"草稿備註：{draft['notes']}")
-                    if draft.get("promoted_question_id"):
-                        st.caption(f"正式題庫 ID：{draft['promoted_question_id'][:8]}...")
-
-                    if template_data:
-                        st.markdown("**歷史模板來源**")
-                        st.caption(
-                            f"{template_data.get('label', '-') } · {template_data.get('source_exam_year', '-')} {template_data.get('source_exam_name', '')} 第 {template_data.get('source_question_number', '-')} 題"
-                        )
-                        if template_data.get("stem_scaffold"):
-                            st.caption(f"模板骨架：{template_data.get('stem_scaffold')}")
-
-                    if blueprint_data:
-                        st.markdown("**Blueprint 摘要**")
-                        blueprint_col1, blueprint_col2, blueprint_col3 = st.columns(3)
-                        with blueprint_col1:
-                            st.markdown(f"**題型:** {blueprint_data.get('pattern_label') or blueprint_data.get('pattern') or '-'}")
-                        with blueprint_col2:
-                            st.markdown(f"**Bloom:** {blueprint_data.get('bloom_level', '-')}")
-                        with blueprint_col3:
-                            st.markdown(f"**Blueprint 難度:** {blueprint_data.get('difficulty', '-')}")
-                        if blueprint_data.get("target_topics"):
-                            st.caption(f"目標主題：{', '.join(blueprint_data.get('target_topics', []))}")
-                        if blueprint_data.get("reference_concepts"):
-                            st.caption(f"參考概念：{', '.join(blueprint_data.get('reference_concepts', []))}")
-                        if blueprint_data.get("sample_source_refs"):
-                            st.caption(f"歷史參考：{'；'.join(blueprint_data.get('sample_source_refs', []))}")
-                        if blueprint_data.get("recommended_rules"):
-                            st.markdown(
-                                "\n".join(
-                                    f"- {rule}" for rule in blueprint_data.get("recommended_rules", [])[:3]
-                                )
-                            )
-
-                    similar_matches = draft_similarity_map.get(draft["id"], {}).get("matches", [])
-                    if similar_matches:
-                        st.info("相似題提醒")
-                        match_lines = []
-                        for match in similar_matches:
-                            source_label = "正式題庫" if match["source_type"] == "bank" else "草稿箱"
-                            similarity_pct = int(round(match["similarity"] * 100))
-                            preview_text = match["question_text"][:72].strip()
-                            if len(match["question_text"]) > 72:
-                                preview_text += "..."
-                            match_lines.append(f"- [{source_label}] {similarity_pct}% 相似: {preview_text}")
-                        st.markdown("\n".join(match_lines))
-
-                    with st.container(border=True):
-                        st.markdown("**QA 審閱**")
-                        qa_col1, qa_col2, qa_col3 = st.columns(3)
-                        with qa_col1:
-                            qa_overall = st.selectbox(
-                                "整體狀態",
-                                QA_STATUS_OPTIONS,
-                                index=QA_STATUS_OPTIONS.index(qa_data.get("overall_status", "pending"))
-                                if qa_data.get("overall_status", "pending") in QA_STATUS_OPTIONS
-                                else 0,
-                                format_func=lambda value: QA_STATUS_LABELS.get(value) or str(value),
-                                key=f"draft_qa_overall_{draft['id']}",
-                            )
-                            qa_stem = st.selectbox(
-                                "題幹品質",
-                                QA_CHECK_OPTIONS,
-                                index=QA_CHECK_OPTIONS.index(qa_data.get("stem_quality", "pending"))
-                                if qa_data.get("stem_quality", "pending") in QA_CHECK_OPTIONS
-                                else 0,
-                                format_func=lambda value: QA_CHECK_LABELS.get(value) or str(value),
-                                key=f"draft_qa_stem_{draft['id']}",
-                            )
-                        with qa_col2:
-                            qa_option = st.selectbox(
-                                "選項品質",
-                                QA_CHECK_OPTIONS,
-                                index=QA_CHECK_OPTIONS.index(qa_data.get("option_quality", "pending"))
-                                if qa_data.get("option_quality", "pending") in QA_CHECK_OPTIONS
-                                else 0,
-                                format_func=lambda value: QA_CHECK_LABELS.get(value) or str(value),
-                                key=f"draft_qa_option_{draft['id']}",
-                            )
-                            qa_answer = st.selectbox(
-                                "答案對齊",
-                                QA_CHECK_OPTIONS,
-                                index=QA_CHECK_OPTIONS.index(qa_data.get("answer_alignment", "pending"))
-                                if qa_data.get("answer_alignment", "pending") in QA_CHECK_OPTIONS
-                                else 0,
-                                format_func=lambda value: QA_CHECK_LABELS.get(value) or str(value),
-                                key=f"draft_qa_answer_{draft['id']}",
-                            )
-                        with qa_col3:
-                            qa_source = st.selectbox(
-                                "來源對齊",
-                                QA_CHECK_OPTIONS,
-                                index=QA_CHECK_OPTIONS.index(qa_data.get("source_alignment", "pending"))
-                                if qa_data.get("source_alignment", "pending") in QA_CHECK_OPTIONS
-                                else 0,
-                                format_func=lambda value: QA_CHECK_LABELS.get(value) or str(value),
-                                key=f"draft_qa_source_{draft['id']}",
-                            )
-                            qa_explanation = st.selectbox(
-                                "解析品質",
-                                QA_CHECK_OPTIONS,
-                                index=QA_CHECK_OPTIONS.index(qa_data.get("explanation_quality", "pending"))
-                                if qa_data.get("explanation_quality", "pending") in QA_CHECK_OPTIONS
-                                else 0,
-                                format_func=lambda value: QA_CHECK_LABELS.get(value) or str(value),
-                                key=f"draft_qa_explanation_{draft['id']}",
-                            )
-
-                        qa_note = st.text_area(
-                            "QA 備註",
-                            value=qa_data.get("review_notes", ""),
-                            key=f"draft_qa_note_{draft['id']}",
-                        )
-                        if qa_data.get("reviewed_at"):
-                            reviewer = qa_data.get("reviewer") or "-"
-                            st.caption(f"最近審閱：{qa_data.get('reviewed_at')} by {reviewer}")
-                        st.caption(f"相似題提醒數：{qa_data.get('similarity_warning_count', 0)}")
-
-                        if st.button("💾 儲存 QA", key=f"draft_qa_save_{draft['id']}", width="stretch"):
-                            saved = draft_service.update_qa_metadata(
-                                draft_id=draft["id"],
-                                overall_status=qa_overall,
-                                stem_quality=qa_stem,
-                                option_quality=qa_option,
-                                answer_alignment=qa_answer,
-                                source_alignment=qa_source,
-                                explanation_quality=qa_explanation,
-                                review_notes=(qa_note or "").strip(),
-                                similarity_warning_count=len(similar_matches),
-                            )
-                            if saved:
-                                st.success("QA metadata 已更新。")
-                                st.rerun()
-                            st.error("QA metadata 更新失敗。")
-
-                    history_entries = draft_service.get_draft_history(draft["id"], limit=8)
-                    if history_entries:
-                        with st.container(border=True):
-                            st.markdown("**版本歷史**")
-                            for entry in history_entries:
-                                snapshot = entry.get("snapshot_data") or {}
-                                snapshot_question = snapshot.get("question") or {}
-                                snapshot_template = snapshot.get("template_data") or {}
-                                snapshot_qa = snapshot.get("qa_metadata") or {}
-                                qa_summary = QA_STATUS_LABELS.get(
-                                    snapshot_qa.get("overall_status", "pending"),
-                                    snapshot_qa.get("overall_status", "pending"),
-                                )
-                                template_summary = snapshot_template.get("label", "-")
-                                reason_text = entry.get("reason") or "-"
-                                st.caption(
-                                    f"v{entry.get('version_number', '-')} · {entry.get('action', '-')} · {entry.get('created_at', '-') } · {entry.get('actor_name', '-') }"
-                                )
-                                st.markdown(
-                                    f"- 題目：{snapshot_question.get('question_text', '')[:72] or '-'}"
-                                )
-                                st.markdown(
-                                    f"- 模板：{template_summary}｜QA：{qa_summary}｜原因：{reason_text}"
-                                )
-
-                    quick_col1, quick_col2 = st.columns(2)
-                    with quick_col1:
-                        if st.button(
-                            "⭐ 取消加星" if draft.get("is_starred") else "⭐ 加星",
-                            key=f"draft_star_{draft['id']}",
-                            width="stretch",
-                        ):
-                            draft_service.bulk_update(
-                                [draft["id"]],
-                                is_starred=not draft.get("is_starred", False),
-                            )
-                            st.rerun()
-                    with quick_col2:
-                        if draft.get("status") == "draft" and st.button(
-                            "✅ 立即入庫",
-                            key=f"draft_promote_{draft['id']}",
-                            width="stretch",
-                        ):
-                            draft_service.promote_drafts([draft["id"]])
-                            st.rerun()
-
-                    source = question.get("source") or {}
-                    if source:
-                        render_source_info(source, expanded=False)
+        st.info("草稿箱已整合到題庫管理頁面，請改在那裡進行待審、QA 與正式入庫。")
+        navigate_to("📚 題庫管理")
+        st.rerun()
 
     elif page == "✍️ 作答練習":
         # ===== 作答練習頁面 =====
@@ -3717,6 +3403,7 @@ exam_save_question 需要：
                         question_prefix = f"第 {q.get('question_number', '-')} 題" if q.get("question_number") else ""
                         st.caption(f"{q.get('exam_year', '-') } 年 {q.get('exam_name', '考古題')} {question_prefix}".strip())
                     st.markdown(q.get("question_text", ""))
+                    render_past_exam_question_assets(q)
 
                     # 選項
                     options = q.get("options", [])
@@ -3771,14 +3458,37 @@ exam_save_question 需要：
 
             # 提交按鈕
             if not st.session_state.practice_submitted:
+                practice_context = st.session_state.get("practice_context", {})
+                practice_export_content = build_practice_download_markdown(
+                    questions,
+                    st.session_state.practice_answers,
+                    practice_context,
+                )
+                practice_export_filename = build_practice_download_filename(practice_context)
+
                 col1, col2, col3 = st.columns([1, 1, 1])
                 with col2:
                     if st.button("📤 提交答案", width="stretch", type="primary"):
                         st.session_state.practice_submitted = True
                         st.rerun()
+                with col3:
+                    st.download_button(
+                        "⬇️ 下載題目＋答案詳解",
+                        data=practice_export_content,
+                        file_name=practice_export_filename,
+                        mime="text/markdown",
+                        width="stretch",
+                    )
             else:
                 practice_context = st.session_state.get("practice_context", {})
                 practice_result = summarize_practice_results(questions, st.session_state.practice_answers)
+                practice_export_content = build_practice_download_markdown(
+                    questions,
+                    st.session_state.practice_answers,
+                    practice_context,
+                    practice_result,
+                )
+                practice_export_filename = build_practice_download_filename(practice_context)
                 correct_count = practice_result["correct_count"]
                 score = practice_result["score"]
                 st.success(f"🎉 本次成績：{correct_count}/{len(questions)} 題 ({score:.1f}%)")
@@ -3865,10 +3575,12 @@ exam_save_question 需要：
                                     if meta_parts:
                                         st.caption("｜".join(meta_parts))
 
+                                    render_past_exam_question_assets(row)
+
                                     if row.get("explanation"):
                                         st.info(row["explanation"])
 
-                col1, col2 = st.columns(2)
+                col1, col2, col3 = st.columns(3)
                 with col1:
                     if st.button("🔄 重新練習", width="stretch"):
                         start_practice_session(questions, practice_context)
@@ -3877,6 +3589,14 @@ exam_save_question 需要：
                     if st.button("📝 新的練習", width="stretch"):
                         clear_practice_session()
                         st.rerun()
+                with col3:
+                    st.download_button(
+                        "⬇️ 下載題目＋答案詳解",
+                        data=practice_export_content,
+                        file_name=practice_export_filename,
+                        mime="text/markdown",
+                        width="stretch",
+                    )
         else:
             render_empty_state("尚未開始練習", "先選擇題數、難度或主題，再開始一輪作答。")
 
@@ -3895,14 +3615,15 @@ exam_save_question 需要：
 
         questions = load_questions()
         past_exam_catalog = load_past_exam_catalog(limit=30)
+        draft_stats = get_draft_stats()
         all_topics = sorted({topic for q in questions for topic in q.get("topics", [])})
         render_page_hero(
             "題庫管理",
-            "搜尋、篩選與抽查題庫內容，快速找出要複習、要修正或要拿去練習的題目。",
+            "搜尋、篩選與抽查題庫內容，並在下方處理待審草稿、QA 與正式入庫。",
             [
                 f"一般題庫 {len(questions)} 題",
                 f"歷屆題庫 {content_stats['past_exam_question_count']} 題",
-                f"待審 {content_stats['pending_review_count']} 題",
+                f"待審草稿 {draft_stats.get('draft', 0)} 題",
             ],
         )
 
@@ -3952,11 +3673,12 @@ exam_save_question 需要：
             [q for q in base_filtered_questions if q.get("is_validated")] if bank_validated_only else base_filtered_questions
         )
         pending_questions = [q for q in base_filtered_questions if not q.get("is_validated")]
-        tab_general, tab_history, tab_review = st.tabs(
+        tab_general, tab_history, tab_review, tab_drafts = st.tabs(
             [
                 f"一般題庫 ({len(filtered_questions)})",
                 f"歷屆題庫 ({content_stats['past_exam_question_count']})",
                 f"待審題目 ({len(pending_questions)})",
+                f"待審草稿 ({draft_stats.get('draft', 0)})",
             ]
         )
 
@@ -3968,15 +3690,18 @@ exam_save_question 需要：
                 with summary_col1:
                     st.caption(f"顯示 {len(filtered_questions)} / {len(questions)} 題（一般題庫）")
                 with summary_col2:
-                    if filtered_questions and st.button("✍️ 用目前篩選結果練習", width="stretch"):
-                        start_practice_session(
+                    if filtered_questions and st.button(
+                        "✍️ 用目前篩選結果練習",
+                        width="stretch",
+                        key="bank_filtered_practice",
+                    ):
+                        queue_practice_session(
                             filtered_questions[:10],
                             {
                                 "source_type": PRACTICE_SOURCE_GENERAL,
                                 "label": "題庫篩選結果",
                             },
                         )
-                        navigate_to("✍️ 作答練習")
                         st.rerun()
 
                 if not filtered_questions:
@@ -3992,6 +3717,7 @@ exam_save_question 需要：
                 if not past_exam_catalog:
                     render_empty_state("尚未匯入歷屆考卷", "請先執行歷屆考題匯入流程。")
                 else:
+                    explanation_service = get_past_exam_explanation_service()
                     st.dataframe(build_past_exam_scan_rows(past_exam_catalog), width="stretch", hide_index=True)
                     selected_past_exam_id = st.selectbox(
                         "檢視歷屆考卷",
@@ -4011,21 +3737,111 @@ exam_save_question 需要：
                         past_exam_catalog[0],
                     )
                     past_exam_questions = load_past_exam_questions(selected_past_exam_id)
-                    past_exam_query = st.text_input(
-                        "搜尋歷屆題目",
-                        placeholder="輸入關鍵字，例如 malignant hyperthermia",
-                        key="past_exam_query",
+                    explanation_ready_count = sum(
+                        1 for question in past_exam_questions if str(question.get("explanation") or "").strip()
                     )
+                    missing_explanation_count = len(past_exam_questions) - explanation_ready_count
+
+                    status_col1, status_col2, status_col3 = st.columns(3)
+                    with status_col1:
+                        st.metric("本卷題數", len(past_exam_questions))
+                    with status_col2:
+                        st.metric("已有詳解", explanation_ready_count)
+                    with status_col3:
+                        st.metric("待補詳解", missing_explanation_count)
+
+                    filter_col1, filter_col2, filter_col3 = st.columns([1.5, 1, 1])
+                    with filter_col1:
+                        past_exam_query = st.text_input(
+                            "搜尋歷屆題目",
+                            placeholder="輸入關鍵字，例如 malignant hyperthermia",
+                            key="past_exam_query",
+                        )
+                    with filter_col2:
+                        past_exam_missing_only = st.checkbox(
+                            "只看缺詳解",
+                            value=False,
+                            key="past_exam_missing_only",
+                        )
+                    with filter_col3:
+                        past_exam_batch_limit = st.number_input(
+                            "批次補寫題數",
+                            min_value=1,
+                            max_value=10,
+                            value=3,
+                            step=1,
+                            key="past_exam_batch_limit",
+                        )
+
+                    filtered_past_exam_questions = list(past_exam_questions)
                     if past_exam_query:
                         query = past_exam_query.strip().lower()
-                        past_exam_questions = [
+                        filtered_past_exam_questions = [
                             question
-                            for question in past_exam_questions
+                            for question in filtered_past_exam_questions
                             if query in question.get("question_text", "").lower()
+                            or query in str(question.get("explanation") or "").lower()
+                        ]
+                    if past_exam_missing_only:
+                        filtered_past_exam_questions = [
+                            question
+                            for question in filtered_past_exam_questions
+                            if not str(question.get("explanation") or "").strip()
                         ]
 
+                    provider_for_explanation = (
+                        st.session_state.agent_provider if st.session_state.agent_available else None
+                    )
+                    explanation_available, explanation_reason = explanation_service.get_generation_availability(
+                        provider=provider_for_explanation
+                    )
+
+                    action_col1, action_col2 = st.columns([1, 1.2])
+                    with action_col1:
+                        if st.button(
+                            "🤖 批次補本卷缺詳解",
+                            width="stretch",
+                            key=f"past_exam_batch_generate_{selected_past_exam_id}",
+                            disabled=not explanation_available or not filtered_past_exam_questions,
+                        ):
+                            with st.spinner("正在生成並寫回考古題詳解..."):
+                                batch_result = explanation_service.generate_and_save_missing_explanations(
+                                    filtered_past_exam_questions,
+                                    provider=provider_for_explanation,
+                                    limit=int(past_exam_batch_limit),
+                                )
+                            for item in batch_result["generated"]:
+                                update_question_explanation_in_place(
+                                    past_exam_questions,
+                                    str(item.get("question_id") or ""),
+                                    str(item.get("explanation") or ""),
+                                )
+                                update_question_explanation_in_place(
+                                    filtered_past_exam_questions,
+                                    str(item.get("question_id") or ""),
+                                    str(item.get("explanation") or ""),
+                                )
+
+                            if batch_result["generated"]:
+                                st.success(f"已補寫並存檔 {len(batch_result['generated'])} 題詳解。")
+                            if batch_result["errors"]:
+                                st.warning(f"有 {len(batch_result['errors'])} 題補寫失敗，請查看 log 或稍後重試。")
+
+                            if past_exam_missing_only:
+                                filtered_past_exam_questions = [
+                                    question
+                                    for question in filtered_past_exam_questions
+                                    if not str(question.get("explanation") or "").strip()
+                                ]
+                    with action_col2:
+                        if explanation_available:
+                            st.caption(f"詳解生成可用：{explanation_reason}")
+                        else:
+                            st.warning(f"目前無法生成詳解：{explanation_reason}")
+
                     st.caption(
-                        f"{selected_past_exam['exam_name']}：顯示 {len(past_exam_questions)} / {selected_past_exam['total_questions']} 題"
+                        f"{selected_past_exam['exam_name']}：顯示 {len(filtered_past_exam_questions)} / "
+                        f"{selected_past_exam['total_questions']} 題"
                     )
                     st.dataframe(
                         [
@@ -4038,13 +3854,193 @@ exam_save_question 需要：
                                 ),
                                 "難度": question.get("difficulty", "medium"),
                                 "答案": question.get("correct_answer", "") or "-",
+                                "詳解": "已有" if str(question.get("explanation") or "").strip() else "待補",
                                 "頁碼": question.get("source_page") or "-",
                             }
-                            for question in past_exam_questions
+                            for question in filtered_past_exam_questions
                         ],
                         width="stretch",
                         hide_index=True,
                     )
+
+                    if not filtered_past_exam_questions:
+                        render_empty_state("目前沒有符合條件的歷屆題目", "試著放寬搜尋條件，或取消「只看缺詳解」。")
+                    else:
+                        selected_past_exam_question_id = st.selectbox(
+                            "檢視歷屆題目",
+                            options=[question["id"] for question in filtered_past_exam_questions],
+                            format_func=lambda question_id: next(
+                                (
+                                    f"第 {question['question_number']} 題｜{question.get('question_text', '')[:48]}"
+                                    for question in filtered_past_exam_questions
+                                    if question["id"] == question_id
+                                ),
+                                question_id,
+                            ),
+                            key=f"selected_past_exam_question_{selected_past_exam_id}",
+                        )
+                        selected_past_exam_question = next(
+                            (
+                                question
+                                for question in filtered_past_exam_questions
+                                if question["id"] == selected_past_exam_question_id
+                            ),
+                            filtered_past_exam_questions[0],
+                        )
+                        reference_matches = explanation_service.find_reference_matches(
+                            selected_past_exam_question,
+                            limit=5,
+                        )
+                        textbook_evidence = _resolve_textbook_evidence(
+                            explanation_service,
+                            selected_past_exam_question,
+                        )
+
+                        with st.container(border=True):
+                            st.markdown(
+                                f"### 第 {selected_past_exam_question.get('question_number', '-')} 題"
+                            )
+                            st.caption(
+                                f"{selected_past_exam_question.get('exam_year', '-')}"
+                                f"｜{selected_past_exam_question.get('exam_name', '考古題')}"
+                            )
+                            st.markdown(selected_past_exam_question.get("question_text", ""))
+                            render_past_exam_question_assets(selected_past_exam_question)
+
+                            st.markdown("**選項**")
+                            for option_index, option in enumerate(selected_past_exam_question.get("options", [])):
+                                st.markdown(f"- {chr(65 + option_index)}. {option}")
+
+                            meta_col1, meta_col2, meta_col3 = st.columns(3)
+                            with meta_col1:
+                                st.markdown(f"**答案:** {selected_past_exam_question.get('correct_answer', '-')}")
+                            with meta_col2:
+                                st.markdown(f"**難度:** {selected_past_exam_question.get('difficulty', 'medium')}")
+                            with meta_col3:
+                                st.markdown(
+                                    f"**主題:** {', '.join(selected_past_exam_question.get('topics', [])) or '-'}"
+                                )
+
+                            if selected_past_exam_question.get("explanation"):
+                                st.info(selected_past_exam_question["explanation"])
+                            else:
+                                st.warning("這題目前尚無詳解。")
+
+                            detail_col1, detail_col2 = st.columns([1, 1])
+                            with detail_col1:
+                                if st.button(
+                                    "🤖 產生並存入這題詳解",
+                                    width="stretch",
+                                    key=f"past_exam_generate_one_{selected_past_exam_question['id']}",
+                                    disabled=not explanation_available,
+                                ):
+                                    with st.spinner("正在生成這題詳解..."):
+                                        generated_result = explanation_service.generate_and_save_explanation(
+                                            selected_past_exam_question,
+                                            provider=provider_for_explanation,
+                                        )
+                                    textbook_evidence = generated_result.get("textbook_evidence") or textbook_evidence
+                                    update_question_explanation_in_place(
+                                        past_exam_questions,
+                                        str(selected_past_exam_question["id"]),
+                                        generated_result["explanation"],
+                                    )
+                                    update_question_explanation_in_place(
+                                        filtered_past_exam_questions,
+                                        str(selected_past_exam_question["id"]),
+                                        generated_result["explanation"],
+                                    )
+                                    selected_past_exam_question["explanation"] = generated_result["explanation"]
+                                    st.success("詳解已生成並寫回資料庫。")
+                            with detail_col2:
+                                if st.button(
+                                    "✍️ 練這份考卷",
+                                    width="stretch",
+                                    key=f"past_exam_practice_{selected_past_exam_id}",
+                                ):
+                                    queue_practice_session(
+                                        load_past_exam_question_pool([selected_past_exam_id]),
+                                        {
+                                            "source_type": PRACTICE_SOURCE_PAST_EXAM,
+                                            "label": "歷屆考卷",
+                                            "mode": "單份考卷",
+                                            "selected_exam_ids": [selected_past_exam_id],
+                                            "selected_exam_names": [selected_past_exam.get("exam_name", "考古題")],
+                                            "year_start": selected_past_exam.get("exam_year"),
+                                            "year_end": selected_past_exam.get("exam_year"),
+                                        },
+                                    )
+                                    navigate_to_without_query_sync("✍️ 作答練習")
+                                    st.rerun()
+
+                            with st.expander(f"🔎 題庫參考脈絡 ({len(reference_matches)})", expanded=False):
+                                if not reference_matches:
+                                    st.caption("目前沒有找到帶詳解的近似題，生成時會主要依題幹、選項與知識點推理。")
+                                else:
+                                    st.dataframe(
+                                        [
+                                            {
+                                                "來源": reference.get("label", ""),
+                                                "答案": reference.get("correct_answer", ""),
+                                                "主題": ", ".join(reference.get("topics", [])),
+                                                "相似度": f"{float(reference.get('score', 0.0)):.2f}",
+                                                "題目": _truncate_text(reference.get("question_text", ""), 72),
+                                                "詳解摘要": _truncate_text(reference.get("explanation", ""), 120),
+                                            }
+                                            for reference in reference_matches
+                                        ],
+                                        width="stretch",
+                                        hide_index=True,
+                                    )
+
+                            textbook_ready = bool(textbook_evidence.get("source_ready"))
+                            textbook_source = textbook_evidence.get("source") or {}
+                            textbook_locations = []
+                            for label, location in (
+                                ("題幹", textbook_source.get("stem_source")),
+                                ("答案", textbook_source.get("answer_source")),
+                            ):
+                                if location:
+                                    textbook_locations.append(
+                                        {
+                                            "定位": label,
+                                            "頁碼": location.get("page"),
+                                            "行號": f"L{location.get('line_start')}-{location.get('line_end')}",
+                                            "摘錄": _truncate_text(location.get("original_text", ""), 140),
+                                        }
+                                    )
+                            for index, location in enumerate(textbook_source.get("explanation_sources", []), start=1):
+                                textbook_locations.append(
+                                    {
+                                        "定位": f"詳解依據 {index}",
+                                        "頁碼": location.get("page"),
+                                        "行號": f"L{location.get('line_start')}-{location.get('line_end')}",
+                                        "摘錄": _truncate_text(location.get("original_text", ""), 140),
+                                    }
+                                )
+
+                            with st.expander(
+                                f"📚 教材定位 ({'已命中' if textbook_ready else '未命中'})",
+                                expanded=False,
+                            ):
+                                if textbook_ready:
+                                    st.markdown(
+                                        f"**教材:** {textbook_evidence.get('matched_doc_title', '-')}"
+                                    )
+                                    st.markdown(
+                                        f"**章節:** "
+                                        f"{textbook_source.get('chapter', '-')}"
+                                        f"｜{textbook_source.get('section', '-')}"
+                                    )
+                                    if textbook_locations:
+                                        st.dataframe(textbook_locations, width='stretch', hide_index=True)
+                                else:
+                                    st.caption("目前沒有命中可精確引用的教材 block；生成時會明確避免捏造教材定位。")
+                                    gate_reasons = textbook_evidence.get("gate_reasons", [])
+                                    if gate_reasons:
+                                        st.write("未命中原因：")
+                                        for reason in gate_reasons:
+                                            st.markdown(f"- {reason}")
 
             with tab_review:
                 st.caption("待審題目 = 一般題庫中尚未標記通過的題目。")
@@ -4054,6 +4050,10 @@ exam_save_question 需要：
                     st.dataframe(build_question_scan_rows(pending_questions), width="stretch", hide_index=True)
                     for i, question in enumerate(pending_questions, start=1):
                         render_question_review_expander(question, i, key_prefix="bank_pending")
+
+            with tab_drafts:
+                st.caption("待審草稿區會在這裡處理模板套用、QA、批次編修與正式入庫。")
+                render_draft_workspace(show_hero=False)
 
     elif page == "📋 出題需求":
         # ===== 出題需求 / 補題 backlog =====

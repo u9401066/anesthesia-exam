@@ -86,3 +86,33 @@ def test_save_question_accepts_complete_textbook_evidence_pack(monkeypatch) -> N
 
     assert result["success"] is True
     assert saved["called"] is True
+
+
+def test_save_question_rejects_image_based_payload_for_formal_bank(monkeypatch) -> None:
+    saved = {"called": False}
+
+    def fake_save(**_kwargs):
+        saved["called"] = True
+        return "question-1"
+
+    monkeypatch.setattr(exam_server, "repo", type("Repo", (), {"save": staticmethod(fake_save)})())
+
+    result = exam_server.save_question(
+        {
+            "question_text": "請判讀下列波形",
+            "options": ["A", "B", "C", "D"],
+            "correct_answer": "A",
+            "explanation": "Because.",
+            "pattern": "image_based",
+            "source_doc": "Miller Chapter 79",
+            "stem_source": {"page": 1, "line_start": 10, "line_end": 10, "original_text": "waveform stem"},
+            "answer_source": {"page": 1, "line_start": 11, "line_end": 11, "original_text": "waveform answer"},
+            "explanation_sources": [
+                {"page": 1, "line_start": 12, "line_end": 12, "original_text": "waveform explanation"}
+            ],
+        }
+    )
+
+    assert result["success"] is False
+    assert "image_based" in result["error"]
+    assert saved["called"] is False
