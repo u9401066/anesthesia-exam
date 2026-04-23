@@ -17,7 +17,9 @@
       "command": "uv",
       "args": ["--directory", "libs/asset-aware-mcp", "run", "python", "-m", "src.presentation.server"],
       "env": {
-        "DATA_DIR": "../../data"
+        "DATA_DIR": "../../data",
+        "ENABLE_LIGHTRAG": "false",
+        "ETL_PROFILE_JSON": "../../configs/asset-aware/miller_marker_hq.json"
       }
     }
   },

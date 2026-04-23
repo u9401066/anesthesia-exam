@@ -8,6 +8,7 @@
 - 📥 **PDF ETL 索引** - Web 直接觸發 `ingest_documents`，支援 `page_ranges`、大檔分塊與圖像擷取
 - 🧭 **正式 / preview 來源模式分流** - 缺少 Marker blocks 的文件會阻擋正式入庫，改走 preview 草稿
 - ✍️ **線上作答練習** - 從剛生成題組或既有題庫立即開始作答、批改與查看詳解
+- 🧠 **考古題詳解補寫** - 可在歷屆題庫頁搜尋缺詳解題，參考 repo 既有題庫脈絡後生成詳解並直接寫回 SQLite
 - 📚 **題庫治理** - 支援關鍵字 / 難度 / 主題 / 考試類型 / reviewed-only 篩選
 - 📋 **出題需求 backlog** - 使用者可提出補題需求，heartbeat 會把缺口寫成 `data/jobs/*.json`
 - 🤖 **多 Agent Provider** - Sidebar 可切換 `crush`、`opencode`、`copilot-sdk`
@@ -112,6 +113,7 @@ Streamlit 現在是 UI 包裝層，底層 Agent 可切換：
 - `crush`（預設）
 - `opencode`（CLI 模式）
 - `copilot-sdk`（HTTP API 模式）
+- `codex`（OpenAI API 模式，適合聊天頁 / 詳解生成 / 出題工作台）
 
 透過環境變數設定：
 
@@ -128,13 +130,21 @@ export EXAM_OPENCODE_COMMAND='opencode run "{prompt}"'
 # 可選：Copilot SDK API endpoint
 export EXAM_COPILOT_SDK_ENDPOINT='http://localhost:8080/generate'
 export EXAM_COPILOT_SDK_TOKEN='your-token'
+
+# 可選：Codex / OpenAI API
+export EXAM_AGENT_PROVIDER=codex
+export EXAM_OPENAI_API_KEY='sk-...'
+export EXAM_CODEX_MODEL='gpt-5.3-codex'
+# 若未設定，預設會用 https://api.openai.com/v1
+export EXAM_OPENAI_BASE_URL='https://api.openai.com/v1'
 ```
 
 說明：
 
 - `EXAM_AGENT_PROVIDER=opencode` 時，會呼叫 `EXAM_OPENCODE_COMMAND`。
 - `EXAM_AGENT_PROVIDER=copilot-sdk` 時，會 POST 到 `EXAM_COPILOT_SDK_ENDPOINT`。
-- Sidebar 可即時切換 provider，並顯示連線狀態。
+- `EXAM_AGENT_PROVIDER=codex` 時，聊天頁、考古題詳解生成、出題工作台會走 OpenAI API；ETL 仍不支援 Codex。
+- Sidebar 會顯示目前固定 provider 與連線狀態。
 
 ## Web 工作台頁面
 
@@ -142,7 +152,7 @@ export EXAM_COPILOT_SDK_TOKEN='your-token'
 
 - `📝 生成考題`：教材索引、出題設定、正式/preview 模式分流、生成後審閱
 - `✍️ 作答練習`：依難度 / 主題 / 題數抽題、提交後即時計分
-- `📚 題庫管理`：搜尋、篩選、審查與從篩選結果切換成練習
+- `📚 題庫管理`：搜尋、篩選、審查、從篩選結果切換成練習，並可對歷屆題目補寫詳解
 - `📋 出題需求`：提出補題需求、管理 backlog、觸發 heartbeat job emission
 - `📊 統計`：查看題庫規模、難度分布與高頻主題
 
@@ -160,9 +170,12 @@ export EXAM_COPILOT_SDK_TOKEN='your-token'
 
 前提：
 
-- Provider 需支援 MCP 工具呼叫（目前建議使用 `crush`）
+- Provider 需支援 MCP 工具呼叫（目前建議使用 `crush` 或 `opencode`；`codex` 不走這條）
 - `libs/asset-aware-mcp` 必須有可執行內容（目錄不可為空）
 - 若要做正式來源追蹤，請開啟 Marker 模式，讓文件保留 `blocks.json`
+- 若是 Miller 教材這類需要可靠 figure extraction 的教材，建議直接使用：
+  `uv run python scripts/ingest_miller_chapters.py --high-fidelity-marker ...`
+  這會強制走 strict Marker、載入 `configs/asset-aware/miller_marker_hq.json`，並避免靜默退回 PyMuPDF 圖像 fallback。
 
 ### Crush Agent 設定
 

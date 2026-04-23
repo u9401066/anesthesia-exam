@@ -5,6 +5,8 @@
 - crush: 本地 Crush CLI
 - opencode: OpenCode CLI + opencode.json（Ollama/自訂 LLM）
 - copilot-sdk: HTTP API（由 EXAM_COPILOT_SDK_ENDPOINT 指定）
+- codex: OpenAI API（Codex / GPT-5 family）
+- openclaw: Repo-local OpenClaw CLI + OpenAI-compatible custom models
 """
 
 from __future__ import annotations
@@ -23,6 +25,229 @@ from urllib.error import HTTPError, URLError
 from src.infrastructure.logging import get_logger
 
 logger = get_logger(__name__)
+
+
+def _dedupe_strings(values: list[str]) -> list[str]:
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        normalized = str(value or "").strip()
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        deduped.append(normalized)
+    return deduped
+
+
+def collect_opencode_available_models(config: dict) -> list[str]:
+    """Return all provider/model refs from an OpenCode config."""
+    available_models: list[str] = []
+    providers = config.get("provider", {}) or {}
+
+    for provider_id, provider_cfg in providers.items():
+        raw_models = (provider_cfg or {}).get("models") or {}
+        if isinstance(raw_models, dict):
+            items = raw_models.items()
+        elif isinstance(raw_models, list):
+            items = [
+                (str(model.get("id") or "").strip(), model)
+                for model in raw_models
+                if isinstance(model, dict)
+            ]
+        else:
+            items = []
+
+        for model_id, _model_cfg in items:
+            model_id = str(model_id or "").strip()
+            if not model_id:
+                continue
+            available_models.append(f"{provider_id}/{model_id}")
+
+    return _dedupe_strings(available_models)
+
+
+def resolve_opencode_default_model(config: dict) -> str | None:
+    """Resolve the top-level default model or fall back to the first configured one."""
+    explicit_model = str(config.get("model") or "").strip()
+    if explicit_model:
+        return explicit_model
+
+    available_models = collect_opencode_available_models(config)
+    return available_models[0] if available_models else None
+
+
+def collect_openclaw_available_models(config: dict) -> list[str]:
+    """Return all provider/model refs from an OpenClaw config."""
+    available_models: list[str] = []
+    model_config = config.get("models") or {}
+    providers = model_config.get("providers") or {}
+
+    for provider_id, provider_cfg in providers.items():
+        raw_models = (provider_cfg or {}).get("models") or {}
+        if isinstance(raw_models, dict):
+            items = raw_models.items()
+        elif isinstance(raw_models, list):
+            items = [
+                (str(model.get("id") or "").strip(), model)
+                for model in raw_models
+                if isinstance(model, dict)
+            ]
+        else:
+            items = []
+
+        for model_id, _model_cfg in items:
+            model_id = str(model_id or "").strip()
+            if not model_id:
+                continue
+            available_models.append(f"{provider_id}/{model_id}")
+
+    return _dedupe_strings(available_models)
+
+
+def resolve_openclaw_default_model(config: dict) -> str | None:
+    """Resolve the OpenClaw primary model or fall back to the first configured one."""
+    agents = config.get("agents") or {}
+    defaults = agents.get("defaults") or {}
+    default_model = defaults.get("model") or {}
+    if isinstance(default_model, dict):
+        primary_model = str(default_model.get("primary") or "").strip()
+        if primary_model:
+            return primary_model
+
+    available_models = collect_openclaw_available_models(config)
+    return available_models[0] if available_models else None
+
+
+def extract_openclaw_text(payload: dict) -> str:
+    """Extract model text from an OpenClaw JSON response."""
+    outputs = payload.get("outputs") or []
+    parts: list[str] = []
+
+    for output in outputs:
+        if not isinstance(output, dict):
+            continue
+        text = output.get("text")
+        if isinstance(text, str) and text.strip():
+            parts.append(text.strip())
+
+    if parts:
+        return "\n\n".join(parts).strip()
+
+    fallback_text = payload.get("text")
+    if isinstance(fallback_text, str):
+        return fallback_text.strip()
+
+    return ""
+
+
+def extract_last_json_object(raw_text: str) -> dict | None:
+    """Extract the last JSON object from mixed stdout/stderr text."""
+    decoder = json.JSONDecoder()
+    index = 0
+    last_object: dict | None = None
+
+    while index < len(raw_text):
+        start = raw_text.find("{", index)
+        if start < 0:
+            break
+        try:
+            payload, end = decoder.raw_decode(raw_text[start:])
+        except json.JSONDecodeError:
+            index = start + 1
+            continue
+
+        if isinstance(payload, dict):
+            last_object = payload
+        index = start + max(end, 1)
+
+    return last_object
+
+
+def extract_openai_text_content(payload: object) -> str:
+    """Extract text from string or structured OpenAI content arrays."""
+    if isinstance(payload, str):
+        return payload
+
+    if not isinstance(payload, list):
+        return ""
+
+    parts: list[str] = []
+    for item in payload:
+        if isinstance(item, str):
+            parts.append(item)
+            continue
+        if not isinstance(item, dict):
+            continue
+        part_type = str(item.get("type") or "").strip().lower()
+        if part_type in {"text", "output_text", "input_text"}:
+            text = item.get("text")
+            if isinstance(text, str) and text:
+                parts.append(text)
+    return "".join(parts)
+
+
+def extract_responses_api_text(payload: dict) -> str:
+    """Extract assistant text from a Responses API payload."""
+    output_text = payload.get("output_text")
+    if isinstance(output_text, str) and output_text.strip():
+        return output_text
+
+    parts: list[str] = []
+    for item in payload.get("output") or []:
+        if not isinstance(item, dict):
+            continue
+        item_type = str(item.get("type") or "").strip().lower()
+        if item_type == "message":
+            text = extract_openai_text_content(item.get("content"))
+            if text:
+                parts.append(text)
+            continue
+        if item_type in {"output_text", "text"}:
+            text = item.get("text")
+            if isinstance(text, str) and text:
+                parts.append(text)
+    return "".join(parts).strip()
+
+
+def extract_chat_completion_text(payload: dict) -> str:
+    """Extract assistant text from a Chat Completions payload."""
+    choices = payload.get("choices") or []
+    if not choices:
+        return ""
+
+    first_choice = choices[0] or {}
+    message = first_choice.get("message") or {}
+    content = message.get("content")
+    text = extract_openai_text_content(content)
+    if text:
+        return text
+    if isinstance(content, str):
+        return content
+    return str(message.get("reasoning_content") or "")
+
+
+def iter_sse_data_messages(response) -> Iterator[str]:
+    """Yield complete SSE data payloads from a streaming HTTP response."""
+    data_lines: list[str] = []
+
+    for raw_line in response:
+        if isinstance(raw_line, bytes):
+            line = raw_line.decode("utf-8", errors="replace")
+        else:
+            line = str(raw_line)
+        stripped = line.rstrip("\r\n")
+
+        if not stripped:
+            if data_lines:
+                yield "\n".join(data_lines)
+                data_lines = []
+            continue
+
+        if stripped.startswith("data:"):
+            data_lines.append(stripped[5:].lstrip())
+
+    if data_lines:
+        yield "\n".join(data_lines)
 
 
 class IAgentProvider(Protocol):
@@ -51,6 +276,14 @@ class AgentProviderConfig:
     opencode_model: Optional[str] = None
     copilot_sdk_endpoint: Optional[str] = None
     copilot_sdk_token: Optional[str] = None
+    codex_model: Optional[str] = None
+    openclaw_executable: Optional[str] = None
+    openclaw_model: Optional[str] = None
+    openclaw_config_path: Optional[Path] = None
+    openai_base_url: Optional[str] = None
+    openai_api_key: Optional[str] = None
+    openai_organization: Optional[str] = None
+    openai_project: Optional[str] = None
 
     @classmethod
     def load(
@@ -63,8 +296,8 @@ class AgentProviderConfig:
         provider = (provider_override or os.getenv("EXAM_AGENT_PROVIDER", "crush")).strip().lower()
         timeout = int(os.getenv("EXAM_AGENT_TIMEOUT", "120"))
 
-        model = None
-        if crush_config_path.exists():
+        model = (model_override or os.getenv("EXAM_AGENT_MODEL") or "").strip() or None
+        if model is None and crush_config_path.exists():
             try:
                 with open(crush_config_path, "r", encoding="utf-8") as f:
                     data = json.load(f)
@@ -88,9 +321,55 @@ class AgentProviderConfig:
                 try:
                     with open(opencode_json, "r", encoding="utf-8") as f:
                         oc_data = json.load(f)
-                    opencode_model = oc_data.get("model")
+                    opencode_model = resolve_opencode_default_model(oc_data)
                 except Exception:
                     pass
+
+        default_openclaw_config_path = project_dir / "vendor" / "openclaw-state" / "openclaw.json"
+        openclaw_config_path = (
+            os.getenv("EXAM_OPENCLAW_CONFIG_PATH")
+            or os.getenv("OPENCLAW_CONFIG_PATH")
+            or str(default_openclaw_config_path)
+        ).strip()
+        openclaw_executable = (
+            os.getenv("EXAM_OPENCLAW_PATH")
+            or str(project_dir / "scripts" / "openclaw.sh")
+        ).strip()
+        openclaw_model = (
+            model_override
+            or os.getenv("EXAM_OPENCLAW_MODEL")
+            or os.getenv("EXAM_AGENT_MODEL")
+            or ""
+        ).strip()
+        if not openclaw_model:
+            try:
+                openclaw_path = Path(openclaw_config_path)
+                if openclaw_path.exists():
+                    with open(openclaw_path, "r", encoding="utf-8") as f:
+                        openclaw_data = json.load(f)
+                    openclaw_model = resolve_openclaw_default_model(openclaw_data) or ""
+            except Exception:
+                pass
+
+        codex_model = (
+            model_override
+            or os.getenv("EXAM_CODEX_MODEL")
+            or os.getenv("EXAM_OPENAI_MODEL")
+            or os.getenv("EXAM_AGENT_MODEL")
+            or "gpt-5.3-codex"
+        ).strip()
+        openai_base_url = (
+            os.getenv("EXAM_OPENAI_BASE_URL")
+            or os.getenv("OPENAI_BASE_URL")
+            or "https://api.openai.com/v1"
+        ).strip()
+        openai_api_key = (os.getenv("EXAM_OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY") or "").strip()
+        openai_organization = (
+            os.getenv("EXAM_OPENAI_ORGANIZATION")
+            or os.getenv("OPENAI_ORGANIZATION")
+            or ""
+        ).strip()
+        openai_project = (os.getenv("EXAM_OPENAI_PROJECT") or os.getenv("OPENAI_PROJECT") or "").strip()
 
         return cls(
             provider=provider,
@@ -102,6 +381,14 @@ class AgentProviderConfig:
             opencode_model=opencode_model,
             copilot_sdk_endpoint=os.getenv("EXAM_COPILOT_SDK_ENDPOINT"),
             copilot_sdk_token=os.getenv("EXAM_COPILOT_SDK_TOKEN"),
+            codex_model=codex_model or None,
+            openclaw_executable=openclaw_executable or None,
+            openclaw_model=openclaw_model or None,
+            openclaw_config_path=Path(openclaw_config_path) if openclaw_config_path else None,
+            openai_base_url=openai_base_url or None,
+            openai_api_key=openai_api_key or None,
+            openai_organization=openai_organization or None,
+            openai_project=openai_project or None,
         )
 
 
@@ -356,6 +643,279 @@ class CopilotSdkAgentProvider:
         yield self._call_api(prompt)
 
 
+class CodexAgentProvider:
+    """OpenAI API provider for Codex / GPT-5 family models."""
+
+    name = "codex"
+    DEFAULT_BASE_URL = "https://api.openai.com/v1"
+    DEFAULT_MODEL = "gpt-5.3-codex"
+
+    def __init__(self, config: AgentProviderConfig):
+        self.config = config
+
+    def _get_model(self) -> str:
+        return (
+            self.config.codex_model
+            or self.config.model
+            or self.DEFAULT_MODEL
+        )
+
+    def _get_base_url(self) -> str:
+        return (self.config.openai_base_url or self.DEFAULT_BASE_URL).rstrip("/")
+
+    def _build_headers(self) -> dict[str, str]:
+        headers = {
+            "Content-Type": "application/json",
+        }
+        if self.config.openai_api_key:
+            headers["Authorization"] = f"Bearer {self.config.openai_api_key}"
+        if self.config.openai_organization:
+            headers["OpenAI-Organization"] = self.config.openai_organization
+        if self.config.openai_project:
+            headers["OpenAI-Project"] = self.config.openai_project
+        return headers
+
+    def _open(self, url: str, payload: dict | None = None):
+        data = None
+        method = "GET"
+        if payload is not None:
+            data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            method = "POST"
+        req = request.Request(url, data=data, headers=self._build_headers(), method=method)
+        return request.urlopen(req, timeout=self.config.timeout)
+
+    def _run_via_responses(self, prompt: str) -> str:
+        payload = {
+            "model": self._get_model(),
+            "input": prompt,
+        }
+        with self._open(f"{self._get_base_url()}/responses", payload) as response:
+            raw = response.read().decode("utf-8", errors="replace")
+        data = json.loads(raw)
+        return extract_responses_api_text(data).strip()
+
+    def _run_via_chat_completions(self, prompt: str) -> str:
+        payload = {
+            "model": self._get_model(),
+            "messages": [
+                {"role": "user", "content": prompt},
+            ],
+        }
+        with self._open(f"{self._get_base_url()}/chat/completions", payload) as response:
+            raw = response.read().decode("utf-8", errors="replace")
+        data = json.loads(raw)
+        return extract_chat_completion_text(data).strip()
+
+    def _stream_via_responses(self, prompt: str) -> Iterator[str]:
+        payload = {
+            "model": self._get_model(),
+            "input": prompt,
+            "stream": True,
+        }
+        with self._open(f"{self._get_base_url()}/responses", payload) as response:
+            for message in iter_sse_data_messages(response):
+                if message == "[DONE]":
+                    return
+                event = json.loads(message)
+                event_type = str(event.get("type") or "").strip()
+                if event_type == "response.output_text.delta":
+                    delta = str(event.get("delta") or "")
+                    if delta:
+                        yield delta
+                elif event_type == "error":
+                    raise RuntimeError(str(event.get("message") or "Codex Responses stream error"))
+
+    def _stream_via_chat_completions(self, prompt: str) -> Iterator[str]:
+        payload = {
+            "model": self._get_model(),
+            "messages": [
+                {"role": "user", "content": prompt},
+            ],
+            "stream": True,
+        }
+        with self._open(f"{self._get_base_url()}/chat/completions", payload) as response:
+            for message in iter_sse_data_messages(response):
+                if message == "[DONE]":
+                    return
+                event = json.loads(message)
+                choices = event.get("choices") or []
+                if not choices:
+                    continue
+                delta = choices[0].get("delta") or {}
+                content = delta.get("content")
+                if isinstance(content, str) and content:
+                    yield content
+                    continue
+                structured = extract_openai_text_content(content)
+                if structured:
+                    yield structured
+
+    def is_available(self) -> tuple[bool, str]:
+        if not self.config.openai_api_key:
+            return False, "未設定 EXAM_OPENAI_API_KEY / OPENAI_API_KEY"
+
+        model = self._get_model()
+        try:
+            with self._open(f"{self._get_base_url()}/models") as response:
+                if getattr(response, "status", 200) < 400:
+                    return True, f"可用, model={model}"
+            return False, "OpenAI API 狀態檢查失敗"
+        except HTTPError as e:
+            if e.code in {401, 403}:
+                return False, f"OpenAI 驗證失敗（HTTP {e.code}）"
+            return False, f"OpenAI API HTTP 錯誤：{e.code}"
+        except URLError as e:
+            return False, f"OpenAI API 連線失敗：{e.reason}"
+        except Exception as e:  # noqa: BLE001
+            return False, f"Codex 檢查失敗：{e}"
+
+    def run(self, prompt: str) -> str:
+        log = logger.bind(provider="codex", model=self._get_model())
+        log.info("agent_run_start", prompt_len=len(prompt))
+        t0 = time.monotonic()
+
+        last_error: Exception | None = None
+        for runner in (self._run_via_responses, self._run_via_chat_completions):
+            try:
+                output = runner(prompt).strip()
+                elapsed_ms = int((time.monotonic() - t0) * 1000)
+                if output:
+                    log.info("agent_run_done", duration_ms=elapsed_ms, output_len=len(output))
+                    return output
+                last_error = RuntimeError("Codex 回傳空內容")
+            except Exception as exc:  # noqa: BLE001
+                last_error = exc
+                log.warning("codex_run_candidate_failed", error=str(exc))
+
+        elapsed_ms = int((time.monotonic() - t0) * 1000)
+        log.error("agent_run_error", duration_ms=elapsed_ms, error=str(last_error))
+        raise RuntimeError(f"Codex 執行失敗：{last_error}")
+
+    def stream(self, prompt: str) -> Iterator[str]:
+        log = logger.bind(provider="codex", model=self._get_model())
+        log.info("agent_stream_start", prompt_len=len(prompt))
+        t0 = time.monotonic()
+        total_chars = 0
+        last_error: Exception | None = None
+
+        for streamer in (self._stream_via_responses, self._stream_via_chat_completions):
+            emitted = False
+            try:
+                for chunk in streamer(prompt):
+                    if not chunk:
+                        continue
+                    emitted = True
+                    total_chars += len(chunk)
+                    yield chunk
+                elapsed_ms = int((time.monotonic() - t0) * 1000)
+                log.info("agent_stream_done", duration_ms=elapsed_ms, total_chars=total_chars)
+                return
+            except Exception as exc:  # noqa: BLE001
+                last_error = exc
+                if emitted:
+                    elapsed_ms = int((time.monotonic() - t0) * 1000)
+                    log.error("agent_stream_error", duration_ms=elapsed_ms, error=str(exc))
+                    raise RuntimeError(f"Codex 串流失敗：{exc}") from exc
+                log.warning("codex_stream_candidate_failed", error=str(exc))
+
+        elapsed_ms = int((time.monotonic() - t0) * 1000)
+        log.error("agent_stream_error", duration_ms=elapsed_ms, error=str(last_error))
+        raise RuntimeError(f"Codex 串流失敗：{last_error}")
+
+
+class OpenClawAgentProvider:
+    """Repo-local OpenClaw CLI provider."""
+
+    name = "openclaw"
+    DEFAULT_MODEL = "gb10/Qwen3.5-122B-A10B-Q5_K_M-00001-of-00003.gguf"
+
+    def __init__(self, config: AgentProviderConfig):
+        self.config = config
+
+    def _get_executable(self) -> str:
+        return self.config.openclaw_executable or "openclaw"
+
+    def _get_model(self) -> str:
+        return self.config.openclaw_model or self.config.model or self.DEFAULT_MODEL
+
+    def _build_command(self, prompt: str) -> list[str]:
+        return [
+            self._get_executable(),
+            "infer",
+            "model",
+            "run",
+            "--local",
+            "--model",
+            self._get_model(),
+            "--prompt",
+            prompt,
+            "--json",
+        ]
+
+    def _run_cli(self, args: list[str], *, timeout: int) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            args,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            cwd=str(self.config.working_dir),
+            encoding="utf-8",
+            errors="replace",
+        )
+
+    def is_available(self) -> tuple[bool, str]:
+        exe = self._get_executable()
+        if shutil.which(exe) is None and not Path(exe).exists():
+            return False, f"找不到 OpenClaw：{exe}"
+
+        try:
+            result = self._run_cli([exe, "models", "status", "--plain"], timeout=10)
+        except Exception as e:  # noqa: BLE001
+            return False, f"OpenClaw 檢查失敗：{e}"
+
+        if result.returncode != 0:
+            reason = (result.stderr or result.stdout or "OpenClaw 狀態檢查失敗").strip()
+            return False, reason
+
+        current_model = ""
+        for line in (result.stdout or "").splitlines():
+            if line.strip():
+                current_model = line.strip()
+        return True, f"可用, model={current_model or self._get_model()}"
+
+    def run(self, prompt: str) -> str:
+        log = logger.bind(provider="openclaw", model=self._get_model())
+        log.info("agent_run_start", prompt_len=len(prompt))
+        t0 = time.monotonic()
+        result = self._run_cli(self._build_command(prompt), timeout=self.config.timeout)
+        elapsed_ms = int((time.monotonic() - t0) * 1000)
+        combined_output = "\n".join(part for part in [result.stdout, result.stderr] if part).strip()
+
+        if result.returncode != 0:
+            log.error("agent_run_error", returncode=result.returncode, duration_ms=elapsed_ms)
+            raise RuntimeError(combined_output or "OpenClaw 執行失敗")
+
+        payload = extract_last_json_object(combined_output)
+        if isinstance(payload, dict):
+            if payload.get("ok") is False:
+                raise RuntimeError(str(payload.get("error") or combined_output or "OpenClaw 執行失敗"))
+            text = extract_openclaw_text(payload)
+            if text:
+                log.info("agent_run_done", duration_ms=elapsed_ms, output_len=len(text))
+                return text
+
+        cleaned_output = combined_output.strip()
+        if cleaned_output:
+            log.info("agent_run_done", duration_ms=elapsed_ms, output_len=len(cleaned_output))
+            return cleaned_output
+
+        log.error("agent_run_error", duration_ms=elapsed_ms, error="OpenClaw 回傳空內容")
+        raise RuntimeError("OpenClaw 回傳空內容")
+
+    def stream(self, prompt: str) -> Iterator[str]:
+        yield self.run(prompt)
+
+
 def create_agent_provider(config: AgentProviderConfig) -> IAgentProvider:
     provider = config.provider.strip().lower()
 
@@ -365,5 +925,9 @@ def create_agent_provider(config: AgentProviderConfig) -> IAgentProvider:
         return OpenCodeAgentProvider(config)
     if provider == "copilot-sdk":
         return CopilotSdkAgentProvider(config)
+    if provider == "codex":
+        return CodexAgentProvider(config)
+    if provider == "openclaw":
+        return OpenClawAgentProvider(config)
 
     raise ValueError(f"不支援的 provider: {config.provider}")
