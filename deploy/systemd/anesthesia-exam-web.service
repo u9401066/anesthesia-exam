@@ -5,12 +5,13 @@ After=network-online.target
 
 [Service]
 Type=simple
-User=root
-Group=root
-WorkingDirectory=/root/workspace260209/anesthesia-exam
+User=__RUN_USER__
+Group=__RUN_GROUP__
+WorkingDirectory=__PROJECT_DIR__
 Environment=PYTHONUNBUFFERED=1
-Environment=EXAM_AGENT_PROVIDER=crush
-ExecStart=/root/workspace260209/anesthesia-exam/scripts/run_web.sh
+Environment=EXAM_AGENT_PROVIDER=opencode
+Environment=EXAM_OPENCODE_MODEL=gb10/Qwen3.5-122B-A10B-Q5_K_M-00001-of-00003.gguf
+ExecStart=/usr/bin/env bash __PROJECT_DIR__/scripts/run_web.sh
 Restart=on-failure
 RestartSec=5
 TimeoutStopSec=20

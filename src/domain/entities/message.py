@@ -5,7 +5,7 @@ from datetime import datetime
 from enum import Enum
 from typing import Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class MessageRole(str, Enum):
@@ -19,6 +19,8 @@ class MessageRole(str, Enum):
 class Message(BaseModel):
     """對話訊息實體"""
 
+    model_config = ConfigDict(frozen=True)
+
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     role: MessageRole
     content: str
@@ -27,6 +29,3 @@ class Message(BaseModel):
     # 可選的元數據
     model: Optional[str] = None
     tokens_used: Optional[int] = None
-
-    class Config:
-        frozen = True  # Immutable

@@ -20,10 +20,12 @@ from pathlib import Path
 from typing import Optional
 
 from src.domain.entities.scope_request import ScopeRequestStatus
+from src.infrastructure.logging import get_logger
 from src.infrastructure.persistence.sqlite_question_repo import get_question_repository
 from src.infrastructure.persistence.sqlite_scope_request_repo import get_scope_request_repository
 
 PROJECT_DIR = Path(__file__).resolve().parents[3]
+logger = get_logger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -119,6 +121,7 @@ class HeartbeatService:
         self.scope_repo = get_scope_request_repository()
         self.jobs_dir = jobs_dir or (PROJECT_DIR / "data" / "jobs")
         self.jobs_dir.mkdir(parents=True, exist_ok=True)
+        logger.debug("heartbeat_service_initialized", jobs_dir=str(self.jobs_dir))
 
     # ------------------------------------------------------------------
     # 分析
@@ -126,6 +129,7 @@ class HeartbeatService:
 
     def analyze_coverage_gaps(self) -> list[CoverageGap]:
         """分析題庫覆蓋率缺口（合併 scope requests + 題庫統計）"""
+        logger.debug("heartbeat_analyze_start")
         gaps: list[CoverageGap] = []
 
         # 1. 從 scope requests 找缺口
@@ -164,6 +168,12 @@ class HeartbeatService:
 
         # 按缺口大小排序
         gaps.sort(key=lambda g: g.deficit, reverse=True)
+        logger.info(
+            "heartbeat_analyze_complete",
+            pending_request_count=len(pending),
+            auto_gap_count=sum(1 for gap in gaps if gap.source_request_id is None),
+            total_gap_count=len(gaps),
+        )
         return gaps
 
     # ------------------------------------------------------------------
@@ -172,6 +182,14 @@ class HeartbeatService:
 
     def build_generation_prompt(self, gap: CoverageGap) -> str:
         """根據缺口建立出題 prompt"""
+        logger.debug(
+            "heartbeat_prompt_build",
+            topic=gap.topic,
+            deficit=gap.deficit,
+            difficulty=gap.difficulty,
+            exam_track=gap.exam_track,
+            source_request_id=gap.source_request_id,
+        )
         parts = [
             f"請針對以下主題產生 {gap.deficit} 題選擇題：",
             f"- 主題：{gap.topic}",
@@ -226,6 +244,14 @@ class HeartbeatService:
             json.dumps(job.to_dict(), ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
+        logger.info(
+            "heartbeat_job_written",
+            job_id=job_id,
+            topic=gap.topic,
+            deficit=gap.deficit,
+            source_request_id=gap.source_request_id,
+            job_path=str(job.path),
+        )
         return job
 
     def list_jobs(self, status: Optional[str] = None) -> list[dict]:
@@ -239,6 +265,7 @@ class HeartbeatService:
                     jobs.append(data)
             except (json.JSONDecodeError, OSError):
                 continue
+        logger.debug("heartbeat_jobs_loaded", status=status, job_count=len(jobs))
         return jobs
 
     def mark_job_done(self, job_path: str | Path, questions_generated: int = 0) -> None:
@@ -254,6 +281,13 @@ class HeartbeatService:
         req_id = data.get("source_request_id")
         if req_id and questions_generated > 0:
             self.scope_repo.increment_fulfilled(req_id, questions_generated)
+        logger.info(
+            "heartbeat_job_marked_done",
+            job_id=data.get("job_id"),
+            topic=data.get("topic"),
+            source_request_id=req_id,
+            questions_generated=questions_generated,
+        )
 
     def mark_job_error(self, job_path: str | Path, error_msg: str) -> None:
         """標記 job 失敗"""
@@ -263,6 +297,13 @@ class HeartbeatService:
         data["error"] = error_msg
         data["failed_at"] = datetime.now().isoformat()
         p.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        logger.info(
+            "heartbeat_job_marked_error",
+            job_id=data.get("job_id"),
+            topic=data.get("topic"),
+            source_request_id=data.get("source_request_id"),
+            error_message=error_msg,
+        )
 
     # ------------------------------------------------------------------
     # 主流程
@@ -283,6 +324,7 @@ class HeartbeatService:
         Returns:
             HeartbeatResult
         """
+        logger.info("heartbeat_run_start", max_requests=max_requests, dry_run=dry_run)
         errors: list[str] = []
         job_paths: list[str] = []
         skipped = 0
@@ -290,13 +332,15 @@ class HeartbeatService:
         gaps = self.analyze_coverage_gaps()
 
         if dry_run:
-            return HeartbeatResult(
+            result = HeartbeatResult(
                 timestamp=datetime.now().isoformat(),
                 gaps_found=len(gaps),
                 jobs_written=0,
                 skipped=len(gaps),
                 errors=["dry_run=True, 未實際寫入 job 檔案"],
             )
+            logger.info("heartbeat_run_complete", gaps_found=len(gaps), jobs_written=0, skipped=len(gaps), dry_run=True)
+            return result
 
         # 檢查是否已有相同 topic 的 pending job，避免重複
         existing_pending = {j["topic"] for j in self.list_jobs(status="pending")}
@@ -318,9 +362,16 @@ class HeartbeatService:
                 job_paths.append(str(job.path))
 
             except Exception as e:
+                logger.exception(
+                    "heartbeat_job_write_failed",
+                    topic=gap.topic,
+                    deficit=gap.deficit,
+                    source_request_id=gap.source_request_id,
+                    error=str(e),
+                )
                 errors.append(f"Gap '{gap.topic}': {e}")
 
-        return HeartbeatResult(
+        result = HeartbeatResult(
             timestamp=datetime.now().isoformat(),
             gaps_found=len(gaps),
             jobs_written=len(job_paths),
@@ -328,6 +379,15 @@ class HeartbeatService:
             skipped=skipped,
             errors=errors,
         )
+        logger.info(
+            "heartbeat_run_complete",
+            gaps_found=len(gaps),
+            jobs_written=len(job_paths),
+            skipped=skipped,
+            error_count=len(errors),
+            dry_run=False,
+        )
+        return result
 
     # ------------------------------------------------------------------
     # 狀態摘要
@@ -343,7 +403,7 @@ class HeartbeatService:
         done_jobs = self.list_jobs(status="done")
         error_jobs = self.list_jobs(status="error")
 
-        return {
+        summary = {
             "coverage_gaps": len(gaps),
             "top_gaps": [{"topic": g.topic, "deficit": g.deficit, "difficulty": g.difficulty} for g in gaps[:5]],
             "jobs": {
@@ -357,3 +417,11 @@ class HeartbeatService:
                 "validated": question_stats["validated"],
             },
         }
+        logger.debug(
+            "heartbeat_status_summary_loaded",
+            coverage_gaps=summary["coverage_gaps"],
+            pending_jobs=summary["jobs"]["pending"],
+            done_jobs=summary["jobs"]["done"],
+            error_jobs=summary["jobs"]["error"],
+        )
+        return summary

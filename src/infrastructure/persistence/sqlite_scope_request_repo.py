@@ -8,7 +8,7 @@ from typing import Optional
 
 from src.domain.entities.scope_request import ScopeRequest, ScopeRequestStatus
 from src.domain.repositories.scope_request_repository import IScopeRequestRepository
-from src.infrastructure.persistence.database import get_connection, init_database
+from src.infrastructure.persistence.database import begin_immediate_transaction, get_connection, init_database
 
 
 class SQLiteScopeRequestRepository(IScopeRequestRepository):
@@ -20,6 +20,7 @@ class SQLiteScopeRequestRepository(IScopeRequestRepository):
 
     def save(self, request: ScopeRequest) -> str:
         with get_connection(self.db_path) as conn:
+            begin_immediate_transaction(conn)
             cursor = conn.cursor()
             now = datetime.now().isoformat()
 
@@ -106,6 +107,7 @@ class SQLiteScopeRequestRepository(IScopeRequestRepository):
         admin_notes: Optional[str] = None,
     ) -> bool:
         with get_connection(self.db_path) as conn:
+            begin_immediate_transaction(conn)
             cursor = conn.cursor()
             now = datetime.now().isoformat()
 
@@ -137,6 +139,7 @@ class SQLiteScopeRequestRepository(IScopeRequestRepository):
 
     def increment_fulfilled(self, request_id: str, count: int = 1) -> bool:
         with get_connection(self.db_path) as conn:
+            begin_immediate_transaction(conn)
             cursor = conn.cursor()
             now = datetime.now().isoformat()
 

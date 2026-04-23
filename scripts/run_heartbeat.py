@@ -36,6 +36,9 @@ if str(PROJECT_DIR) not in sys.path:
     sys.path.insert(0, str(PROJECT_DIR))
 
 from src.application.services.heartbeat_service import HeartbeatService
+from src.infrastructure.logging import bootstrap_logging, get_logger, new_run_id
+
+logger = get_logger(__name__)
 
 
 def main():
@@ -50,18 +53,36 @@ def main():
     parser.add_argument("--error", metavar="JOB_PATH", help="標記某 job 失敗")
     parser.add_argument("--error-msg", default="unknown error", help="失敗訊息（搭配 --error）")
     args = parser.parse_args()
+    run_id = new_run_id("heartbeat")
+    bootstrap_logging(__name__, extra_context={"run_id": run_id, "provider": "heartbeat-cli"})
+    logger.info(
+        "heartbeat_cli_start",
+        dry_run=args.dry_run,
+        status=args.status,
+        list_jobs=args.list_jobs,
+        max_requests=args.max_requests,
+    )
 
     service = HeartbeatService()
 
     # --- 狀態摘要 ---
     if args.status:
         summary = service.get_status_summary()
+        logger.info(
+            "heartbeat_status_loaded",
+            coverage_gaps=summary.get("coverage_gaps"),
+            pending_jobs=(summary.get("jobs") or {}).get("pending"),
+            done_jobs=(summary.get("jobs") or {}).get("done"),
+            error_jobs=(summary.get("jobs") or {}).get("error"),
+            total_questions=(summary.get("question_stats") or {}).get("total"),
+        )
         print(json.dumps(summary, ensure_ascii=False, indent=2))
         return
 
     # --- 列出 jobs ---
     if args.list_jobs:
         jobs = service.list_jobs(status=args.job_status)
+        logger.info("heartbeat_jobs_listed", status=args.job_status, job_count=len(jobs))
         if not jobs:
             print("（沒有符合條件的 job）")
             return
@@ -74,18 +95,27 @@ def main():
     # --- 標記完成 ---
     if args.complete:
         service.mark_job_done(args.complete, questions_generated=args.generated)
+        logger.info("heartbeat_job_completed", job_path=args.complete, generated=args.generated)
         print(f"✅ 已標記完成：{args.complete}（生成 {args.generated} 題）")
         return
 
     # --- 標記失敗 ---
     if args.error:
         service.mark_job_error(args.error, args.error_msg)
+        logger.info("heartbeat_job_failed", job_path=args.error, error_message=args.error_msg)
         print(f"❌ 已標記失敗：{args.error}")
         return
 
     # --- 主流程：掃描缺口 → 寫 job 檔 ---
     result = service.run_heartbeat(
         max_requests=args.max_requests,
+        dry_run=args.dry_run,
+    )
+    logger.info(
+        "heartbeat_run_completed",
+        requested=result.requested_count,
+        generated_jobs=len(result.job_paths),
+        error_count=len(result.errors),
         dry_run=args.dry_run,
     )
 

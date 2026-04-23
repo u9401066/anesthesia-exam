@@ -19,7 +19,7 @@ from src.domain.entities.question_draft import (
     classify_source_confidence,
 )
 from src.domain.repositories.question_draft_repository import IQuestionDraftRepository
-from src.infrastructure.persistence.database import get_connection, init_database
+from src.infrastructure.persistence.database import begin_immediate_transaction, get_connection, init_database
 
 
 class SQLiteQuestionDraftRepository(IQuestionDraftRepository):
@@ -37,7 +37,7 @@ class SQLiteQuestionDraftRepository(IQuestionDraftRepository):
         action: str | None = None,
     ) -> str:
         with get_connection(self.db_path) as conn:
-            conn.execute("BEGIN IMMEDIATE")
+            begin_immediate_transaction(conn)
             return self.save_with_connection(
                 conn,
                 draft,
@@ -224,7 +224,7 @@ class SQLiteQuestionDraftRepository(IQuestionDraftRepository):
         reason: str | None = None,
     ) -> bool:
         with get_connection(self.db_path) as conn:
-            conn.execute("BEGIN IMMEDIATE")
+            begin_immediate_transaction(conn)
             result = self.mark_promoted_with_connection(
                 conn,
                 draft_id,

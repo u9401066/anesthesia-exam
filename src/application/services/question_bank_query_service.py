@@ -6,11 +6,13 @@ from inspect import signature
 from pathlib import Path
 
 from src.domain.entities.question import ExamTrack
+from src.infrastructure.logging import get_logger
 from src.infrastructure.persistence.sqlite_past_exam_repo import get_past_exam_repository
 from src.infrastructure.persistence.sqlite_question_repo import get_question_repository
 
 PROJECT_DIR = Path(__file__).resolve().parents[3]
 EXAMS_DIR = PROJECT_DIR / "data" / "exams"
+logger = get_logger(__name__)
 
 
 class QuestionBankQueryService:
@@ -29,7 +31,7 @@ class QuestionBankQueryService:
         past_exam_stats = self.past_exam_repo.get_statistics()
         generated_exams = list(self.exams_dir.glob("*.json"))
 
-        return {
+        stats = {
             "question_count": question_stats["total"],
             "regular_question_count": question_stats["total"],
             "exam_count": len(generated_exams),
@@ -42,6 +44,13 @@ class QuestionBankQueryService:
             "pending_review_count": max(question_stats["total"] - question_stats["validated"], 0),
             "by_topic": question_stats["by_topic"],
         }
+        logger.debug(
+            "question_bank_content_stats_loaded",
+            question_count=stats["question_count"],
+            exam_count=stats["exam_count"],
+            past_exam_count=stats["past_exam_count"],
+        )
+        return stats
 
     def list_questions(
         self,
@@ -70,6 +79,13 @@ class QuestionBankQueryService:
         if exam_track_enum and "exam_track" not in supported_params:
             questions = [question for question in questions if getattr(question, "exam_track", None) == exam_track_enum]
 
+        logger.debug(
+            "question_bank_list_questions_loaded",
+            result_count=len(questions),
+            validated_only=validated_only,
+            exam_track=exam_track_enum.value if exam_track_enum else None,
+            limit=limit,
+        )
         return [question.to_dict() for question in questions]
 
 

@@ -25,7 +25,10 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.domain.entities.question import Difficulty, Question, QuestionType, Source
 from src.domain.value_objects.audit import ActorType
+from src.infrastructure.logging import bootstrap_logging, get_logger, log_context, new_run_id
 from src.infrastructure.persistence.sqlite_question_repo import SQLiteQuestionRepository
+
+logger = get_logger(__name__)
 
 
 def migrate_json_to_sqlite(delete_json: bool = False):
@@ -35,15 +38,18 @@ def migrate_json_to_sqlite(delete_json: bool = False):
     backup_dir = PROJECT_ROOT / "data" / "questions_backup"
 
     if not questions_dir.exists():
+        logger.warning("json_migration_questions_dir_missing", questions_dir=str(questions_dir))
         print("❌ data/questions 目錄不存在")
         return
 
     json_files = list(questions_dir.glob("*.json"))
 
     if not json_files:
+        logger.info("json_migration_no_files", questions_dir=str(questions_dir))
         print("ℹ️ 沒有 JSON 檔案需要遷移")
         return
 
+    logger.info("json_migration_start", file_count=len(json_files), delete_json=delete_json)
     print(f"📋 找到 {len(json_files)} 個 JSON 檔案")
     print()
 
@@ -61,84 +67,89 @@ def migrate_json_to_sqlite(delete_json: bool = False):
                 data = json.load(f)
 
             question_id = data.get("id", "")
+            with log_context(question_id=question_id or filepath.stem):
+                logger.info("json_migration_file_start", source_file=filepath.name)
 
-            # 檢查是否已存在
-            existing = repo.get_by_id(question_id)
-            if existing:
-                print(f"⏭️ 跳過 (已存在): {question_id}")
-                skipped += 1
-                continue
+                # 檢查是否已存在
+                existing = repo.get_by_id(question_id)
+                if existing:
+                    logger.info("json_migration_skipped_existing", source_file=filepath.name)
+                    print(f"⏭️ 跳過 (已存在): {question_id}")
+                    skipped += 1
+                    continue
 
-            # 建立來源
-            source = None
-            source_data = data.get("source")
-            if source_data and isinstance(source_data, dict):
-                source = Source(
-                    document=source_data.get("document", ""),
-                    page=source_data.get("page"),
-                    lines=source_data.get("lines"),
-                    original_text=source_data.get("original_text"),
+                # 建立來源
+                source = None
+                source_data = data.get("source")
+                if source_data and isinstance(source_data, dict):
+                    source = Source(
+                        document=source_data.get("document", ""),
+                        page=source_data.get("page"),
+                        lines=source_data.get("lines"),
+                        original_text=source_data.get("original_text"),
+                    )
+
+                # 處理難度
+                difficulty_str = data.get("difficulty", "medium")
+                try:
+                    difficulty = Difficulty(difficulty_str)
+                except ValueError:
+                    difficulty = Difficulty.MEDIUM
+
+                # 處理題型
+                q_type_str = data.get("question_type", "single_choice")
+                try:
+                    question_type = QuestionType(q_type_str)
+                except ValueError:
+                    question_type = QuestionType.SINGLE_CHOICE
+
+                # 處理時間
+                created_at_str = data.get("created_at")
+                if created_at_str:
+                    try:
+                        created_at = datetime.fromisoformat(created_at_str)
+                    except ValueError:
+                        created_at = datetime.now()
+                else:
+                    created_at = datetime.now()
+
+                # 建立 Question 實體
+                question = Question(
+                    id=question_id,
+                    question_text=data.get("question_text", data.get("question", "")),
+                    options=data.get("options", []),
+                    correct_answer=data.get("correct_answer", data.get("answer", "")),
+                    explanation=data.get("explanation", ""),
+                    source=source,
+                    question_type=question_type,
+                    difficulty=difficulty,
+                    topics=data.get("topics", []),
+                    points=data.get("points", 1),
+                    image_path=data.get("image_path"),
+                    created_at=created_at,
+                    created_by=data.get("created_by", "agent"),
                 )
 
-            # 處理難度
-            difficulty_str = data.get("difficulty", "medium")
-            try:
-                difficulty = Difficulty(difficulty_str)
-            except ValueError:
-                difficulty = Difficulty.MEDIUM
+                # 儲存到 SQLite
+                generation_context = {
+                    "migrated_from": filepath.name,
+                    "migration_date": datetime.now().isoformat(),
+                    "original_data": data,
+                }
 
-            # 處理題型
-            q_type_str = data.get("question_type", "single_choice")
-            try:
-                question_type = QuestionType(q_type_str)
-            except ValueError:
-                question_type = QuestionType.SINGLE_CHOICE
+                repo.save(
+                    question=question,
+                    actor_type=ActorType.SYSTEM,
+                    actor_name="migrate_json_to_sqlite",
+                    generation_context=generation_context,
+                )
 
-            # 處理時間
-            created_at_str = data.get("created_at")
-            if created_at_str:
-                try:
-                    created_at = datetime.fromisoformat(created_at_str)
-                except ValueError:
-                    created_at = datetime.now()
-            else:
-                created_at = datetime.now()
-
-            # 建立 Question 實體
-            question = Question(
-                id=question_id,
-                question_text=data.get("question_text", data.get("question", "")),
-                options=data.get("options", []),
-                correct_answer=data.get("correct_answer", data.get("answer", "")),
-                explanation=data.get("explanation", ""),
-                source=source,
-                question_type=question_type,
-                difficulty=difficulty,
-                topics=data.get("topics", []),
-                points=data.get("points", 1),
-                image_path=data.get("image_path"),
-                created_at=created_at,
-                created_by=data.get("created_by", "agent"),
-            )
-
-            # 儲存到 SQLite
-            generation_context = {
-                "migrated_from": filepath.name,
-                "migration_date": datetime.now().isoformat(),
-                "original_data": data,
-            }
-
-            repo.save(
-                question=question,
-                actor_type=ActorType.SYSTEM,
-                actor_name="migrate_json_to_sqlite",
-                generation_context=generation_context,
-            )
-
-            print(f"✅ 遷移成功: {question_id}")
-            migrated += 1
+                logger.info("json_migration_file_completed", source_file=filepath.name)
+                print(f"✅ 遷移成功: {question_id}")
+                migrated += 1
 
         except Exception as e:
+            logger.exception("json_migration_file_failed", source_file=filepath.name, error=str(e))
             print(f"❌ 遷移失敗 {filepath.name}: {e}")
             failed += 1
 
@@ -148,6 +159,7 @@ def migrate_json_to_sqlite(delete_json: bool = False):
     print(f"   ✅ 成功: {migrated}")
     print(f"   ⏭️ 跳過: {skipped}")
     print(f"   ❌ 失敗: {failed}")
+    logger.info("json_migration_complete", migrated=migrated, skipped=skipped, failed=failed)
 
     # 刪除或備份 JSON 檔案
     if delete_json and migrated > 0:
@@ -177,6 +189,8 @@ def main():
     parser.add_argument("--delete-json", action="store_true", help="遷移後刪除原始 JSON 檔案（會先備份）")
 
     args = parser.parse_args()
+    run_id = new_run_id("migrate")
+    bootstrap_logging(__name__, extra_context={"run_id": run_id, "provider": "json-migration"})
 
     print("=" * 50)
     print("📦 JSON → SQLite 資料遷移")

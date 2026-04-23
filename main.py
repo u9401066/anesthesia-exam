@@ -11,17 +11,22 @@ import subprocess
 import sys
 from pathlib import Path
 
+from src.infrastructure.logging import bootstrap_logging, bind_log_context, new_run_id
+
 
 def main():
     """啟動 Streamlit 應用程式"""
     project_dir = Path(__file__).resolve().parent
     app_path = project_dir / "src" / "presentation" / "streamlit" / "app.py"
+    run_id = new_run_id("cli")
+    logger = bootstrap_logging(__name__, extra_context={"run_id": run_id, "provider": "streamlit"})
+    bind_log_context(entrypoint="main.py")
 
     if not app_path.exists():
-        print(f"錯誤: 找不到 {app_path}")
+        logger.error("streamlit_app_missing", app_path=str(app_path))
         sys.exit(1)
 
-    print("🚀 啟動考卷生成系統...")
+    logger.info("streamlit_launcher_start", app_path=str(app_path), project_dir=str(project_dir))
     result = subprocess.run(
         [
             sys.executable,
@@ -38,6 +43,7 @@ def main():
         cwd=str(project_dir),
         check=False,
     )
+    logger.info("streamlit_launcher_exit", returncode=result.returncode)
     sys.exit(result.returncode)
 
 

@@ -13,7 +13,10 @@ from typing import Optional
 from src.domain.entities.question import Difficulty, ExamTrack, Question, QuestionType, Source
 from src.domain.repositories.question_repository import IQuestionRepository
 from src.domain.value_objects.audit import ActorType, AuditAction, AuditEntry
-from src.infrastructure.persistence.database import get_connection, init_database
+from src.infrastructure.logging import get_logger
+from src.infrastructure.persistence.database import begin_immediate_transaction, get_connection, init_database
+
+logger = get_logger(__name__)
 
 
 class SQLiteQuestionRepository(IQuestionRepository):
@@ -32,6 +35,7 @@ class SQLiteQuestionRepository(IQuestionRepository):
         """
         self.db_path = db_path
         init_database(db_path)
+        logger.debug("question_repository_initialized", db_path=str(db_path) if db_path else None)
 
     # ==================== Create ====================
 
@@ -63,6 +67,8 @@ class SQLiteQuestionRepository(IQuestionRepository):
         commit: bool = False,
     ) -> str:
         """Save a question using an existing database connection."""
+        log = logger.bind(question_id=question.id)
+        begin_immediate_transaction(conn)
         cursor = conn.cursor()
 
         cursor.execute("SELECT id FROM questions WHERE id = ?", (question.id,))
@@ -122,6 +128,13 @@ class SQLiteQuestionRepository(IQuestionRepository):
 
         if commit:
             conn.commit()
+        log.info(
+            "question_saved",
+            operation="create",
+            provider=actor_name,
+            question_type=question.question_type.value,
+            difficulty=question.difficulty.value,
+        )
         return question.id
 
     def _source_to_dict(self, source: Source | None) -> dict | None:
@@ -155,8 +168,10 @@ class SQLiteQuestionRepository(IQuestionRepository):
             row = cursor.fetchone()
 
             if row is None:
+                logger.debug("question_lookup_miss", question_id=question_id)
                 return None
 
+            logger.debug("question_lookup_hit", question_id=question_id)
             return self._row_to_question(row)
 
     def list_all(
@@ -210,7 +225,16 @@ class SQLiteQuestionRepository(IQuestionRepository):
 
             cursor.execute(query, params)
             rows = cursor.fetchall()
-
+            logger.debug(
+                "question_list_loaded",
+                result_count=len(rows),
+                validated_only=validated_only,
+                difficulty=difficulty.value if difficulty else None,
+                question_type=question_type.value if question_type else None,
+                topic=topic,
+                created_by=created_by,
+                exam_track=exam_track.value if exam_track else None,
+            )
             return [self._row_to_question(row) for row in rows]
 
     def count(
@@ -253,6 +277,7 @@ class SQLiteQuestionRepository(IQuestionRepository):
             )
 
             rows = cursor.fetchall()
+            logger.debug("question_search_completed", keyword=keyword, limit=limit, result_count=len(rows))
             return [self._row_to_question(row) for row in rows]
 
     # ==================== Update ====================
@@ -279,6 +304,8 @@ class SQLiteQuestionRepository(IQuestionRepository):
         commit: bool = True,
     ) -> Optional[str]:
         """內部更新方法"""
+        log = logger.bind(question_id=question.id)
+        begin_immediate_transaction(conn)
         cursor = conn.cursor()
 
         # 取得舊版本以計算變更
@@ -341,6 +368,13 @@ class SQLiteQuestionRepository(IQuestionRepository):
 
         if commit:
             conn.commit()
+        log.info(
+            "question_updated",
+            provider=actor_name,
+            changed_fields=sorted(changes.keys()),
+            question_type=question.question_type.value,
+            difficulty=question.difficulty.value,
+        )
         return question.id
 
     def _calculate_changes(self, old: Question, new: Question) -> dict:
@@ -384,7 +418,9 @@ class SQLiteQuestionRepository(IQuestionRepository):
         soft_delete: bool = True,
     ) -> bool:
         """刪除題目"""
+        log = logger.bind(question_id=question_id)
         with get_connection(self.db_path) as conn:
+            begin_immediate_transaction(conn)
             cursor = conn.cursor()
 
             if soft_delete:
@@ -412,6 +448,7 @@ class SQLiteQuestionRepository(IQuestionRepository):
             )
 
             conn.commit()
+            log.info("question_deleted", provider=actor_name, soft_delete=soft_delete)
             return True
 
     def restore(
@@ -421,7 +458,9 @@ class SQLiteQuestionRepository(IQuestionRepository):
         actor_name: str = "unknown",
     ) -> bool:
         """還原已刪除的題目"""
+        log = logger.bind(question_id=question_id)
         with get_connection(self.db_path) as conn:
+            begin_immediate_transaction(conn)
             cursor = conn.cursor()
 
             cursor.execute(
@@ -445,6 +484,7 @@ class SQLiteQuestionRepository(IQuestionRepository):
             )
 
             conn.commit()
+            log.info("question_restored", provider=actor_name)
             return True
 
     # ==================== Audit ====================
@@ -452,6 +492,7 @@ class SQLiteQuestionRepository(IQuestionRepository):
     def get_audit_log(self, question_id: str, limit: int = 50) -> list[AuditEntry]:
         """取得題目的審計日誌"""
         with get_connection(self.db_path) as conn:
+            begin_immediate_transaction(conn)
             cursor = conn.cursor()
             cursor.execute(
                 """
@@ -464,6 +505,7 @@ class SQLiteQuestionRepository(IQuestionRepository):
             )
 
             rows = cursor.fetchall()
+            logger.debug("question_audit_log_loaded", question_id=question_id, limit=limit, result_count=len(rows))
             return [self._row_to_audit(row) for row in rows]
 
     def get_generation_context(self, question_id: str) -> Optional[dict]:
@@ -529,6 +571,7 @@ class SQLiteQuestionRepository(IQuestionRepository):
         notes: Optional[str] = None,
     ) -> bool:
         """標記題目驗證結果"""
+        log = logger.bind(question_id=question_id)
         with get_connection(self.db_path) as conn:
             cursor = conn.cursor()
 
@@ -557,6 +600,7 @@ class SQLiteQuestionRepository(IQuestionRepository):
             )
 
             conn.commit()
+            log.info("question_validation_marked", passed=passed, provider=actor_name)
             return True
 
     # ==================== Statistics ====================
@@ -622,7 +666,7 @@ class SQLiteQuestionRepository(IQuestionRepository):
             # 取 Top 10
             by_topic = dict(sorted(topic_counts.items(), key=lambda x: x[1], reverse=True)[:10])
 
-            return {
+            stats = {
                 "total": total,
                 "by_difficulty": by_difficulty,
                 "by_type": by_type,
@@ -631,6 +675,14 @@ class SQLiteQuestionRepository(IQuestionRepository):
                 "deleted": deleted,
                 "recent_7_days": recent,
             }
+            logger.debug(
+                "question_statistics_loaded",
+                total=total,
+                validated=validated,
+                deleted=deleted,
+                recent_7_days=recent,
+            )
+            return stats
 
     # ==================== Helpers ====================
 
