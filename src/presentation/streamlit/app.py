@@ -14,7 +14,6 @@ import html
 import os
 import re
 import sys
-import time
 from collections import Counter
 from pathlib import Path
 
@@ -27,7 +26,6 @@ import json
 import random
 import shutil
 import subprocess
-import uuid
 from datetime import datetime
 from typing import Any, Optional
 
@@ -38,12 +36,12 @@ from src.application.services.past_exam_figure_service import get_past_exam_figu
 from src.application.services.textbook_generation_service import get_textbook_generation_service
 from src.infrastructure import agent as agent_module
 from src.infrastructure.logging import bootstrap_logging, new_run_id
+from src.presentation.streamlit.document_manifest import normalize_manifest_paths as _normalize_manifest_paths
+from src.presentation.streamlit.generation.controller import autosave_generated_questions_to_drafts
 from src.presentation.streamlit.generation.fragments import (
-    render_question_card_inline,
     render_question_review_form,
     render_source_info,
 )
-from src.presentation.streamlit.generation.controller import autosave_generated_questions_to_drafts
 from src.presentation.streamlit.generation.orchestration import (
     build_generation_prompt,
     create_generation_execution_ui,
@@ -1110,46 +1108,6 @@ def render_empty_state(title: str, body: str) -> None:
         """,
         unsafe_allow_html=True,
     )
-
-
-def _normalize_project_path_string(path_str: str) -> str:
-    """Map stale absolute repo paths back onto the current workspace root."""
-    normalized = str(path_str or "").strip()
-    if not normalized:
-        return normalized
-
-    path = Path(normalized)
-    if not path.is_absolute() or path.exists():
-        return normalized
-
-    parts = path.parts
-    if "anesthesia-exam" not in parts:
-        return normalized
-
-    project_index = parts.index("anesthesia-exam")
-    relative_parts = parts[project_index + 1 :]
-    if not relative_parts:
-        return normalized
-
-    return str(PROJECT_DIR.joinpath(*relative_parts))
-
-
-def _normalize_manifest_paths(value):
-    """Normalize stale persisted path fields inside manifest payloads."""
-    if isinstance(value, dict):
-        normalized: dict = {}
-        for key, item in value.items():
-            normalized_item = _normalize_manifest_paths(item)
-            if isinstance(normalized_item, str) and (key == "path" or key.endswith("_path")):
-                normalized[key] = _normalize_project_path_string(normalized_item)
-            else:
-                normalized[key] = normalized_item
-        return normalized
-
-    if isinstance(value, list):
-        return [_normalize_manifest_paths(item) for item in value]
-
-    return value
 
 
 def _resolve_doc_root(manifest: dict) -> Path | None:
