@@ -16,6 +16,7 @@ import os
 import shutil
 import subprocess
 import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator, Optional, Protocol
@@ -120,11 +121,19 @@ def resolve_openclaw_default_model(config: dict) -> str | None:
 
 def extract_openclaw_text(payload: dict) -> str:
     """Extract model text from an OpenClaw JSON response."""
-    outputs = payload.get("outputs") or []
+    meta = payload.get("meta") or {}
+    for key in ("finalAssistantVisibleText", "finalAssistantRawText"):
+        final_text = meta.get(key)
+        if isinstance(final_text, str) and final_text.strip():
+            return final_text.strip()
+
+    outputs = payload.get("payloads") or payload.get("outputs") or []
     parts: list[str] = []
 
     for output in outputs:
         if not isinstance(output, dict):
+            continue
+        if output.get("isError") or output.get("isReasoning"):
             continue
         text = output.get("text")
         if isinstance(text, str) and text.strip():
@@ -280,6 +289,8 @@ class AgentProviderConfig:
     openclaw_executable: Optional[str] = None
     openclaw_model: Optional[str] = None
     openclaw_config_path: Optional[Path] = None
+    openclaw_mode: Optional[str] = None
+    openclaw_agent_id: Optional[str] = None
     openai_base_url: Optional[str] = None
     openai_api_key: Optional[str] = None
     openai_organization: Optional[str] = None
@@ -294,7 +305,10 @@ class AgentProviderConfig:
         model_override: Optional[str] = None,
     ) -> "AgentProviderConfig":
         provider = (provider_override or os.getenv("EXAM_AGENT_PROVIDER", "crush")).strip().lower()
-        timeout = int(os.getenv("EXAM_AGENT_TIMEOUT", "120"))
+        if provider == "openclaw":
+            timeout = int(os.getenv("EXAM_OPENCLAW_TIMEOUT") or os.getenv("EXAM_AGENT_TIMEOUT") or "300")
+        else:
+            timeout = int(os.getenv("EXAM_AGENT_TIMEOUT", "120"))
 
         model = (model_override or os.getenv("EXAM_AGENT_MODEL") or "").strip() or None
         if model is None and crush_config_path.exists():
@@ -350,6 +364,10 @@ class AgentProviderConfig:
                     openclaw_model = resolve_openclaw_default_model(openclaw_data) or ""
             except Exception:
                 pass
+        openclaw_mode = (os.getenv("EXAM_OPENCLAW_MODE") or "agent").strip().lower() or "agent"
+        if openclaw_mode not in {"agent", "infer"}:
+            openclaw_mode = "agent"
+        openclaw_agent_id = (os.getenv("EXAM_OPENCLAW_AGENT_ID") or "main").strip() or "main"
 
         codex_model = (
             model_override
@@ -385,6 +403,8 @@ class AgentProviderConfig:
             openclaw_executable=openclaw_executable or None,
             openclaw_model=openclaw_model or None,
             openclaw_config_path=Path(openclaw_config_path) if openclaw_config_path else None,
+            openclaw_mode=openclaw_mode,
+            openclaw_agent_id=openclaw_agent_id,
             openai_base_url=openai_base_url or None,
             openai_api_key=openai_api_key or None,
             openai_organization=openai_organization or None,
@@ -838,7 +858,13 @@ class OpenClawAgentProvider:
     def _get_model(self) -> str:
         return self.config.openclaw_model or self.config.model or self.DEFAULT_MODEL
 
-    def _build_command(self, prompt: str) -> list[str]:
+    def _get_mode(self) -> str:
+        return (self.config.openclaw_mode or "agent").strip().lower() or "agent"
+
+    def _get_agent_id(self) -> str:
+        return (self.config.openclaw_agent_id or "main").strip() or "main"
+
+    def _build_infer_command(self, prompt: str) -> list[str]:
         return [
             self._get_executable(),
             "infer",
@@ -851,6 +877,25 @@ class OpenClawAgentProvider:
             prompt,
             "--json",
         ]
+
+    def _build_agent_command(self, prompt: str) -> list[str]:
+        return [
+            self._get_executable(),
+            "agent",
+            "--local",
+            "--agent",
+            self._get_agent_id(),
+            "--session-id",
+            uuid.uuid4().hex,
+            "--json",
+            "--message",
+            prompt,
+        ]
+
+    def _build_command(self, prompt: str) -> list[str]:
+        if self._get_mode() == "infer":
+            return self._build_infer_command(prompt)
+        return self._build_agent_command(prompt)
 
     def _run_cli(self, args: list[str], *, timeout: int) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
@@ -868,6 +913,11 @@ class OpenClawAgentProvider:
         if shutil.which(exe) is None and not Path(exe).exists():
             return False, f"找不到 OpenClaw：{exe}"
 
+        mode = self._get_mode()
+        config_path = self.config.openclaw_config_path
+        if mode == "agent" and config_path and not config_path.exists():
+            return False, f"找不到 OpenClaw 設定：{config_path}"
+
         try:
             result = self._run_cli([exe, "models", "status", "--plain"], timeout=10)
         except Exception as e:  # noqa: BLE001
@@ -881,7 +931,9 @@ class OpenClawAgentProvider:
         for line in (result.stdout or "").splitlines():
             if line.strip():
                 current_model = line.strip()
-        return True, f"可用, model={current_model or self._get_model()}"
+        if mode == "agent":
+            return True, f"可用, mode=agent, agent={self._get_agent_id()}, model={current_model or self._get_model()}"
+        return True, f"可用, mode=infer, model={current_model or self._get_model()}"
 
     def run(self, prompt: str) -> str:
         log = logger.bind(provider="openclaw", model=self._get_model())

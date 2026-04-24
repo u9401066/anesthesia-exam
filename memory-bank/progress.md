@@ -2,6 +2,13 @@
 
 ## Done
 
+- 完成 Streamlit performance rescue：右側常駐聊天改成 background thread + fragment 同步的非阻塞串流，聊天期間 UI 可先響應，不再被同步 agent 回應整頁卡住
+- 完成 Streamlit cache invalidation 收斂：教材清單、草稿箱、一般題庫、歷屆題庫、scope request 的 cached read-model 都在 mutation path 後明確清 cache，修掉 rerun 後短時間顯示舊資料的 UX bug
+- 完成題庫/練習頁重型面板減載：多處由 `st.tabs` 改為單一 active-section 渲染，並讓待審面板採 opt-in 展開，降低左側切頁與對話期間 rerun 的固定成本
+- 修正 `OpenClaw infer` availability 判斷：`infer` 模式不再無條件要求 repo-local config，只有 `agent` 模式才檢查 `openclaw_config_path`
+- 修正 root `uv run pytest`：正式補上 fresh env 缺失的測試依賴、限制 root collection 只跑本 repo `tests/`，並新增 mixed root/vendored test collection 的隔離與防回歸測試
+- 驗證完成：`uv run pytest -q` 為 `86 passed`；顯式 mixed command `uv run pytest -q libs/asset-aware-mcp/tests/unit/test_document_service.py tests/test_agent_provider_config.py` 為 `24 passed`
+
 - 已完成 Miller 9th 分章教材 figure asset 全量受控刷新：87/87 章節重跑 `scripts/refresh_miller_figures.py`，並以 `scripts/audit_miller_image_quality.py` 做前後品質驗證
 - 修正 asset-aware PyMuPDF figure caption extraction 可能卡死單章的問題：新增 document-level caption timeout，超時時只跳過該文件 captions，不讓整批 ingest/refresh 停住
 - Miller figure audit 指標大幅收斂：figure 總數 `4159 -> 867`、極小碎圖 `<20k area` 為 `2267 -> 51`、低變異圖 `1759 -> 14`、最大單頁 figure 數 `268 -> 4`，且 path missing / unreadable / 舊 `/root` prefix 全部歸零
@@ -37,11 +44,12 @@
 
 ## Doing
 
-- 進入 commit/push 收尾；目前要分段提交 asset-aware 子 repo、主 repo 程式/設定/測試、以及正式 DB/稽核結果
+- 進入 commit/push 收尾；本次主 repo 先提交 Streamlit performance rescue、OpenClaw availability fix、pytest isolation 與對應測試/文件，排除正式 DB 與個人環境檔
 - 後續教材 evidence 品質應轉為 targeted caption/evidence recovery，而不是再全書重跑 figure refresh
 
 ## Next
 
+- 對真實 Streamlit 頁面加 rerun / query 耗時量測，確認是否還有比聊天與重型 panel 更大的瓶頸
 - 針對 caption coverage 偏低章節做定向補強：優先看 chapter 30、42、59、66、32，確認 caption extraction、page text 與 figure matching 是否需要專章策略
 - 詳解/出題 pipeline 使用教材圖像時，應以最新 asset audit 作為最低品質門檻，避免重新使用舊碎圖 manifest
 - 若要繼續收斂 `exam_server.py`，下一刀優先拆 `get_generation_guide / get_topics` 或 past-exam tool adapter，不要一次動整條 pipeline harness

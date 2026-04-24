@@ -26,8 +26,9 @@ import json
 import random
 import shutil
 import subprocess
+import time
 from datetime import datetime
-from typing import Any, Optional
+from typing import Any, Optional, cast
 
 import streamlit as st
 
@@ -36,6 +37,7 @@ from src.application.services.past_exam_figure_service import get_past_exam_figu
 from src.application.services.textbook_generation_service import get_textbook_generation_service
 from src.infrastructure import agent as agent_module
 from src.infrastructure.logging import bootstrap_logging, new_run_id
+from src.presentation.streamlit.async_chat import ChatStreamJobStore
 from src.presentation.streamlit.document_manifest import normalize_manifest_paths as _normalize_manifest_paths
 from src.presentation.streamlit.generation.controller import autosave_generated_questions_to_drafts
 from src.presentation.streamlit.generation.fragments import (
@@ -65,6 +67,7 @@ logger = bootstrap_logging(
     log_dir=LOG_DIR,
     extra_context={"run_id": APP_RUN_ID, "provider": "streamlit"},
 )
+CHAT_STREAM_JOBS = ChatStreamJobStore()
 
 # 設定頁面
 st.set_page_config(
@@ -123,6 +126,8 @@ PRACTICE_SOURCE_GENERAL = "general_bank"
 PRACTICE_SOURCE_GENERATED = "generated_preview"
 PRACTICE_SOURCE_PAST_EXAM = "past_exam"
 SUPPORTED_AGENT_PROVIDERS = ("crush", "opencode", "copilot-sdk", "codex", "openclaw")
+MCP_CAPABLE_AGENT_PROVIDERS = ("crush", "opencode")
+REQUIRED_REPO_MCP_SERVERS = ("exam-generator", "asset-aware")
 PRACTICE_PATTERN_LABELS = {
     "direct_recall": "直接記憶",
     "clinical_scenario": "臨床情境",
@@ -134,6 +139,21 @@ PRACTICE_PATTERN_LABELS = {
     "negation": "否定題",
     "sequence": "順序題",
 }
+
+
+def provider_supports_repo_mcp(provider_name: str, agent_meta: Optional[dict] = None) -> bool:
+    """Return whether the configured provider can use the repo MCP workflows."""
+    normalized_provider = str(provider_name or "").strip().lower()
+    if normalized_provider in MCP_CAPABLE_AGENT_PROVIDERS:
+        return True
+    if normalized_provider != "openclaw":
+        return False
+
+    servers = (agent_meta or {}).get("mcp_servers") or {}
+    if not isinstance(servers, dict):
+        return False
+    configured_servers = {str(name or "").strip() for name in servers.keys() if str(name or "").strip()}
+    return set(REQUIRED_REPO_MCP_SERVERS).issubset(configured_servers)
 
 
 def get_configured_agent_provider_name() -> str:
@@ -1205,6 +1225,7 @@ def render_selected_docs_summary(selected_docs_info: list[dict]) -> tuple[int, i
 inject_app_styles()
 
 
+@st.cache_data(ttl=120, show_spinner=False)
 def load_indexed_documents() -> list[dict]:
     """載入已索引的文件列表（掃描 data/doc_* manifest + 全域 manifest.json）"""
     docs: list[dict] = []
@@ -1250,8 +1271,75 @@ def load_indexed_documents() -> list[dict]:
     return docs
 
 
-def load_agent_metadata(provider_name: str = "crush") -> dict:
+def _file_signature(path: Path) -> tuple[int, int]:
+    """Return (mtime_ns, size) for cache invalidation keys."""
+    try:
+        stat = path.stat()
+        return (int(stat.st_mtime_ns), int(stat.st_size))
+    except OSError:
+        return (0, 0)
+
+
+def _build_agent_metadata_cache_key(provider_name: str) -> tuple[Any, ...]:
+    """Build a lightweight cache key so metadata refreshes when config/env changes."""
+    normalized = str(provider_name or "").strip().lower()
+
+    if normalized == "opencode":
+        opencode_bin = shutil.which("opencode") or shutil.which("opencode.exe") or ""
+        return (
+            normalized,
+            _file_signature(OPENCODE_CONFIG_PATH),
+            str(opencode_bin),
+            str(os.getenv("EXAM_OPENCODE_MODEL") or ""),
+            str(os.getenv("EXAM_AGENT_MODEL") or ""),
+        )
+
+    if normalized == "openclaw":
+        openclaw_config_path = Path(
+            os.getenv("EXAM_OPENCLAW_CONFIG_PATH")
+            or os.getenv("OPENCLAW_CONFIG_PATH")
+            or (PROJECT_DIR / "vendor" / "openclaw-state" / "openclaw.json")
+        )
+        openclaw_executable = Path(os.getenv("EXAM_OPENCLAW_PATH") or (PROJECT_DIR / "scripts" / "openclaw.sh"))
+        return (
+            normalized,
+            _file_signature(openclaw_config_path),
+            _file_signature(openclaw_executable),
+            str(os.getenv("EXAM_OPENCLAW_CONFIG_PATH") or ""),
+            str(os.getenv("OPENCLAW_CONFIG_PATH") or ""),
+            str(os.getenv("EXAM_OPENCLAW_PATH") or ""),
+            str(os.getenv("EXAM_OPENCLAW_MODEL") or ""),
+            str(os.getenv("EXAM_AGENT_MODEL") or ""),
+        )
+
+    if normalized == "codex":
+        return (
+            normalized,
+            str(os.getenv("EXAM_CODEX_MODEL") or ""),
+            str(os.getenv("EXAM_OPENAI_MODEL") or ""),
+            str(os.getenv("EXAM_AGENT_MODEL") or ""),
+        )
+
+    if normalized == "copilot-sdk":
+        return (
+            normalized,
+            str(os.getenv("EXAM_COPILOT_SDK_MODEL") or ""),
+            str(os.getenv("EXAM_AGENT_MODEL") or ""),
+        )
+
+    return (
+        normalized,
+        _file_signature(CRUSH_CONFIG_PATH),
+        str(os.getenv("EXAM_CRUSH_MODEL") or ""),
+        str(os.getenv("EXAM_AGENT_MODEL") or ""),
+    )
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def _load_agent_metadata_cached(provider_name: str, cache_key: tuple[Any, ...]) -> dict:
     """根據 provider 載入對應的模型/MCP/context 設定（供 UI 顯示）"""
+    _ = cache_key
+    provider_name = str(provider_name or "").strip().lower()
     meta = {
         "model": None,
         "mcp_servers": {},
@@ -1309,6 +1397,8 @@ def load_agent_metadata(provider_name: str = "crush") -> dict:
                     data = json.load(f)
                 meta["model"] = resolve_openclaw_default_model(data)
                 meta["available_models"] = collect_openclaw_available_models(data)
+                meta["mcp_servers"] = ((data.get("mcp") or {}).get("servers") or {})
+                meta["workspace"] = (((data.get("agents") or {}).get("defaults") or {}).get("workspace"))
             except Exception as e:
                 logger.warning("openclaw_config_load_error", error=str(e), path=str(openclaw_config_path))
 
@@ -1352,6 +1442,12 @@ def load_agent_metadata(provider_name: str = "crush") -> dict:
             meta["available_models"] = [configured_model, *meta["available_models"]]
 
     return meta
+
+
+def load_agent_metadata(provider_name: str = "crush") -> dict:
+    """Load provider metadata with short-lived caching to avoid repeated CLI calls on rerun."""
+    cache_key = _build_agent_metadata_cache_key(provider_name)
+    return _load_agent_metadata_cached(provider_name, cache_key)
 
 
 def get_agent_status(provider_name: str, model_override: Optional[str] = None) -> tuple[bool, str, object]:
@@ -1464,25 +1560,63 @@ def ingest_pdf_via_agent(
     return provider.run(prompt)
 
 
-def build_question_context_options() -> tuple[list[str], dict[str, dict]]:
-    """建立聊天可選題目上下文"""
-    mapping: dict[str, dict] = {}
-    options = ["不指定題目"]
+def _copy_chat_payload_value(value: Any) -> Any:
+    if isinstance(value, (dict, list)):
+        return json.loads(json.dumps(value, ensure_ascii=False))
+    return value
 
-    generated = st.session_state.get("generated_questions", [])
-    for i, q in enumerate(generated, 1):
-        label = f"[最近生成 #{i}] {q.get('question_text', '')[:45]}"
-        mapping[label] = q
-        options.append(label)
 
-    repo_questions = load_questions()[:30]
-    for i, q in enumerate(repo_questions, 1):
-        qid = q.get("id", "N/A")[:8]
-        label = f"[題庫 {qid}] {q.get('question_text', '')[:45]}"
-        mapping[label] = q
-        options.append(label)
+def build_chat_context_label(question: dict, origin_label: str) -> str:
+    """Build a short label for the active chat question context."""
+    origin = str(origin_label or "題目").strip() or "題目"
+    question_number = str(question.get("question_number") or "").strip()
+    if question_number:
+        origin = f"{origin} 第 {question_number} 題"
+    question_text = _truncate_text(str(question.get("question_text") or "").strip(), 48)
+    return f"{origin}｜{question_text or '未命名題目'}"
 
-    return options, mapping
+
+def build_chat_context_payload(question: dict, origin_label: str) -> dict:
+    """Normalize a question payload for sidebar discussion."""
+    payload = {
+        "id": str(question.get("id") or "").strip() or None,
+        "question_text": str(question.get("question_text") or "").strip(),
+        "options": list(question.get("options") or []),
+        "correct_answer": str(question.get("correct_answer") or "").strip(),
+        "explanation": str(question.get("explanation") or "").strip(),
+        "source": _copy_chat_payload_value(question.get("source") or {}),
+        "topics": list(question.get("topics") or []),
+        "difficulty": str(question.get("difficulty") or "").strip(),
+        "exam_name": str(question.get("exam_name") or "").strip(),
+        "exam_year": question.get("exam_year"),
+        "question_number": question.get("question_number"),
+    }
+    payload["_chat_origin"] = str(origin_label or "題目").strip() or "題目"
+    payload["_chat_label"] = build_chat_context_label(question, payload["_chat_origin"])
+    return payload
+
+
+def set_chat_question_context(question: dict, origin_label: str) -> None:
+    """Store one active question for the right-side discussion panel."""
+    payload = build_chat_context_payload(question, origin_label)
+    st.session_state.chat_question_payload = payload
+    st.session_state.chat_question_context_label = payload["_chat_label"]
+
+
+def clear_chat_question_context() -> None:
+    """Clear the active question discussion context."""
+    st.session_state.chat_question_payload = None
+    st.session_state.chat_question_context_label = "未指定題目"
+
+
+def get_active_chat_question_context() -> dict | None:
+    """Return the active chat question context if one is set."""
+    payload = st.session_state.get("chat_question_payload")
+    if not isinstance(payload, dict):
+        return None
+    if not str(payload.get("question_text") or "").strip():
+        return None
+    return payload
 
 
 def build_discussion_prompt(user_prompt: str, selected_question: dict | None) -> str:
@@ -1491,11 +1625,15 @@ def build_discussion_prompt(user_prompt: str, selected_question: dict | None) ->
         return user_prompt
 
     context = {
+        "chat_origin": selected_question.get("_chat_origin"),
+        "chat_label": selected_question.get("_chat_label"),
         "question_text": selected_question.get("question_text"),
         "options": selected_question.get("options"),
         "correct_answer": selected_question.get("correct_answer"),
         "explanation": selected_question.get("explanation"),
         "source": selected_question.get("source"),
+        "topics": selected_question.get("topics"),
+        "difficulty": selected_question.get("difficulty"),
     }
 
     return (
@@ -1516,6 +1654,7 @@ def run_agent_sync(prompt: str, provider) -> str:
     return provider.run(prompt)
 
 
+@st.cache_data(ttl=15, show_spinner=False)
 def load_past_exam_catalog(limit: int = 20) -> list[dict]:
     """讀取歷屆考卷清單與摘要資訊。"""
     from src.infrastructure.persistence.sqlite_past_exam_repo import get_past_exam_repository
@@ -1524,6 +1663,7 @@ def load_past_exam_catalog(limit: int = 20) -> list[dict]:
     return repo.list_exam_catalog(limit=limit)
 
 
+@st.cache_data(ttl=15, show_spinner=False)
 def load_past_exam_questions(past_exam_id: str) -> list[dict]:
     """讀取單份歷屆考卷的題目明細。"""
     from src.infrastructure.persistence.sqlite_past_exam_repo import get_past_exam_repository
@@ -1572,6 +1712,7 @@ def load_past_exam_question_pool(past_exam_ids: list[str]) -> list[dict]:
     return question_pool
 
 
+@st.cache_data(ttl=5, show_spinner=False)
 def load_question_drafts(status: str | None = None, starred_only: bool = False) -> list[dict]:
     """載入題目草稿箱。"""
     from src.application.services.question_draft_service import get_question_draft_service
@@ -1579,6 +1720,7 @@ def load_question_drafts(status: str | None = None, starred_only: bool = False) 
     return get_question_draft_service().list_drafts(status=status, starred_only=starred_only, limit=300)
 
 
+@st.cache_data(ttl=5, show_spinner=False)
 def get_draft_stats() -> dict:
     """取得草稿箱統計。"""
     from src.application.services.question_draft_service import get_question_draft_service
@@ -1803,6 +1945,7 @@ def render_draft_workspace(*, show_hero: bool = True) -> None:
             if st.button("📐 以歷史模板建立新草稿", width="stretch", key="draft_workspace_create_from_template"):
                 draft_id = draft_service.create_draft_from_template(selected_template_id)
                 if draft_id:
+                    invalidate_draft_caches()
                     set_draft_flash(
                         f"已從 {selected_template.get('source_exam_year', '-')} 年第 {selected_template.get('source_question_number', '-')} 題建立模板草稿。"
                     )
@@ -1871,13 +2014,18 @@ def render_draft_workspace(*, show_hero: bool = True) -> None:
     )
     selected_draft_ids = widget_selected_draft_ids
     if is_e2e_test_mode() and st.session_state.get("draft_batch_selection_override"):
-        selected_draft_ids = list(st.session_state["draft_batch_selection_override"])
+        selected_draft_ids = [
+            draft_id
+            for draft_id in st.session_state.get("draft_batch_selection_override", [])
+            if draft_id in selection_options
+        ]
+        st.session_state.draft_batch_selection_override = selected_draft_ids
 
     if is_e2e_test_mode():
         if st.button("🧪 E2E 全選目前草稿", width="stretch", key="draft_workspace_e2e_select_all"):
             selected_ids = selection_options.copy()
             st.session_state.draft_batch_selection_override = selected_ids
-            st.rerun()
+            selected_draft_ids = selected_ids
 
     if selected_draft_ids:
         selected_drafts = [draft for draft in drafts if draft["id"] in selected_draft_ids]
@@ -1993,6 +2141,7 @@ def render_draft_workspace(*, show_hero: bool = True) -> None:
                     is_starred=None if batch_starred == "不變更" else batch_starred == "加星",
                     notes=None if not batch_notes.strip() else batch_notes.strip(),
                 )
+                invalidate_draft_caches()
                 schedule_draft_batch_selection_reset()
                 set_draft_flash(f"已更新 {updated} 題草稿。")
                 st.rerun()
@@ -2003,12 +2152,15 @@ def render_draft_workspace(*, show_hero: bool = True) -> None:
                     batch_template_id,
                     replace_content=batch_replace_content,
                 )
+                invalidate_draft_caches()
                 schedule_draft_batch_selection_reset()
                 set_draft_flash(f"已將歷史模板套用到 {updated} 題草稿。")
                 st.rerun()
         with action_col3:
             if st.button("✅ 送入正式題庫", width="stretch", disabled=not selected_draft_ids, key="draft_workspace_promote"):
                 result = draft_service.promote_drafts(selected_draft_ids)
+                invalidate_draft_caches()
+                invalidate_question_bank_caches()
                 schedule_draft_batch_selection_reset()
                 promoted_count = int(result.get("promoted", 0) or 0)
                 failed_count = len(result.get("failed", []))
@@ -2027,6 +2179,7 @@ def render_draft_workspace(*, show_hero: bool = True) -> None:
         with archive_col3:
             if st.button("🗂️ 封存選取", width="stretch", disabled=not selected_draft_ids, key="draft_workspace_archive"):
                 archived = draft_service.archive_drafts(selected_draft_ids)
+                invalidate_draft_caches()
                 schedule_draft_batch_selection_reset()
                 set_draft_flash(f"已封存 {archived} 題草稿。")
                 st.rerun()
@@ -2203,6 +2356,7 @@ def render_draft_workspace(*, show_hero: bool = True) -> None:
                         similarity_warning_count=len(similar_matches),
                     )
                     if saved:
+                        invalidate_draft_caches()
                         st.success("QA metadata 已更新。")
                         st.rerun()
                     st.error("QA metadata 更新失敗。")
@@ -2236,6 +2390,7 @@ def render_draft_workspace(*, show_hero: bool = True) -> None:
                     width="stretch",
                 ):
                     draft_service.bulk_update([draft["id"]], is_starred=not draft.get("is_starred", False))
+                    invalidate_draft_caches()
                     st.rerun()
             with quick_col2:
                 if draft.get("status") == "draft" and st.button(
@@ -2244,6 +2399,8 @@ def render_draft_workspace(*, show_hero: bool = True) -> None:
                     width="stretch",
                 ):
                     draft_service.promote_drafts([draft["id"]])
+                    invalidate_draft_caches()
+                    invalidate_question_bank_caches()
                     st.rerun()
 
             source = question.get("source") or {}
@@ -2291,7 +2448,7 @@ def render_question_review_expander(question: dict, display_number: int, key_pre
             value=question.get("validation_notes") or "",
             key=f"{key_prefix}_review_note_{question_id}",
         )
-        review_col1, review_col2 = st.columns(2)
+        review_col1, review_col2, review_col3 = st.columns(3)
         with review_col1:
             if st.button("✅ 標記通過", key=f"{key_prefix}_approve_{question_id}", width="stretch"):
                 from src.infrastructure.persistence.sqlite_question_repo import get_question_repository
@@ -2303,6 +2460,7 @@ def render_question_review_expander(question: dict, display_number: int, key_pre
                     actor_name="streamlit-admin",
                     notes=review_note or None,
                 )
+                invalidate_question_bank_caches()
                 st.rerun()
         with review_col2:
             if st.button("❌ 標記退回", key=f"{key_prefix}_reject_{question_id}", width="stretch"):
@@ -2315,13 +2473,18 @@ def render_question_review_expander(question: dict, display_number: int, key_pre
                     actor_name="streamlit-admin",
                     notes=review_note or None,
                 )
+                invalidate_question_bank_caches()
                 st.rerun()
+        with review_col3:
+            if st.button("🦞 問龍蝦這題", key=f"{key_prefix}_chat_{question_id}", width="stretch"):
+                set_chat_question_context(question, "題庫審題")
 
         source = question.get("source") or {}
         if source:
             render_source_info(source, expanded=False)
 
 
+@st.cache_data(ttl=10, show_spinner=False)
 def get_questions_stats() -> dict:
     """取得題庫統計。"""
     from src.application.services.question_bank_query_service import get_question_bank_query_service
@@ -2329,6 +2492,7 @@ def get_questions_stats() -> dict:
     return get_question_bank_query_service().get_content_stats()
 
 
+@st.cache_data(ttl=10, show_spinner=False)
 def load_questions(validated_only: bool = False, exam_track: str | None = None) -> list[dict]:
     """載入一般題庫題目。"""
     from src.application.services.question_bank_query_service import get_question_bank_query_service
@@ -2340,6 +2504,7 @@ def load_questions(validated_only: bool = False, exam_track: str | None = None) 
     )
 
 
+@st.cache_data(ttl=5, show_spinner=False)
 def load_scope_requests(status: str | None = None) -> list[dict]:
     """載入出題需求 backlog"""
     from src.domain.entities.scope_request import ScopeRequestStatus
@@ -2349,6 +2514,36 @@ def load_scope_requests(status: str | None = None) -> list[dict]:
     status_filter = ScopeRequestStatus(status) if status else None
     requests = repo.list_all(status=status_filter, limit=200)
     return [req.to_dict() for req in requests]
+
+
+def _clear_cached_read_function(func) -> None:
+    """Clear one Streamlit cached read path when a write invalidates it."""
+    clear = getattr(func, "clear", None)
+    if callable(clear):
+        clear()
+
+
+def invalidate_document_caches() -> None:
+    _clear_cached_read_function(load_indexed_documents)
+
+
+def invalidate_draft_caches() -> None:
+    _clear_cached_read_function(load_question_drafts)
+    _clear_cached_read_function(get_draft_stats)
+
+
+def invalidate_question_bank_caches() -> None:
+    _clear_cached_read_function(load_questions)
+    _clear_cached_read_function(get_questions_stats)
+
+
+def invalidate_past_exam_caches() -> None:
+    _clear_cached_read_function(load_past_exam_catalog)
+    _clear_cached_read_function(load_past_exam_questions)
+
+
+def invalidate_scope_request_caches() -> None:
+    _clear_cached_read_function(load_scope_requests)
 
 
 def get_heartbeat_summary() -> dict:
@@ -2436,8 +2631,14 @@ if "etl_last_result" not in st.session_state:
     st.session_state.etl_last_result = ""
 if "last_generation_response" not in st.session_state:
     st.session_state.last_generation_response = ""
-if "chat_question_context" not in st.session_state:
-    st.session_state.chat_question_context = "不指定題目"
+if "chat_question_payload" not in st.session_state:
+    st.session_state.chat_question_payload = None
+if "chat_question_context_label" not in st.session_state:
+    st.session_state.chat_question_context_label = "未指定題目"
+if "chat_active_job_id" not in st.session_state:
+    st.session_state.chat_active_job_id = None
+if "chat_active_assistant_index" not in st.session_state:
+    st.session_state.chat_active_assistant_index = None
 if "draft_flash" not in st.session_state:
     st.session_state.draft_flash = ""
 if "draft_flash_level" not in st.session_state:
@@ -2484,9 +2685,17 @@ with st.sidebar:
         st.markdown(f"**Agent 狀態:** {status}")
         st.caption(f"Provider: {st.session_state.agent_provider_name}")
         st.caption(f"狀態訊息: {st.session_state.agent_status_reason}")
+        mcp_status = (
+            "可用"
+            if provider_supports_repo_mcp(st.session_state.agent_provider_name, st.session_state.agent_meta)
+            else "未接通"
+        )
+        st.caption(f"Repo MCP 工具: {mcp_status}")
 
         if st.session_state.agent_model:
             st.caption(f"模型: {st.session_state.agent_model}")
+        if st.session_state.agent_meta.get("workspace"):
+            st.caption(f"Workspace: {st.session_state.agent_meta['workspace']}")
 
         if st.session_state.agent_meta.get("mcp_servers"):
             with st.expander("MCP Servers"):
@@ -2514,6 +2723,187 @@ with st.sidebar:
         if content_stats["generated_exam_count"]:
             st.caption(f"另有 {content_stats['generated_exam_count']} 份練習考卷檔。")
         st.caption("一般題庫 = AI / 正式題；歷屆題庫 = 匯入考古題。")
+
+
+_chat_panel_fragment = st.fragment if hasattr(st, "fragment") else (lambda func: func)
+
+
+def rerun_chat_panel() -> None:
+    """Prefer fragment-local reruns for chat interactions, with older Streamlit fallback."""
+    try:
+        st.rerun(scope="fragment")
+    except TypeError:
+        st.rerun()
+    except Exception as exc:  # noqa: BLE001
+        if "fragment" in str(exc).lower() or "scope" in str(exc).lower():
+            st.rerun()
+        raise
+
+
+def sync_active_chat_stream() -> None:
+    """Refresh the in-flight assistant message from the background stream job."""
+    job_id = str(st.session_state.get("chat_active_job_id") or "").strip()
+    assistant_index = st.session_state.get("chat_active_assistant_index")
+    if not job_id or not isinstance(assistant_index, int):
+        return
+
+    messages = st.session_state.get("messages") or []
+    if assistant_index < 0 or assistant_index >= len(messages):
+        CHAT_STREAM_JOBS.cancel(job_id, reason="stream target message missing")
+        st.session_state.chat_active_job_id = None
+        st.session_state.chat_active_assistant_index = None
+        return
+
+    snapshot = CHAT_STREAM_JOBS.snapshot(job_id)
+    message = messages[assistant_index]
+    streamed_content = str(snapshot.get("content") or "")
+    status = str(snapshot.get("status") or "error")
+    error_message = str(snapshot.get("error") or "")
+
+    if streamed_content:
+        message["content"] = streamed_content
+
+    if status == "running":
+        message["streaming"] = True
+        return
+
+    message.pop("streaming", None)
+    if status == "done":
+        if not str(message.get("content") or "").strip():
+            message["content"] = "無回應"
+    elif status == "cancelled":
+        if not str(message.get("content") or "").strip():
+            message["content"] = f"[中止] {error_message or '回應已停止'}"
+    else:
+        fallback_error = f"[錯誤] {error_message or '聊天串流失敗'}"
+        if streamed_content:
+            message["content"] = f"{streamed_content}\n\n{fallback_error}"
+        else:
+            message["content"] = fallback_error
+
+    st.session_state.chat_active_job_id = None
+    st.session_state.chat_active_assistant_index = None
+
+
+def stop_active_chat_stream(reason: str = "回應已停止") -> None:
+    """Stop tracking the current stream and recover the chat UI immediately."""
+    job_id = str(st.session_state.get("chat_active_job_id") or "").strip()
+    assistant_index = st.session_state.get("chat_active_assistant_index")
+    messages = st.session_state.get("messages") or []
+
+    if job_id:
+        CHAT_STREAM_JOBS.cancel(job_id, reason=reason)
+
+    if isinstance(assistant_index, int) and 0 <= assistant_index < len(messages):
+        message = messages[assistant_index]
+        message.pop("streaming", None)
+        if not str(message.get("content") or "").strip():
+            message["content"] = f"[中止] {reason}"
+
+    st.session_state.chat_active_job_id = None
+    st.session_state.chat_active_assistant_index = None
+
+
+@_chat_panel_fragment
+def render_chat_panel(current_page: str) -> None:
+    """Render the persistent assistant panel behind a fragment rerun boundary."""
+    _ = current_page
+    sync_active_chat_stream()
+    chat_stream_running = bool(st.session_state.get("chat_active_job_id"))
+
+    with st.container(border=True):
+        st.subheader("💬 AI 助手")
+
+        selected_question = get_active_chat_question_context()
+        if selected_question:
+            source_state = "精確來源可用" if question_has_precise_source(selected_question) else "來源待補強"
+            context_col1, context_col2 = st.columns([3.4, 1])
+            with context_col1:
+                st.caption(f"目前上下文：{st.session_state.chat_question_context_label} · {source_state}")
+            with context_col2:
+                if st.button("清除題目", key="chat_context_clear", width="stretch"):
+                    clear_chat_question_context()
+                    rerun_chat_panel()
+        else:
+            st.caption("目前上下文：未指定題目。請在作答、審題或生成預覽按「🦞 問龍蝦這題」。")
+
+        quick_prompt = ""
+        if not st.session_state.messages:
+            render_empty_state("從右側開始即時討論", "你可以詢問題目詳解、誘答選項設計，或請 AI 幫你檢查目前工作流。")
+            qp_col1, qp_col2, qp_col3 = st.columns(3)
+            if qp_col1.button("流程建議", width="stretch"):
+                quick_prompt = CHAT_QUICK_PROMPTS[0]
+            if qp_col2.button("檢查詳解", width="stretch"):
+                quick_prompt = CHAT_QUICK_PROMPTS[1]
+            if qp_col3.button("審閱清單", width="stretch"):
+                quick_prompt = CHAT_QUICK_PROMPTS[2]
+
+        chat_container = st.container(height=520)
+        with chat_container:
+            active_idx = st.session_state.get("chat_active_assistant_index")
+            for message_index, message in enumerate(st.session_state.messages):
+                with st.chat_message(message["role"]):
+                    content = str(message.get("content") or "")
+                    if chat_stream_running and message_index == active_idx and message.get("role") == "assistant":
+                        st.markdown(content + "▌" if content else "▌")
+                    else:
+                        st.markdown(content)
+
+        if not st.session_state.agent_available:
+            st.warning("⚠️ Agent 未連線")
+
+        prompt = st.chat_input(
+            "輸入問題...",
+            key="chat_input",
+            disabled=(not st.session_state.agent_available) or chat_stream_running,
+        )
+        if quick_prompt:
+            prompt = quick_prompt
+
+    if prompt:
+        st.session_state.messages.append({"role": "user", "content": prompt, "timestamp": datetime.now().isoformat()})
+
+        if st.session_state.agent_available:
+            effective_prompt = build_discussion_prompt(prompt, selected_question)
+            st.session_state.messages.append(
+                {"role": "assistant", "content": "", "timestamp": datetime.now().isoformat(), "streaming": True}
+            )
+            assistant_index = len(st.session_state.messages) - 1
+            try:
+                provider = st.session_state.agent_provider
+                if provider is None:
+                    raise RuntimeError("agent provider unavailable")
+                job_id = CHAT_STREAM_JOBS.start(
+                    lambda _prompt=effective_prompt, _provider=provider: stream_agent_response(_prompt, _provider)
+                )
+                st.session_state.chat_active_job_id = job_id
+                st.session_state.chat_active_assistant_index = assistant_index
+            except Exception as exc:  # noqa: BLE001
+                st.session_state.messages[assistant_index]["content"] = f"[錯誤] {exc}"
+                st.session_state.messages[assistant_index].pop("streaming", None)
+                st.session_state.chat_active_job_id = None
+                st.session_state.chat_active_assistant_index = None
+        else:
+            st.session_state.messages.append(
+                {"role": "assistant", "content": "[錯誤] Agent 未連線", "timestamp": datetime.now().isoformat()}
+            )
+
+        rerun_chat_panel()
+
+    if chat_stream_running and st.button("⏹️ 停止回應", key="chat_stop_stream", width="stretch"):
+        stop_active_chat_stream("使用者中止回應")
+        rerun_chat_panel()
+
+    if st.session_state.messages:
+        if st.button("🗑️ 清除對話", width="stretch"):
+            if chat_stream_running:
+                stop_active_chat_stream("使用者清除對話")
+            st.session_state.messages = []
+            rerun_chat_panel()
+
+    if chat_stream_running:
+        time.sleep(0.15)
+        rerun_chat_panel()
 
 
 # ===== 主區域：三欄佈局 (操作區 2/3 + 常駐 Chat 1/3) =====
@@ -2618,8 +3008,11 @@ with main_col:
                         )
 
                     if st.button("⚙️ 執行 ETL（ingest_documents）", width="stretch"):
-                        if st.session_state.agent_provider_name not in ("crush", "opencode"):
-                            st.error("ETL 需要支援 MCP 的 agent（crush 或 opencode）。")
+                        if not provider_supports_repo_mcp(
+                            st.session_state.agent_provider_name,
+                            st.session_state.agent_meta,
+                        ):
+                            st.error("ETL 需要支援 repo MCP 工具的 agent；請先確認目前 provider 已完成 repo bootstrap。")
                         elif not st.session_state.agent_available:
                             st.error("Agent 未連線，無法執行 ETL。")
                         elif uploaded_pdf is None:
@@ -2644,6 +3037,7 @@ with main_col:
                                             bool(etl_extract_figures),
                                         )
                                         st.session_state.etl_last_result = result_text
+                                        invalidate_document_caches()
                                         st.success("ETL 已觸發，請在下方已索引教材清單選擇剛剛 ingest 的教材。")
                                         st.code(result_text)
                                     except ValueError as e:
@@ -2754,7 +3148,7 @@ with main_col:
 
                 st.markdown("---")
 
-                indexed_docs = load_indexed_documents()
+                indexed_docs = indexed_docs_snapshot
                 st.markdown("##### 2-2 依來源模式設定題材")
 
                 if source_mode in (SOURCE_MODE_EXISTING, SOURCE_MODE_UPLOAD) and indexed_docs:
@@ -2870,6 +3264,11 @@ with main_col:
                 generation_blocked = False
                 if source_mode == SOURCE_MODE_TEMPLATE:
                     generation_blocked = selected_template_context is None
+                elif not provider_supports_repo_mcp(
+                    st.session_state.agent_provider_name,
+                    st.session_state.agent_meta,
+                ):
+                    generation_blocked = True
                 elif not selected_doc_ids:
                     generation_blocked = True
                 elif strict_source_tracking and missing_precise_docs:
@@ -2878,6 +3277,11 @@ with main_col:
                 st.markdown("##### Step 3. 確認模式並開始生成")
                 if source_mode == SOURCE_MODE_TEMPLATE:
                     st.info("目前是模板改寫模式：會先生成預覽題目，審題與正式入庫請到題庫管理。")
+                elif not provider_supports_repo_mcp(
+                    st.session_state.agent_provider_name,
+                    st.session_state.agent_meta,
+                ):
+                    st.warning("目前 provider 未接通 repo MCP 工具；教材 ETL、知識檢索與教材出題流程暫時無法使用。")
                 elif preview_only_mode:
                     st.info("目前是 preview-only 模式：可先驗證內容方向，但不應視為正式入庫題。")
                 elif selected_doc_ids:
@@ -2898,6 +3302,11 @@ with main_col:
             if submitted:
                 if not st.session_state.agent_available:
                     st.error("❌ Agent 未連線，無法生成")
+                elif source_mode != SOURCE_MODE_TEMPLATE and not provider_supports_repo_mcp(
+                    st.session_state.agent_provider_name,
+                    st.session_state.agent_meta,
+                ):
+                    st.error("❌ 目前 provider 未接通 repo MCP 工具；教材出題流程暫時無法使用。")
                 elif source_mode == SOURCE_MODE_TEMPLATE and not selected_template_context:
                     st.error("❌ 目前尚未選定歷史模板。")
                 elif source_mode != SOURCE_MODE_TEMPLATE and not selected_doc_ids:
@@ -2990,6 +3399,8 @@ with main_col:
                     # 完成訊息
                     if all_questions:
                         autosaved_count = autosave_generated_questions_to_drafts(all_questions)
+                        if autosaved_count:
+                            invalidate_draft_caches()
                         st.session_state.generated_questions_auto_saved = autosaved_count > 0
                         formal_ready_count = sum(1 for question in all_questions if question_formal_save_ready(question))
                         preview_only_count = sum(1 for question in all_questions if question.get("preview_only"))
@@ -3037,6 +3448,8 @@ with main_col:
                             preview_questions = build_e2e_textbook_review_questions("preview")
                             st.session_state.generated_questions = preview_questions
                             autosaved_count = autosave_generated_questions_to_drafts(preview_questions)
+                            if autosaved_count:
+                                invalidate_draft_caches()
                             st.session_state.generated_questions_auto_saved = autosaved_count > 0
                             st.session_state.last_generation_response = "E2E preview-only textbook review payload"
                             st.rerun()
@@ -3045,6 +3458,8 @@ with main_col:
                             formal_questions = build_e2e_textbook_review_questions("formal")
                             st.session_state.generated_questions = formal_questions
                             autosaved_count = autosave_generated_questions_to_drafts(formal_questions)
+                            if autosaved_count:
+                                invalidate_draft_caches()
                             st.session_state.generated_questions_auto_saved = autosaved_count > 0
                             st.session_state.last_generation_response = "E2E formal-save textbook review payload"
                             st.rerun()
@@ -3060,6 +3475,7 @@ with main_col:
                     st.session_state.generated_questions,
                     navigate_to=navigate_to,
                     auto_saved_to_drafts=bool(st.session_state.get("generated_questions_auto_saved")),
+                    question_context_callback=set_chat_question_context,
                 )
 
                 # 顯示操作按鈕
@@ -3363,6 +3779,9 @@ with main_col:
                     st.markdown(q.get("question_text", ""))
                     render_past_exam_question_assets(q)
 
+                    if st.button("🦞 問龍蝦這題", key=f"practice_chat_{q_id}", width="stretch"):
+                        set_chat_question_context(q, "作答練習")
+
                     # 選項
                     options = q.get("options", [])
                     option_labels = [
@@ -3489,19 +3908,36 @@ with main_col:
                     pattern_rows = build_practice_breakdown_rows(result_rows, group_key="pattern_label", label="題型")
                     weak_topic_rows = build_practice_weak_topic_rows(result_rows)
 
-                    year_tab, exam_tab, pattern_tab, review_tab = st.tabs(
-                        [
-                            "年度表現",
-                            "考卷表現",
-                            "題型與主題",
-                            f"錯題回顧 ({len(review_rows)})",
-                        ]
-                    )
-                    with year_tab:
+                    stats_sections = ["year", "exam", "pattern", "review"]
+                    stats_labels = {
+                        "year": "年度表現",
+                        "exam": "考卷表現",
+                        "pattern": "題型與主題",
+                        "review": f"錯題回顧 ({len(review_rows)})",
+                    }
+                    try:
+                        selected_stats_section = st.radio(
+                            "考古題統計視圖",
+                            options=stats_sections,
+                            format_func=lambda section: stats_labels.get(section, section),
+                            key="past_exam_practice_stats_section",
+                            horizontal=True,
+                            label_visibility="collapsed",
+                        )
+                    except TypeError:
+                        selected_stats_section = st.radio(
+                            "考古題統計視圖",
+                            options=stats_sections,
+                            format_func=lambda section: stats_labels.get(section, section),
+                            key="past_exam_practice_stats_section",
+                            label_visibility="collapsed",
+                        )
+
+                    if selected_stats_section == "year":
                         st.dataframe(year_rows, width="stretch", hide_index=True)
-                    with exam_tab:
+                    elif selected_stats_section == "exam":
                         st.dataframe(exam_rows, width="stretch", hide_index=True)
-                    with pattern_tab:
+                    elif selected_stats_section == "pattern":
                         pattern_col1, pattern_col2 = st.columns(2)
                         with pattern_col1:
                             st.dataframe(pattern_rows, width="stretch", hide_index=True)
@@ -3510,7 +3946,7 @@ with main_col:
                                 st.dataframe(weak_topic_rows, width="stretch", hide_index=True)
                             else:
                                 st.success("本回合沒有錯題，主題弱點暫時為空。")
-                    with review_tab:
+                    else:
                         if not review_rows:
                             st.success("本回合全部答對，沒有可回顧的錯題。")
                         else:
@@ -3631,391 +4067,488 @@ with main_col:
             [q for q in base_filtered_questions if q.get("is_validated")] if bank_validated_only else base_filtered_questions
         )
         pending_questions = [q for q in base_filtered_questions if not q.get("is_validated")]
-        tab_general, tab_history, tab_review, tab_drafts = st.tabs(
-            [
-                f"一般題庫 ({len(filtered_questions)})",
-                f"歷屆題庫 ({content_stats['past_exam_question_count']})",
-                f"待審題目 ({len(pending_questions)})",
-                f"待審草稿 ({draft_stats.get('draft', 0)})",
-            ]
-        )
+        bank_sections = ["general", "history", "pending", "drafts"]
+        bank_section_labels = {
+            "general": f"一般題庫 ({len(filtered_questions)})",
+            "history": f"歷屆題庫 ({content_stats['past_exam_question_count']})",
+            "pending": f"待審題目 ({len(pending_questions)})",
+            "drafts": f"待審草稿 ({draft_stats.get('draft', 0)})",
+        }
+        try:
+            selected_bank_section = st.radio(
+                "題庫分頁",
+                options=bank_sections,
+                format_func=lambda section: bank_section_labels.get(section, section),
+                key="bank_active_section",
+                horizontal=True,
+                label_visibility="collapsed",
+            )
+        except TypeError:
+            selected_bank_section = st.radio(
+                "題庫分頁",
+                options=bank_sections,
+                format_func=lambda section: bank_section_labels.get(section, section),
+                key="bank_active_section",
+                label_visibility="collapsed",
+            )
 
-        if not questions:
-            st.info("📭 題庫空空如也，請先生成考題！")
-        else:
-            with tab_general:
-                summary_col1, summary_col2 = st.columns([1, 1])
-                with summary_col1:
-                    st.caption(f"顯示 {len(filtered_questions)} / {len(questions)} 題（一般題庫）")
-                with summary_col2:
-                    if filtered_questions and st.button(
-                        "✍️ 用目前篩選結果練習",
-                        width="stretch",
-                        key="bank_filtered_practice",
-                    ):
-                        queue_practice_session(
-                            filtered_questions[:10],
-                            {
-                                "source_type": PRACTICE_SOURCE_GENERAL,
-                                "label": "題庫篩選結果",
-                            },
-                        )
-                        st.rerun()
-
-                if not filtered_questions:
-                    render_empty_state("沒有符合條件的題目", "試著放寬關鍵字、難度或主題篩選。")
-                else:
-                    st.dataframe(build_question_scan_rows(filtered_questions), width="stretch", hide_index=True)
-                    st.caption("先用表格快速掃描，再展開單題做審查與修正。")
-                    for i, question in enumerate(filtered_questions, start=1):
-                        render_question_review_expander(question, i, key_prefix="bank_all")
-
-            with tab_history:
-                st.caption("歷屆題庫與一般題庫分開存放；這裡列的是已匯入的考古題與考卷。")
-                if not past_exam_catalog:
-                    render_empty_state("尚未匯入歷屆考卷", "請先執行歷屆考題匯入流程。")
-                else:
-                    explanation_service = get_past_exam_explanation_service()
-                    st.dataframe(build_past_exam_scan_rows(past_exam_catalog), width="stretch", hide_index=True)
-                    selected_past_exam_id = st.selectbox(
-                        "檢視歷屆考卷",
-                        options=[exam["id"] for exam in past_exam_catalog],
-                        format_func=lambda exam_id: next(
-                            (
-                                f"{exam['exam_year']}｜{exam['exam_name']}"
-                                for exam in past_exam_catalog
-                                if exam["id"] == exam_id
-                            ),
-                            exam_id,
-                        ),
-                        key="selected_past_exam_id",
-                    ) or past_exam_catalog[0]["id"]
-                    selected_past_exam = next(
-                        (exam for exam in past_exam_catalog if exam["id"] == selected_past_exam_id),
-                        past_exam_catalog[0],
+        if selected_bank_section == "general":
+            summary_col1, summary_col2 = st.columns([1, 1])
+            with summary_col1:
+                st.caption(f"顯示 {len(filtered_questions)} / {len(questions)} 題（一般題庫）")
+            with summary_col2:
+                if filtered_questions and st.button(
+                    "✍️ 用目前篩選結果練習",
+                    width="stretch",
+                    key="bank_filtered_practice",
+                ):
+                    queue_practice_session(
+                        filtered_questions[:10],
+                        {
+                            "source_type": PRACTICE_SOURCE_GENERAL,
+                            "label": "題庫篩選結果",
+                        },
                     )
-                    past_exam_questions = load_past_exam_questions(selected_past_exam_id)
-                    explanation_ready_count = sum(
-                        1 for question in past_exam_questions if str(question.get("explanation") or "").strip()
-                    )
-                    missing_explanation_count = len(past_exam_questions) - explanation_ready_count
+                    st.rerun()
 
-                    status_col1, status_col2, status_col3 = st.columns(3)
-                    with status_col1:
-                        st.metric("本卷題數", len(past_exam_questions))
-                    with status_col2:
-                        st.metric("已有詳解", explanation_ready_count)
-                    with status_col3:
-                        st.metric("待補詳解", missing_explanation_count)
-
-                    filter_col1, filter_col2, filter_col3 = st.columns([1.5, 1, 1])
-                    with filter_col1:
-                        past_exam_query = st.text_input(
-                            "搜尋歷屆題目",
-                            placeholder="輸入關鍵字，例如 malignant hyperthermia",
-                            key="past_exam_query",
-                        )
-                    with filter_col2:
-                        past_exam_missing_only = st.checkbox(
-                            "只看缺詳解",
-                            value=False,
-                            key="past_exam_missing_only",
-                        )
-                    with filter_col3:
-                        past_exam_batch_limit = st.number_input(
-                            "批次補寫題數",
+            if not questions:
+                st.info("📭 題庫空空如也，請先生成考題！")
+            elif not filtered_questions:
+                render_empty_state("沒有符合條件的題目", "試著放寬關鍵字、難度或主題篩選。")
+            else:
+                st.dataframe(build_question_scan_rows(filtered_questions), width="stretch", hide_index=True)
+                show_general_review_panel = st.checkbox(
+                    "顯示一般題庫單題審閱面板",
+                    value=False,
+                    key="bank_general_show_review_panel",
+                )
+                if not show_general_review_panel:
+                    st.caption("目前只顯示掃描表格；需要逐題審閱時再開啟單題面板。")
+                else:
+                    detail_limit = int(
+                        st.number_input(
+                            "一般題庫審閱面板載入數",
                             min_value=1,
-                            max_value=10,
-                            value=3,
+                            max_value=100,
+                            value=min(12, len(filtered_questions)),
                             step=1,
-                            key="past_exam_batch_limit",
+                            key="bank_general_detail_limit",
                         )
-
-                    filtered_past_exam_questions = list(past_exam_questions)
-                    if past_exam_query:
-                        query = past_exam_query.strip().lower()
-                        filtered_past_exam_questions = [
-                            question
-                            for question in filtered_past_exam_questions
-                            if query in question.get("question_text", "").lower()
-                            or query in str(question.get("explanation") or "").lower()
-                        ]
-                    if past_exam_missing_only:
-                        filtered_past_exam_questions = [
-                            question
-                            for question in filtered_past_exam_questions
-                            if not str(question.get("explanation") or "").strip()
-                        ]
-
-                    provider_for_explanation = (
-                        st.session_state.agent_provider if st.session_state.agent_available else None
                     )
-                    explanation_available, explanation_reason = explanation_service.get_generation_availability(
-                        provider=provider_for_explanation
-                    )
-
-                    action_col1, action_col2 = st.columns([1, 1.2])
-                    with action_col1:
-                        if st.button(
-                            "🤖 批次補本卷缺詳解",
-                            width="stretch",
-                            key=f"past_exam_batch_generate_{selected_past_exam_id}",
-                            disabled=not explanation_available or not filtered_past_exam_questions,
-                        ):
-                            with st.spinner("正在生成並寫回考古題詳解..."):
-                                batch_result = explanation_service.generate_and_save_missing_explanations(
-                                    filtered_past_exam_questions,
-                                    provider=provider_for_explanation,
-                                    limit=int(past_exam_batch_limit),
-                                )
-                            for item in batch_result["generated"]:
-                                update_question_explanation_in_place(
-                                    past_exam_questions,
-                                    str(item.get("question_id") or ""),
-                                    str(item.get("explanation") or ""),
-                                )
-                                update_question_explanation_in_place(
-                                    filtered_past_exam_questions,
-                                    str(item.get("question_id") or ""),
-                                    str(item.get("explanation") or ""),
-                                )
-
-                            if batch_result["generated"]:
-                                st.success(f"已補寫並存檔 {len(batch_result['generated'])} 題詳解。")
-                            if batch_result["errors"]:
-                                st.warning(f"有 {len(batch_result['errors'])} 題補寫失敗，請查看 log 或稍後重試。")
-
-                            if past_exam_missing_only:
-                                filtered_past_exam_questions = [
-                                    question
-                                    for question in filtered_past_exam_questions
-                                    if not str(question.get("explanation") or "").strip()
-                                ]
-                    with action_col2:
-                        if explanation_available:
-                            st.caption(f"詳解生成可用：{explanation_reason}")
-                        else:
-                            st.warning(f"目前無法生成詳解：{explanation_reason}")
-
+                    detail_questions = filtered_questions[:detail_limit]
                     st.caption(
-                        f"{selected_past_exam['exam_name']}：顯示 {len(filtered_past_exam_questions)} / "
-                        f"{selected_past_exam['total_questions']} 題"
+                        f"先用表格快速掃描，再展開單題做審查與修正（目前載入前 {len(detail_questions)} 題）。"
                     )
-                    st.dataframe(
-                        [
-                            {
-                                "題號": question.get("question_number", 0),
-                                "題目": (
-                                    question.get("question_text", "")[:56].rstrip() + "..."
-                                    if len(question.get("question_text", "")) > 56
-                                    else question.get("question_text", "")
-                                ),
-                                "難度": question.get("difficulty", "medium"),
-                                "答案": question.get("correct_answer", "") or "-",
-                                "詳解": "已有" if str(question.get("explanation") or "").strip() else "待補",
-                                "頁碼": question.get("source_page") or "-",
-                            }
-                            for question in filtered_past_exam_questions
-                        ],
-                        width="stretch",
-                        hide_index=True,
+                    for i, question in enumerate(detail_questions, start=1):
+                        render_question_review_expander(question, i, key_prefix="bank_all")
+                    if len(filtered_questions) > detail_limit:
+                        st.info(
+                            f"尚有 {len(filtered_questions) - detail_limit} 題未展開。可調高載入數，或先縮小搜尋條件。"
+                        )
+
+        elif selected_bank_section == "history":
+            st.caption("歷屆題庫與一般題庫分開存放；這裡列的是已匯入的考古題與考卷。")
+            if not past_exam_catalog:
+                render_empty_state("尚未匯入歷屆考卷", "請先執行歷屆考題匯入流程。")
+            else:
+                explanation_service = get_past_exam_explanation_service()
+                st.dataframe(build_past_exam_scan_rows(past_exam_catalog), width="stretch", hide_index=True)
+                selected_past_exam_id = st.selectbox(
+                    "檢視歷屆考卷",
+                    options=[exam["id"] for exam in past_exam_catalog],
+                    format_func=lambda exam_id: next(
+                        (
+                            f"{exam['exam_year']}｜{exam['exam_name']}"
+                            for exam in past_exam_catalog
+                            if exam["id"] == exam_id
+                        ),
+                        exam_id,
+                    ),
+                    key="selected_past_exam_id",
+                ) or past_exam_catalog[0]["id"]
+                selected_past_exam = next(
+                    (exam for exam in past_exam_catalog if exam["id"] == selected_past_exam_id),
+                    past_exam_catalog[0],
+                )
+                past_exam_questions = load_past_exam_questions(selected_past_exam_id)
+                explanation_ready_count = sum(
+                    1 for question in past_exam_questions if str(question.get("explanation") or "").strip()
+                )
+                missing_explanation_count = len(past_exam_questions) - explanation_ready_count
+
+                status_col1, status_col2, status_col3 = st.columns(3)
+                with status_col1:
+                    st.metric("本卷題數", len(past_exam_questions))
+                with status_col2:
+                    st.metric("已有詳解", explanation_ready_count)
+                with status_col3:
+                    st.metric("待補詳解", missing_explanation_count)
+
+                filter_col1, filter_col2, filter_col3 = st.columns([1.5, 1, 1])
+                with filter_col1:
+                    past_exam_query = st.text_input(
+                        "搜尋歷屆題目",
+                        placeholder="輸入關鍵字，例如 malignant hyperthermia",
+                        key="past_exam_query",
+                    )
+                with filter_col2:
+                    past_exam_missing_only = st.checkbox(
+                        "只看缺詳解",
+                        value=False,
+                        key="past_exam_missing_only",
+                    )
+                with filter_col3:
+                    past_exam_batch_limit = st.number_input(
+                        "批次補寫題數",
+                        min_value=1,
+                        max_value=10,
+                        value=3,
+                        step=1,
+                        key="past_exam_batch_limit",
                     )
 
-                    if not filtered_past_exam_questions:
-                        render_empty_state("目前沒有符合條件的歷屆題目", "試著放寬搜尋條件，或取消「只看缺詳解」。")
-                    else:
-                        selected_past_exam_question_id = st.selectbox(
-                            "檢視歷屆題目",
-                            options=[question["id"] for question in filtered_past_exam_questions],
-                            format_func=lambda question_id: next(
-                                (
-                                    f"第 {question['question_number']} 題｜{question.get('question_text', '')[:48]}"
-                                    for question in filtered_past_exam_questions
-                                    if question["id"] == question_id
-                                ),
-                                question_id,
-                            ),
-                            key=f"selected_past_exam_question_{selected_past_exam_id}",
-                        )
-                        selected_past_exam_question = next(
-                            (
+                filtered_past_exam_questions = list(past_exam_questions)
+                if past_exam_query:
+                    query = past_exam_query.strip().lower()
+                    filtered_past_exam_questions = [
+                        question
+                        for question in filtered_past_exam_questions
+                        if query in question.get("question_text", "").lower()
+                        or query in str(question.get("explanation") or "").lower()
+                    ]
+                if past_exam_missing_only:
+                    filtered_past_exam_questions = [
+                        question
+                        for question in filtered_past_exam_questions
+                        if not str(question.get("explanation") or "").strip()
+                    ]
+
+                provider_for_explanation = (
+                    st.session_state.agent_provider if st.session_state.agent_available else None
+                )
+                explanation_available, explanation_reason = explanation_service.get_generation_availability(
+                    provider=provider_for_explanation
+                )
+
+                action_col1, action_col2 = st.columns([1, 1.2])
+                with action_col1:
+                    if st.button(
+                        "🤖 批次補本卷缺詳解",
+                        width="stretch",
+                        key=f"past_exam_batch_generate_{selected_past_exam_id}",
+                        disabled=not explanation_available or not filtered_past_exam_questions,
+                    ):
+                        with st.spinner("正在生成並寫回考古題詳解..."):
+                            batch_result = explanation_service.generate_and_save_missing_explanations(
+                                filtered_past_exam_questions,
+                                provider=provider_for_explanation,
+                                limit=int(past_exam_batch_limit),
+                            )
+                        invalidate_past_exam_caches()
+                        for item in batch_result["generated"]:
+                            update_question_explanation_in_place(
+                                past_exam_questions,
+                                str(item.get("question_id") or ""),
+                                str(item.get("explanation") or ""),
+                            )
+                            update_question_explanation_in_place(
+                                filtered_past_exam_questions,
+                                str(item.get("question_id") or ""),
+                                str(item.get("explanation") or ""),
+                            )
+
+                        if batch_result["generated"]:
+                            st.success(f"已補寫並存檔 {len(batch_result['generated'])} 題詳解。")
+                        if batch_result["errors"]:
+                            st.warning(f"有 {len(batch_result['errors'])} 題補寫失敗，請查看 log 或稍後重試。")
+
+                        if past_exam_missing_only:
+                            filtered_past_exam_questions = [
                                 question
                                 for question in filtered_past_exam_questions
-                                if question["id"] == selected_past_exam_question_id
+                                if not str(question.get("explanation") or "").strip()
+                            ]
+                with action_col2:
+                    if explanation_available:
+                        st.caption(f"詳解生成可用：{explanation_reason}")
+                    else:
+                        st.warning(f"目前無法生成詳解：{explanation_reason}")
+
+                st.caption(
+                    f"{selected_past_exam['exam_name']}：顯示 {len(filtered_past_exam_questions)} / "
+                    f"{selected_past_exam['total_questions']} 題"
+                )
+                st.dataframe(
+                    [
+                        {
+                            "題號": question.get("question_number", 0),
+                            "題目": (
+                                question.get("question_text", "")[:56].rstrip() + "..."
+                                if len(question.get("question_text", "")) > 56
+                                else question.get("question_text", "")
                             ),
-                            filtered_past_exam_questions[0],
-                        )
-                        reference_matches = explanation_service.find_reference_matches(
-                            selected_past_exam_question,
-                            limit=5,
-                        )
-                        textbook_evidence = _resolve_textbook_evidence(
-                            explanation_service,
-                            selected_past_exam_question,
-                        )
+                            "難度": question.get("difficulty", "medium"),
+                            "答案": question.get("correct_answer", "") or "-",
+                            "詳解": "已有" if str(question.get("explanation") or "").strip() else "待補",
+                            "頁碼": question.get("source_page") or "-",
+                        }
+                        for question in filtered_past_exam_questions
+                    ],
+                    width="stretch",
+                    hide_index=True,
+                )
 
-                        with st.container(border=True):
+                if not filtered_past_exam_questions:
+                    render_empty_state("目前沒有符合條件的歷屆題目", "試著放寬搜尋條件，或取消「只看缺詳解」。")
+                else:
+                    selected_past_exam_question_id = st.selectbox(
+                        "檢視歷屆題目",
+                        options=[question["id"] for question in filtered_past_exam_questions],
+                        format_func=lambda question_id: next(
+                            (
+                                f"第 {question['question_number']} 題｜{question.get('question_text', '')[:48]}"
+                                for question in filtered_past_exam_questions
+                                if question["id"] == question_id
+                            ),
+                            question_id,
+                        ),
+                        key=f"selected_past_exam_question_{selected_past_exam_id}",
+                    )
+                    selected_past_exam_question = next(
+                        (
+                            question
+                            for question in filtered_past_exam_questions
+                            if question["id"] == selected_past_exam_question_id
+                        ),
+                        filtered_past_exam_questions[0],
+                    )
+                    evidence_state_key = f"past_exam_context_evidence_{selected_past_exam_question['id']}"
+                    evidence_state = st.session_state.get(evidence_state_key) or {}
+                    reference_matches = (
+                        list(evidence_state.get("reference_matches") or [])
+                        if isinstance(evidence_state, dict)
+                        else []
+                    )
+                    textbook_evidence = (
+                        dict(evidence_state.get("textbook_evidence") or {})
+                        if isinstance(evidence_state, dict)
+                        else {}
+                    ) or _empty_textbook_evidence_pack("尚未載入教材定位")
+
+                    if st.button(
+                        "🔎 載入參考脈絡與教材定位",
+                        width="stretch",
+                        key=f"past_exam_load_context_{selected_past_exam_question['id']}",
+                    ):
+                        with st.spinner("正在查找參考題與教材定位..."):
+                            reference_matches = explanation_service.find_reference_matches(
+                                selected_past_exam_question,
+                                limit=5,
+                            )
+                            textbook_evidence = _resolve_textbook_evidence(
+                                explanation_service,
+                                selected_past_exam_question,
+                            )
+                        st.session_state[evidence_state_key] = {
+                            "reference_matches": reference_matches,
+                            "textbook_evidence": textbook_evidence,
+                        }
+
+                    with st.container(border=True):
+                        st.markdown(
+                            f"### 第 {selected_past_exam_question.get('question_number', '-')} 題"
+                        )
+                        st.caption(
+                            f"{selected_past_exam_question.get('exam_year', '-')}"
+                            f"｜{selected_past_exam_question.get('exam_name', '考古題')}"
+                        )
+                        st.markdown(selected_past_exam_question.get("question_text", ""))
+                        render_past_exam_question_assets(selected_past_exam_question)
+
+                        st.markdown("**選項**")
+                        for option_index, option in enumerate(selected_past_exam_question.get("options", [])):
+                            st.markdown(f"- {chr(65 + option_index)}. {option}")
+
+                        meta_col1, meta_col2, meta_col3 = st.columns(3)
+                        with meta_col1:
+                            st.markdown(f"**答案:** {selected_past_exam_question.get('correct_answer', '-')}")
+                        with meta_col2:
+                            st.markdown(f"**難度:** {selected_past_exam_question.get('difficulty', 'medium')}")
+                        with meta_col3:
                             st.markdown(
-                                f"### 第 {selected_past_exam_question.get('question_number', '-')} 題"
+                                f"**主題:** {', '.join(selected_past_exam_question.get('topics', [])) or '-'}"
                             )
-                            st.caption(
-                                f"{selected_past_exam_question.get('exam_year', '-')}"
-                                f"｜{selected_past_exam_question.get('exam_name', '考古題')}"
-                            )
-                            st.markdown(selected_past_exam_question.get("question_text", ""))
-                            render_past_exam_question_assets(selected_past_exam_question)
 
-                            st.markdown("**選項**")
-                            for option_index, option in enumerate(selected_past_exam_question.get("options", [])):
-                                st.markdown(f"- {chr(65 + option_index)}. {option}")
+                        if selected_past_exam_question.get("explanation"):
+                            st.info(selected_past_exam_question["explanation"])
+                        else:
+                            st.warning("這題目前尚無詳解。")
 
-                            meta_col1, meta_col2, meta_col3 = st.columns(3)
-                            with meta_col1:
-                                st.markdown(f"**答案:** {selected_past_exam_question.get('correct_answer', '-')}")
-                            with meta_col2:
-                                st.markdown(f"**難度:** {selected_past_exam_question.get('difficulty', 'medium')}")
-                            with meta_col3:
-                                st.markdown(
-                                    f"**主題:** {', '.join(selected_past_exam_question.get('topics', [])) or '-'}"
+                        detail_col1, detail_col2, detail_col3 = st.columns([1, 1, 1])
+                        with detail_col1:
+                            if st.button(
+                                "🤖 產生並存入這題詳解",
+                                width="stretch",
+                                key=f"past_exam_generate_one_{selected_past_exam_question['id']}",
+                                disabled=not explanation_available,
+                            ):
+                                with st.spinner("正在生成這題詳解..."):
+                                    generated_result = explanation_service.generate_and_save_explanation(
+                                        selected_past_exam_question,
+                                        provider=provider_for_explanation,
+                                    )
+                                invalidate_past_exam_caches()
+                                textbook_evidence = generated_result.get("textbook_evidence") or textbook_evidence
+                                update_question_explanation_in_place(
+                                    past_exam_questions,
+                                    str(selected_past_exam_question["id"]),
+                                    generated_result["explanation"],
+                                )
+                                update_question_explanation_in_place(
+                                    filtered_past_exam_questions,
+                                    str(selected_past_exam_question["id"]),
+                                    generated_result["explanation"],
+                                )
+                                selected_past_exam_question["explanation"] = generated_result["explanation"]
+                                st.success("詳解已生成並寫回資料庫。")
+                        with detail_col2:
+                            if st.button(
+                                "✍️ 練這份考卷",
+                                width="stretch",
+                                key=f"past_exam_practice_{selected_past_exam_id}",
+                            ):
+                                queue_practice_session(
+                                    load_past_exam_question_pool([selected_past_exam_id]),
+                                    {
+                                        "source_type": PRACTICE_SOURCE_PAST_EXAM,
+                                        "label": "歷屆考卷",
+                                        "mode": "單份考卷",
+                                        "selected_exam_ids": [selected_past_exam_id],
+                                        "selected_exam_names": [selected_past_exam.get("exam_name", "考古題")],
+                                        "year_start": selected_past_exam.get("exam_year"),
+                                        "year_end": selected_past_exam.get("exam_year"),
+                                    },
+                                )
+                                navigate_to_without_query_sync("✍️ 作答練習")
+                                st.rerun()
+                        with detail_col3:
+                            if st.button(
+                                "🦞 問龍蝦這題",
+                                width="stretch",
+                                key=f"past_exam_chat_{selected_past_exam_question['id']}",
+                            ):
+                                set_chat_question_context(selected_past_exam_question, "歷屆審題")
+
+                        with st.expander(f"🔎 題庫參考脈絡 ({len(reference_matches)})", expanded=False):
+                            if not reference_matches:
+                                st.caption("目前沒有找到帶詳解的近似題，生成時會主要依題幹、選項與知識點推理。")
+                            else:
+                                st.dataframe(
+                                    [
+                                        {
+                                            "來源": reference.get("label", ""),
+                                            "答案": reference.get("correct_answer", ""),
+                                            "主題": ", ".join(reference.get("topics", [])),
+                                            "相似度": f"{float(reference.get('score', 0.0)):.2f}",
+                                            "題目": _truncate_text(reference.get("question_text", ""), 72),
+                                            "詳解摘要": _truncate_text(reference.get("explanation", ""), 120),
+                                        }
+                                        for reference in reference_matches
+                                    ],
+                                    width="stretch",
+                                    hide_index=True,
                                 )
 
-                            if selected_past_exam_question.get("explanation"):
-                                st.info(selected_past_exam_question["explanation"])
-                            else:
-                                st.warning("這題目前尚無詳解。")
-
-                            detail_col1, detail_col2 = st.columns([1, 1])
-                            with detail_col1:
-                                if st.button(
-                                    "🤖 產生並存入這題詳解",
-                                    width="stretch",
-                                    key=f"past_exam_generate_one_{selected_past_exam_question['id']}",
-                                    disabled=not explanation_available,
-                                ):
-                                    with st.spinner("正在生成這題詳解..."):
-                                        generated_result = explanation_service.generate_and_save_explanation(
-                                            selected_past_exam_question,
-                                            provider=provider_for_explanation,
-                                        )
-                                    textbook_evidence = generated_result.get("textbook_evidence") or textbook_evidence
-                                    update_question_explanation_in_place(
-                                        past_exam_questions,
-                                        str(selected_past_exam_question["id"]),
-                                        generated_result["explanation"],
-                                    )
-                                    update_question_explanation_in_place(
-                                        filtered_past_exam_questions,
-                                        str(selected_past_exam_question["id"]),
-                                        generated_result["explanation"],
-                                    )
-                                    selected_past_exam_question["explanation"] = generated_result["explanation"]
-                                    st.success("詳解已生成並寫回資料庫。")
-                            with detail_col2:
-                                if st.button(
-                                    "✍️ 練這份考卷",
-                                    width="stretch",
-                                    key=f"past_exam_practice_{selected_past_exam_id}",
-                                ):
-                                    queue_practice_session(
-                                        load_past_exam_question_pool([selected_past_exam_id]),
-                                        {
-                                            "source_type": PRACTICE_SOURCE_PAST_EXAM,
-                                            "label": "歷屆考卷",
-                                            "mode": "單份考卷",
-                                            "selected_exam_ids": [selected_past_exam_id],
-                                            "selected_exam_names": [selected_past_exam.get("exam_name", "考古題")],
-                                            "year_start": selected_past_exam.get("exam_year"),
-                                            "year_end": selected_past_exam.get("exam_year"),
-                                        },
-                                    )
-                                    navigate_to_without_query_sync("✍️ 作答練習")
-                                    st.rerun()
-
-                            with st.expander(f"🔎 題庫參考脈絡 ({len(reference_matches)})", expanded=False):
-                                if not reference_matches:
-                                    st.caption("目前沒有找到帶詳解的近似題，生成時會主要依題幹、選項與知識點推理。")
-                                else:
-                                    st.dataframe(
-                                        [
-                                            {
-                                                "來源": reference.get("label", ""),
-                                                "答案": reference.get("correct_answer", ""),
-                                                "主題": ", ".join(reference.get("topics", [])),
-                                                "相似度": f"{float(reference.get('score', 0.0)):.2f}",
-                                                "題目": _truncate_text(reference.get("question_text", ""), 72),
-                                                "詳解摘要": _truncate_text(reference.get("explanation", ""), 120),
-                                            }
-                                            for reference in reference_matches
-                                        ],
-                                        width="stretch",
-                                        hide_index=True,
-                                    )
-
-                            textbook_ready = bool(textbook_evidence.get("source_ready"))
-                            textbook_source = textbook_evidence.get("source") or {}
-                            textbook_locations = []
-                            for label, location in (
-                                ("題幹", textbook_source.get("stem_source")),
-                                ("答案", textbook_source.get("answer_source")),
-                            ):
-                                if location:
-                                    textbook_locations.append(
-                                        {
-                                            "定位": label,
-                                            "頁碼": location.get("page"),
-                                            "行號": f"L{location.get('line_start')}-{location.get('line_end')}",
-                                            "摘錄": _truncate_text(location.get("original_text", ""), 140),
-                                        }
-                                    )
-                            for index, location in enumerate(textbook_source.get("explanation_sources", []), start=1):
+                        textbook_ready = bool(textbook_evidence.get("source_ready"))
+                        textbook_source = textbook_evidence.get("source") or {}
+                        textbook_locations = []
+                        for label, location in (
+                            ("題幹", textbook_source.get("stem_source")),
+                            ("答案", textbook_source.get("answer_source")),
+                        ):
+                            if location:
                                 textbook_locations.append(
                                     {
-                                        "定位": f"詳解依據 {index}",
+                                        "定位": label,
                                         "頁碼": location.get("page"),
                                         "行號": f"L{location.get('line_start')}-{location.get('line_end')}",
                                         "摘錄": _truncate_text(location.get("original_text", ""), 140),
                                     }
                                 )
+                        for index, location in enumerate(textbook_source.get("explanation_sources", []), start=1):
+                            textbook_locations.append(
+                                {
+                                    "定位": f"詳解依據 {index}",
+                                    "頁碼": location.get("page"),
+                                    "行號": f"L{location.get('line_start')}-{location.get('line_end')}",
+                                    "摘錄": _truncate_text(location.get("original_text", ""), 140),
+                                }
+                            )
 
-                            with st.expander(
-                                f"📚 教材定位 ({'已命中' if textbook_ready else '未命中'})",
-                                expanded=False,
-                            ):
-                                if textbook_ready:
-                                    st.markdown(
-                                        f"**教材:** {textbook_evidence.get('matched_doc_title', '-')}"
-                                    )
-                                    st.markdown(
-                                        f"**章節:** "
-                                        f"{textbook_source.get('chapter', '-')}"
-                                        f"｜{textbook_source.get('section', '-')}"
-                                    )
-                                    if textbook_locations:
-                                        st.dataframe(textbook_locations, width='stretch', hide_index=True)
-                                else:
-                                    st.caption("目前沒有命中可精確引用的教材 block；生成時會明確避免捏造教材定位。")
-                                    gate_reasons = textbook_evidence.get("gate_reasons", [])
-                                    if gate_reasons:
-                                        st.write("未命中原因：")
-                                        for reason in gate_reasons:
-                                            st.markdown(f"- {reason}")
+                        with st.expander(
+                            f"📚 教材定位 ({'已命中' if textbook_ready else '未命中'})",
+                            expanded=False,
+                        ):
+                            if textbook_ready:
+                                st.markdown(
+                                    f"**教材:** {textbook_evidence.get('matched_doc_title', '-')}"
+                                )
+                                st.markdown(
+                                    f"**章節:** "
+                                    f"{textbook_source.get('chapter', '-')}"
+                                    f"｜{textbook_source.get('section', '-')}"
+                                )
+                                if textbook_locations:
+                                    st.dataframe(textbook_locations, width="stretch", hide_index=True)
+                            else:
+                                st.caption("目前沒有命中可精確引用的教材 block；生成時會明確避免捏造教材定位。")
+                                gate_reasons = textbook_evidence.get("gate_reasons", [])
+                                if gate_reasons:
+                                    st.write("未命中原因：")
+                                    for reason in gate_reasons:
+                                        st.markdown(f"- {reason}")
 
-            with tab_review:
-                st.caption("待審題目 = 一般題庫中尚未標記通過的題目。")
-                if not pending_questions:
-                    render_empty_state("目前沒有待審題目", "代表目前篩選結果都已審查，或條件過於嚴格。")
+        elif selected_bank_section == "pending":
+            st.caption("待審題目 = 一般題庫中尚未標記通過的題目。")
+            if not pending_questions:
+                render_empty_state("目前沒有待審題目", "代表目前篩選結果都已審查，或條件過於嚴格。")
+            else:
+                st.dataframe(build_question_scan_rows(pending_questions), width="stretch", hide_index=True)
+                show_pending_review_panel = st.checkbox(
+                    "顯示待審題目單題審閱面板",
+                    value=False,
+                    key="bank_pending_show_review_panel",
+                )
+                if not show_pending_review_panel:
+                    st.caption("目前只顯示待審掃描表格；需要逐題處理時再開啟單題面板。")
                 else:
-                    st.dataframe(build_question_scan_rows(pending_questions), width="stretch", hide_index=True)
-                    for i, question in enumerate(pending_questions, start=1):
+                    pending_limit = int(
+                        st.number_input(
+                            "待審題目面板載入數",
+                            min_value=1,
+                            max_value=100,
+                            value=min(12, len(pending_questions)),
+                            step=1,
+                            key="bank_pending_detail_limit",
+                        )
+                    )
+                    detail_pending = pending_questions[:pending_limit]
+                    st.caption(f"目前展開前 {len(detail_pending)} 題待審題目。")
+                    for i, question in enumerate(detail_pending, start=1):
                         render_question_review_expander(question, i, key_prefix="bank_pending")
+                    if len(pending_questions) > pending_limit:
+                        st.info(
+                            f"尚有 {len(pending_questions) - pending_limit} 題未展開。可調高載入數，或先縮小篩選條件。"
+                        )
 
-            with tab_drafts:
-                st.caption("待審草稿區會在這裡處理模板套用、QA、批次編修與正式入庫。")
-                render_draft_workspace(show_hero=False)
+        else:
+            st.caption("待審草稿區會在這裡處理模板套用、QA、批次編修與正式入庫。")
+            render_draft_workspace(show_hero=False)
 
     elif page == "📋 出題需求":
         # ===== 出題需求 / 補題 backlog =====
         from src.application.services.heartbeat_service import HeartbeatService
+        from src.application.services.scope_request_dispatch_service import get_scope_request_dispatch_service
         from src.domain.entities.scope_request import ScopeRequest, ScopeRequestStatus
         from src.infrastructure.persistence.sqlite_scope_request_repo import get_scope_request_repository
 
@@ -4041,12 +4574,14 @@ with main_col:
 
         scope_repo = get_scope_request_repository()
         heartbeat = HeartbeatService()
+        dispatch_service = get_scope_request_dispatch_service()
         heartbeat_summary = heartbeat.get_status_summary()
         scope_stats = heartbeat_summary["scope_requests"]
+        repo_mcp_ready = provider_supports_repo_mcp(st.session_state.agent_provider_name, st.session_state.agent_meta)
 
         render_page_hero(
             "出題需求與補題 Backlog",
-            "使用者可提交缺題需求，管理者可核准，heartbeat 會把缺口寫成 job 檔案交給外部 agent 補題。",
+            "使用者可提交缺題需求，管理者可核准；除了 heartbeat 寫 job，也可直接派給目前連線的 agent 補題。",
             [
                 f"需求 {scope_stats.get('total', 0)} 筆",
                 f"待處理 job {heartbeat_summary['jobs']['pending']} 筆",
@@ -4111,6 +4646,7 @@ with main_col:
                         target_count=int(scope_target_count),
                     )
                     scope_repo.save(request)
+                    invalidate_scope_request_caches()
                     st.success("已建立出題需求。")
                     st.rerun()
 
@@ -4181,7 +4717,7 @@ with main_col:
                             key=f"scope_admin_note_{req.get('id')}",
                         )
 
-                        action_col1, action_col2 = st.columns(2)
+                        action_col1, action_col2, action_col3 = st.columns(3)
                         with action_col1:
                             if st.button("✅ 核准需求", key=f"scope_approve_{req.get('id')}", width="stretch"):
                                 scope_repo.update_status(
@@ -4189,6 +4725,7 @@ with main_col:
                                     ScopeRequestStatus.APPROVED,
                                     admin_notes=admin_note or None,
                                 )
+                                invalidate_scope_request_caches()
                                 st.rerun()
                         with action_col2:
                             if st.button("❌ 駁回需求", key=f"scope_reject_{req.get('id')}", width="stretch"):
@@ -4197,7 +4734,41 @@ with main_col:
                                     ScopeRequestStatus.REJECTED,
                                     admin_notes=admin_note or None,
                                 )
+                                invalidate_scope_request_caches()
                                 st.rerun()
+                        with action_col3:
+                            if st.button(
+                                "🦞 立即派給龍蝦",
+                                key=f"scope_dispatch_{req.get('id')}",
+                                width="stretch",
+                                disabled=(
+                                    req.get("status") not in {"approved", "in_progress"}
+                                    or not st.session_state.agent_available
+                                    or not repo_mcp_ready
+                                ),
+                            ):
+                                with st.spinner("龍蝦補題中..."):
+                                    agent_provider = cast(Any, st.session_state.agent_provider)
+                                    dispatch_result = dispatch_service.dispatch(
+                                        req["id"],
+                                        agent_provider,
+                                    )
+                                invalidate_scope_request_caches()
+                                invalidate_question_bank_caches()
+                                if dispatch_result.generated_count > 0:
+                                    st.success(
+                                        f"龍蝦已寫回 {dispatch_result.generated_count} 題；本次計入需求進度 {dispatch_result.applied_count} 題。"
+                                    )
+                                else:
+                                    st.warning("龍蝦這次沒有成功寫入題目；詳細摘要已寫入管理備註。")
+                                st.rerun()
+
+                        if req.get("status") not in {"approved", "in_progress"}:
+                            st.caption("先核准需求，再直接派給龍蝦補題。")
+                        elif not st.session_state.agent_available:
+                            st.caption("目前 agent 未連線，暫時不能直接派工。")
+                        elif not repo_mcp_ready:
+                            st.caption("目前 provider 尚未接通 repo MCP 工具，暫時不能直接派工。")
 
         pending_jobs = heartbeat.list_jobs(status="pending")
         if pending_jobs:
@@ -4287,79 +4858,7 @@ with main_col:
 
 # ===== 右欄：常駐 Chat =====
 with chat_col:
-    with st.container(border=True):
-        st.subheader("💬 AI 助手")
-
-        context_options, context_mapping = build_question_context_options()
-        if st.session_state.chat_question_context not in context_options:
-            st.session_state.chat_question_context = "不指定題目"
-        st.session_state.chat_question_context = st.selectbox(
-            "討論題目上下文",
-            context_options,
-            index=context_options.index(st.session_state.chat_question_context),
-            help="可先指定一題，再和 AI 討論題目與詳解",
-        )
-
-        selected_question = context_mapping.get(st.session_state.chat_question_context)
-        if selected_question:
-            source_state = "精確來源可用" if question_has_precise_source(selected_question) else "來源待補強"
-            st.caption(f"目前上下文：{selected_question.get('question_text', '')[:48]} · {source_state}")
-
-        quick_prompt = ""
-        if not st.session_state.messages:
-            render_empty_state("從右側開始即時討論", "你可以詢問題目詳解、誘答選項設計，或請 AI 幫你檢查目前工作流。")
-            qp_col1, qp_col2, qp_col3 = st.columns(3)
-            if qp_col1.button("流程建議", width="stretch"):
-                quick_prompt = CHAT_QUICK_PROMPTS[0]
-            if qp_col2.button("檢查詳解", width="stretch"):
-                quick_prompt = CHAT_QUICK_PROMPTS[1]
-            if qp_col3.button("審閱清單", width="stretch"):
-                quick_prompt = CHAT_QUICK_PROMPTS[2]
-
-        chat_container = st.container(height=520)
-        with chat_container:
-            for message in st.session_state.messages:
-                with st.chat_message(message["role"]):
-                    st.markdown(message["content"])
-
-        if not st.session_state.agent_available:
-            st.warning("⚠️ Agent 未連線")
-
-        prompt = st.chat_input("輸入問題...", key="chat_input", disabled=not st.session_state.agent_available)
-        if quick_prompt:
-            prompt = quick_prompt
-
-    if prompt:
-        # 添加用戶訊息
-        st.session_state.messages.append({"role": "user", "content": prompt, "timestamp": datetime.now().isoformat()})
-
-        # 生成回應
-        effective_prompt = build_discussion_prompt(prompt, selected_question)
-
-        if st.session_state.agent_available:
-            with st.spinner("思考中..."):
-                try:
-                    full_response = ""
-                    for chunk in stream_agent_response(effective_prompt, st.session_state.agent_provider):
-                        full_response += chunk
-                    response = full_response if full_response else "無回應"
-                except Exception:
-                    response = run_agent_sync(effective_prompt, st.session_state.agent_provider)
-        else:
-            response = "[錯誤] Agent 未連線"
-
-        # 添加助手訊息
-        st.session_state.messages.append(
-            {"role": "assistant", "content": response, "timestamp": datetime.now().isoformat()}
-        )
-
-        st.rerun()
-
-    # 清除對話按鈕
-    if st.session_state.messages:
-        if st.button("🗑️ 清除對話", width="stretch"):
-            st.session_state.messages = []
-            st.rerun()
+    render_chat_panel(page)
 
 
 # ===== 底部資訊 =====

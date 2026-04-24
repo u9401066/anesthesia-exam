@@ -154,6 +154,7 @@ def render_question_review_form(
     navigate_to: Callable[[str], None],
     *,
     auto_saved_to_drafts: bool = False,
+    question_context_callback: Callable[[dict, str], None] | None = None,
 ) -> None:
     """Render the generated-question preview UI and dispatch navigation actions."""
     if not questions:
@@ -219,6 +220,13 @@ def render_question_review_form(
                 st.success("formal-save ready：stem_source、answer_source、explanation_sources 已齊備，可到題庫管理入庫。")
             else:
                 st.warning("尚未達到 formal-save gate。請先補齊 evidence pack，或到題庫管理整理。")
+
+            if question_context_callback and st.button(
+                "🦞 問龍蝦這題",
+                key=f"review_chat_{review_key}",
+                width="stretch",
+            ):
+                question_context_callback(question, "生成預覽")
 
             gate_reasons = evidence_pack.get("gate_reasons") or []
             if gate_reasons:

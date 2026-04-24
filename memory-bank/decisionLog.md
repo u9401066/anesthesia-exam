@@ -1,5 +1,25 @@
 # Decision Log
 
+## 2026-04-24
+
+### DEC-043: Streamlit 先採「非阻塞串流 + 顯式 cache invalidation + 單區塊渲染」救 UX，不急著直接重寫 TypeScript
+
+| 項目 | 內容 |
+|------|------|
+| **決策** | 先保留現有 Streamlit 架構，透過 background chat job、fragment 同步、mutation 後顯式清 cache，以及把重型 `tabs` 改成單一 active-section 渲染來做性能救援；這一輪不直接改造成前後端分離的 TypeScript SPA。 |
+| **問題** | 使用者遇到的主要 UX 痛點是真實的：聊天時每次互動都像整頁重載、左側切頁慢、`st.cache_data` 加上寫入後只 `st.rerun()` 會短時間繼續顯示舊資料。這些問題雖然源自 Streamlit rerun model，但並不代表眼前只能整套重寫。 |
+| **解決方案** | 新增 `async_chat.py` 承接背景串流工作，聊天面板改成 fragment 邊界；教材/草稿/題庫/歷屆題/補題需求的 cached read-model 全部補上 mutation 後 invalidation helper；題庫管理與考古題統計頁則改成單區塊渲染與 opt-in 展開重型面板。 |
+| **影響** | 目前可以在不離開 Streamlit 的前提下，先把「同步卡整頁」「切頁慢」「寫入後看見舊資料」這三個主 UX bug 收斂。長期若要做到真正 SPA 級別的無感切頁，仍可再評估 TypeScript 重構，但那應該建立在先量清剩餘 bottleneck 之後。 |
+
+### DEC-044: root pytest 預設只跑本 repo tests；若顯式混跑 vendored `asset-aware-mcp` tests，改用 repo-root `conftest.py` 合併雙 `src` package search path
+
+| 項目 | 內容 |
+|------|------|
+| **決策** | `pyproject.toml` 的 root pytest 設定明確限制為 `testpaths = ["tests"]` 與 `norecursedirs = ["libs/asset-aware-mcp", ...]`；但若使用者顯式指定 `libs/asset-aware-mcp/tests/...` 與 root `tests/...` 同時執行，則由 repo-root `conftest.py` 在 collection/setup 階段切換並合併 `src` package search path。 |
+| **問題** | 主 repo 與 vendored `asset-aware-mcp` 都有頂層 `src` package。單純放任 root `pytest` 遞迴收集會讓 collection 在 fresh env 下同時踩到缺依賴、雙 `src` collision 與 `tests` namespace 汙染；但使用者又明確給出 mixed-path command 作為真實重現式，不能只靠「不要這樣跑」帶過。 |
+| **解決方案** | 一方面補齊 root dev/test env 真正缺的依賴，讓 `uv run pytest -q` 在乾淨環境下成立；另一方面在 repo-root `conftest.py` 自訂 module collect/setup，按 test file 來源切換 import root，並把已載入的 `src`/`src.application`/`src.infrastructure` 等 package `__path__` 擴成雙 root 搜尋路徑，讓 mixed command 也能成功。 |
+| **影響** | 現在文件、fresh env、以及使用者給的 mixed command 三者終於一致：root `uv run pytest` 穩定只跑本 repo test suite，而顯式混跑 vendored tests 也不再因雙 `src` package 汙染而直接崩潰。 |
+
 ## 2026-04-23
 
 ### DEC-042: Miller 教材圖像修復採「figure-only 全章節刷新 + audit gate」，不再用無界限 strict Marker 全書重跑

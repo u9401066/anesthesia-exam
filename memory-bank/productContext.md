@@ -9,6 +9,7 @@ Provide a high-level overview of the project.
 ## Core Features
 
 - Streamlit 工作台：教材索引、AI 出題、題庫管理、作答練習、右側常駐 AI 助手
+- 常駐 AI 助手：非阻塞 stream 回應、可帶入目前畫面題目上下文直接討論
 - 題庫治理：管理者審查、`validated_only` 篩選、`exam_track` 題目分類
 - Backlog 補題工作流：使用者可提交 `scope request`，heartbeat 會產出外部 agent 可讀的 job 檔
 - 考古題後台流程：past-exam extraction / classification / blueprint / pipeline harness
@@ -52,4 +53,7 @@ Provide a high-level overview of the project.
 - pathlib
 - structlog
 - pydantic
-
+- pytest-asyncio
+- lxml
+- PyMuPDF
+- python-docx

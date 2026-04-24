@@ -1,4 +1,5 @@
 import sys
+import subprocess
 from pathlib import Path
 
 
@@ -7,6 +8,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.infrastructure.agent.provider import (  # noqa: E402
     AgentProviderConfig,
+    OpenClawAgentProvider,
     collect_openclaw_available_models,
     collect_opencode_available_models,
     create_agent_provider,
@@ -168,3 +170,34 @@ def test_agent_provider_config_loads_openclaw_settings_from_repo_local_config(
 
     provider = create_agent_provider(config)
     assert provider.name == "openclaw"
+
+
+def test_openclaw_infer_mode_does_not_require_repo_local_config(tmp_path: Path) -> None:
+    executable = tmp_path / "openclaw"
+    executable.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+    executable.chmod(0o755)
+
+    provider = OpenClawAgentProvider(
+        AgentProviderConfig(
+            provider="openclaw",
+            working_dir=tmp_path,
+            model="gb10/Qwen.gguf",
+            timeout=30,
+            openclaw_executable=str(executable),
+            openclaw_model="gb10/Qwen.gguf",
+            openclaw_mode="infer",
+            openclaw_agent_id="main",
+            openclaw_config_path=tmp_path / "missing-openclaw.json",
+        )
+    )
+    provider._run_cli = lambda args, *, timeout: subprocess.CompletedProcess(  # type: ignore[method-assign]
+        args=args,
+        returncode=0,
+        stdout="gb10/Qwen.gguf\n",
+        stderr="",
+    )
+
+    available, reason = provider.is_available()
+
+    assert available is True
+    assert "mode=infer" in reason

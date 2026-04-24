@@ -186,6 +186,10 @@ jobs:
         run: uv run pytest
 ```
 
+補充：
+- repo root 的 `uv run pytest` 只跑本專案 `tests/`。
+- vendored `asset-aware-mcp` 若要跑自己的測試，請在子專案目錄獨立執行：`uv --directory libs/asset-aware-mcp run pytest`
+
 ### 5.2 Docker 使用 uv
 ```dockerfile
 FROM python:3.11-slim

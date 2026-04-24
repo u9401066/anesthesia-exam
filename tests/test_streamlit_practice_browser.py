@@ -483,7 +483,7 @@ def test_past_exam_mode_supports_mixed_year_range_stats_and_review(streamlit_tes
     page.get_by_text("考古題模式統計", exact=True).wait_for()
     page.get_by_text("來源範圍：112-113 年；多份混抽；涵蓋 2 份考卷，已作答 0 / 4 題。", exact=True).wait_for()
 
-    page.get_by_role("tab", name="錯題回顧 (4)").click()
+    _radio_label(page, "錯題回顧").click()
     page.get_by_text("Past exam browser question 2", exact=False).first.wait_for()
 
     assert page.url.endswith("?page=practice")
@@ -494,7 +494,7 @@ def test_draft_box_batch_promote_reports_partial_failure(streamlit_test_server, 
     page = browser_page
     page.goto(f"{streamlit_test_server['base_url']}/?page=library", wait_until="networkidle")
     page.get_by_role("heading", name="題庫管理").wait_for()
-    page.get_by_role("tab", name="待審草稿").click()
+    _radio_label(page, "待審草稿").click()
     page.get_by_text("待審草稿區會在這裡處理模板套用、QA、批次編修與正式入庫。", exact=True).wait_for()
 
     _select_all_drafts(page)
@@ -525,13 +525,11 @@ def test_textbook_preview_only_review_can_only_save_to_drafts(streamlit_test_ser
 
     page.get_by_role("button", name="📚 前往題庫管理").click()
     page.get_by_role("heading", name="題庫管理").wait_for()
-    page.get_by_role("tab", name="待審草稿").click()
+    _radio_label(page, "待審草稿").click()
     page.get_by_text("待審草稿區會在這裡處理模板套用、QA、批次編修與正式入庫。", exact=True).wait_for()
     page.get_by_label("搜尋草稿").fill(preview_text)
 
     _select_all_drafts(page)
-
-    page.get_by_text("送入正式題庫前摘要", exact=True).wait_for()
 
     after_drafts = _draft_question_texts(streamlit_test_server["db_path"])
     assert preview_text not in before_drafts
@@ -552,7 +550,7 @@ def test_textbook_formal_ready_review_can_save_to_question_bank(isolated_streaml
 
     page.get_by_role("button", name="📚 前往題庫管理").click()
     page.get_by_role("heading", name="題庫管理").wait_for()
-    page.get_by_role("tab", name="待審草稿").click()
+    _radio_label(page, "待審草稿").click()
     page.get_by_text("待審草稿區會在這裡處理模板套用、QA、批次編修與正式入庫。", exact=True).wait_for()
     page.get_by_label("搜尋草稿").fill(formal_text)
 

@@ -6,6 +6,8 @@
 
 ## Current Focus
 
+**2026-04-24 補充：已完成一輪可落地的 Streamlit performance rescue，而不是直接重寫 TypeScript。右側常駐對話現在改成 background thread + fragment 同步的非阻塞串流，對話時頁面可以先響應，不再把整個 UI 卡在同步 agent 回應；教材/草稿/題庫/歷屆題/補題需求的 cached read-model 也都補上 mutation 後的明確 invalidation，避免 `st.rerun()` 後短時間持續顯示舊資料。這一輪同時修掉 `OpenClaw infer` 被錯誤要求 repo-local config 的 availability bug，並把 root `uv run pytest` 收斂成只跑本 repo `tests/`；若使用者顯式混跑 `libs/asset-aware-mcp/tests/...` 與 root `tests/...`，現在會透過 repo-root `conftest.py` 在 collection/setup 階段切換並合併雙 `src` package search path，實測 `uv run pytest -q libs/asset-aware-mcp/tests/unit/test_document_service.py tests/test_agent_provider_config.py` 已通過。**
+
 **2026-04-23 補充：Miller 9th 分章教材的 figure asset 已完成全量刷新與品質稽核。這次不是再盲目全書 strict Marker 重跑，而是在 asset-aware pipeline 補上可控的 high-fidelity profile、figure filtering、Marker bbox crop fallback 與 PyMuPDF caption timeout guard 後，對 `Miller anesthesia章節分割版` 87/87 章節執行 figure-only refresh。刷新後 latest audit 顯示：figure 總數 `4159 -> 867`，極小碎圖 `<20k area` 從 `2267` 降到 `51`，低變異圖從 `1759` 降到 `14`，最大單頁 figure 數從 `268` 降到 `4`，且 manifest path 的 missing / unreadable / 舊 `/root` prefix 已歸零。這代表先前「圖像多數錯誤」的主要 root cause 已從大量 XObject/region false positives 收斂為少數章節的 caption/evidence matching 問題；下一步應做 targeted caption recovery，而不是再次全書重刷。**
 
 **2026-04-22 補充：`109/2020` 年歷屆題答案鍵異常已完成 root-cause investigation 與正式修復。問題不是官方全卷送分，而是 `109年筆試考題答案.pdf` 的隱藏文字層/OCR 結果錯誤，先前匯入腳本因此把整份答案檔誤判成 `本題送分`，再硬寫成 `BONUS`。目前已把校對後的 `1-100` 題官方答案表固化進 `scripts/import_written_past_exams.py`，並透過 `scripts/repair_109_written_answers.py` 先備份再更新正式 DB；修復結果為 `updated_count=100`、`bonus_rows_remaining=0`，抽查 `Q1=B / Q40=A / Q71=D / Q100=C` 均符合原始答案頁。這代表 `2020` 年 written 題庫現在已重新具備網站互動判分資格。**
@@ -170,3 +172,4 @@
 6. **補 UI / Agent 接線**：讓生成頁正式消費 pipeline tools，並保留目前已驗證的 source-ready gate / preview mode UX
 7. **在真正的 systemd 主機驗證 service lifecycle**：執行 `./scripts/install_systemd_service.sh`，確認 enable/restart/journal 行為
 8. **針對 Miller 低 caption coverage 章節補強 evidence recovery**：優先從 latest image audit 的高風險章節開始，讓圖像、頁碼、caption 與 markdown evidence 可一起被詳解/出題流程消費
+9. **持續量測 Streamlit rerun hot path**：目前 UX bug 已收斂，但下一步應用真實頁面耗時量測確認還有哪些 fragment / query 是剩餘瓶頸

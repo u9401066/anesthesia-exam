@@ -46,6 +46,47 @@ def test_assess_document_source_readiness_requires_searchable_blocks_and_lines(t
     assert readiness["precise_block_count"] == 1
 
 
+def test_assess_document_source_readiness_reuses_cached_block_stats(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    _write_doc(
+        tmp_path,
+        doc_id="doc_cached",
+        title="Miller Cached Chapter",
+        markdown="# Cached Chapter\n\nShock therapy overview.",
+        blocks=[
+            {
+                "block_id": "blk_0001",
+                "block_type": "Text",
+                "page": 4,
+                "text": "Shock therapy overview.",
+                "bbox": [],
+                "section_hierarchy": {"1": "Cached Chapter"},
+                "metadata": {"line_start": 1, "line_end": 1},
+            }
+        ],
+    )
+
+    original_read_text = Path.read_text
+    read_count = 0
+
+    def counted_read_text(path: Path, *args, **kwargs):
+        nonlocal read_count
+        if path.name == "blocks.json":
+            read_count += 1
+        return original_read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", counted_read_text)
+
+    service = TextbookGenerationService(tmp_path)
+    first = service.assess_document_source_readiness("doc_cached")
+    second = service.assess_document_source_readiness("doc_cached")
+
+    assert first == second
+    assert read_count == 1
+
+
 def test_build_prompt_context_prefers_selected_section_excerpt(tmp_path: Path) -> None:
     markdown = """# Pediatric and Neonatal Critical Care
 

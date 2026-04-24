@@ -73,6 +73,7 @@ class TextbookGenerationService:
     def __init__(self, data_dir: Path | None = None):
         self.data_dir = data_dir or DEFAULT_DATA_DIR
         self.asset_loader = PastExamExtractionService(self.data_dir)
+        self._source_readiness_cache: dict[str, tuple[tuple[int, int], dict[str, Any]]] = {}
         logger.debug("textbook_generation_service_initialized", data_dir=str(self.data_dir))
 
     def assess_document_source_readiness(self, doc_id: str) -> dict[str, Any]:
@@ -93,6 +94,16 @@ class TextbookGenerationService:
             return result
 
         try:
+            stat = blocks_path.stat()
+            cache_key = (stat.st_mtime_ns, stat.st_size)
+        except OSError:
+            cache_key = (0, 0)
+
+        cached = self._source_readiness_cache.get(doc_id)
+        if cached and cached[0] == cache_key:
+            return dict(cached[1])
+
+        try:
             blocks = json.loads(blocks_path.read_text(encoding="utf-8"))
         except Exception as exc:  # noqa: BLE001
             result = {
@@ -103,8 +114,9 @@ class TextbookGenerationService:
                 "precise_block_count": 0,
                 "gate_reasons": [f"blocks.json 無法讀取: {exc}"],
             }
+            self._source_readiness_cache[doc_id] = (cache_key, result)
             log.info("textbook_source_readiness_checked", **result)
-            return result
+            return dict(result)
 
         searchable_blocks = [block for block in blocks if self._block_has_searchable_text(block)]
         precise_blocks = [
@@ -129,8 +141,9 @@ class TextbookGenerationService:
             "precise_block_count": len(precise_blocks),
             "gate_reasons": gate_reasons,
         }
+        self._source_readiness_cache[doc_id] = (cache_key, result)
         log.info("textbook_source_readiness_checked", **result)
-        return result
+        return dict(result)
 
     def build_prompt_context(
         self,
