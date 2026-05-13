@@ -6,7 +6,7 @@ import argparse
 import asyncio
 import json
 import os
-import shutil
+import re
 import sys
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
@@ -21,6 +21,7 @@ DEFAULT_REPORT_DIR = PROJECT_ROOT / "data" / "reports"
 DEFAULT_PROFILE_JSON = (
     PROJECT_ROOT / "configs" / "asset-aware" / "miller_marker_hq.json"
 )
+CHAPTER_PDF_NAME_RE = re.compile(r"^\d+\s+-\s+.+\.pdf$", re.IGNORECASE)
 
 
 @dataclass
@@ -67,6 +68,16 @@ def find_chapter_pdfs(
     start_chapter: int,
     end_chapter: int,
 ) -> list[Path]:
+    def is_real_chapter_pdf(path: Path) -> bool:
+        if path.name.startswith("._") or path.name.startswith("."):
+            return False
+        if path.name.endswith("~") or not CHAPTER_PDF_NAME_RE.match(path.name):
+            return False
+        try:
+            return path.read_bytes()[:5] == b"%PDF-"
+        except OSError:
+            return False
+
     def sort_key(path: Path) -> tuple[int, str]:
         prefix = path.name.split(" - ", 1)[0].strip()
         if prefix.isdigit():
@@ -76,7 +87,7 @@ def find_chapter_pdfs(
     pdfs = [
         path
         for path in sorted(chapter_dir.glob("*.pdf"), key=sort_key)
-        if not path.name.startswith("._")
+        if is_real_chapter_pdf(path)
     ]
     if start_chapter > 0 or end_chapter > 0:
         filtered: list[Path] = []
@@ -148,9 +159,12 @@ async def refresh_one(
     original_pdf = doc_dir / "original.pdf"
     source_pdf = original_pdf if original_pdf.exists() else pdf_path
 
-    images_dir = doc_dir / "images"
-    if images_dir.exists():
-        shutil.rmtree(images_dir)
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assets = manifest.get("assets")
+    if not isinstance(assets, dict):
+        assets = {}
+        manifest["assets"] = assets
+    existing_figures = assets.get("figures") if isinstance(assets.get("figures"), list) else []
 
     try:
         figures = await service._extract_and_save_images(doc_id, source_pdf)
@@ -159,15 +173,19 @@ async def refresh_one(
             filename=pdf_path.name,
             doc_id=doc_id,
             success=False,
-            figure_count=0,
+            figure_count=len(existing_figures),
             error=str(exc),
         )
 
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    assets = manifest.get("assets")
-    if not isinstance(assets, dict):
-        assets = {}
-        manifest["assets"] = assets
+    if not figures and existing_figures:
+        return RefreshEntry(
+            filename=pdf_path.name,
+            doc_id=doc_id,
+            success=False,
+            figure_count=len(existing_figures),
+            error="new extraction returned zero figures; preserved existing manifest",
+        )
+
     assets["figures"] = [figure.model_dump(mode="json") for figure in figures]
     manifest_path.write_text(
         json.dumps(manifest, ensure_ascii=False, indent=2),
@@ -222,6 +240,10 @@ async def main_async(args: argparse.Namespace) -> int:
         entries.append(entry)
 
     report = {
+        "report_schema_version": 1,
+        "run_status": "success"
+        if all(entry.success for entry in entries)
+        else "partial",
         "generated_at_utc": datetime.now(UTC).isoformat(),
         "chapter_dir": str(chapter_dir),
         "data_dir": str(data_dir),

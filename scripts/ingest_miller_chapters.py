@@ -28,6 +28,7 @@ DEFAULT_REPORT_DIR = PROJECT_ROOT / "data" / "reports"
 DEFAULT_MILLER_PROFILE_JSON = (
     PROJECT_ROOT / "configs" / "asset-aware" / "miller_marker_hq.json"
 )
+CHAPTER_PDF_NAME_RE = re.compile(r"^\d+\s+-\s+.+\.pdf$", re.IGNORECASE)
 
 
 def parse_args() -> argparse.Namespace:
@@ -203,6 +204,16 @@ def find_chapter_pdfs(
     start_chapter: int,
     end_chapter: int,
 ) -> list[Path]:
+    def is_real_chapter_pdf(path: Path) -> bool:
+        if path.name.startswith("._") or path.name.startswith("."):
+            return False
+        if path.name.endswith("~") or not CHAPTER_PDF_NAME_RE.match(path.name):
+            return False
+        try:
+            return path.read_bytes()[:5] == b"%PDF-"
+        except OSError:
+            return False
+
     def sort_key(path: Path) -> tuple[int, str]:
         prefix = path.name.split(" - ", 1)[0].strip()
         if prefix.isdigit():
@@ -212,7 +223,7 @@ def find_chapter_pdfs(
     pdfs = [
         path
         for path in sorted(chapter_dir.glob("*.pdf"), key=sort_key)
-        if not path.name.startswith("._")
+        if is_real_chapter_pdf(path)
     ]
     if start_chapter > 0 or end_chapter > 0:
         filtered: list[Path] = []
@@ -255,7 +266,7 @@ def check_blocks_json(data_dir: Path, doc_id: str) -> tuple[bool, int]:
     try:
         payload = json.loads(blocks_path.read_text(encoding="utf-8"))
     except Exception:
-        return True, 0
+        return False, 0
 
     if isinstance(payload, list):
         return True, len(payload)
@@ -263,6 +274,19 @@ def check_blocks_json(data_dir: Path, doc_id: str) -> tuple[bool, int]:
 
 
 def load_existing_readiness(data_dir: Path, doc_id: str) -> tuple[bool, int]:
+    doc_dir = data_dir / doc_id
+    manifest_path = doc_dir / f"{doc_id}_manifest.json"
+    markdown_path = doc_dir / f"{doc_id}_full.md"
+    if not manifest_path.exists() or not markdown_path.exists():
+        return False, 0
+
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except Exception:
+        return False, 0
+    if not isinstance(manifest, dict) or not manifest.get("doc_id"):
+        return False, 0
+
     return check_blocks_json(data_dir, doc_id)
 
 

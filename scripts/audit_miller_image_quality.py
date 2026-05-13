@@ -43,6 +43,12 @@ class FigureRecord:
     recoverable: bool
     missing: bool
     unreadable: bool
+    raw_path: str
+    extraction_strategy: str
+    figure_bbox: list[float]
+    crop_bbox: list[float]
+    caption_bbox: list[float]
+    caption_confidence: float
 
 
 def parse_args() -> argparse.Namespace:
@@ -190,6 +196,7 @@ def collect_records(
                 continue
 
             raw_path = str(figure.get("path") or "")
+            figure_raw_path = str(figure.get("raw_path") or "")
             resolved_path, path_status, recoverable = resolve_figure_path(
                 raw_path,
                 data_dir=data_dir,
@@ -224,6 +231,14 @@ def collect_records(
                     recoverable=recoverable,
                     missing=path_status == "missing",
                     unreadable=unreadable,
+                    raw_path=figure_raw_path,
+                    extraction_strategy=str(
+                        figure.get("extraction_strategy") or "unknown"
+                    ),
+                    figure_bbox=list(figure.get("figure_bbox") or []),
+                    crop_bbox=list(figure.get("crop_bbox") or []),
+                    caption_bbox=list(figure.get("caption_bbox") or []),
+                    caption_confidence=float(figure.get("caption_confidence") or 0.0),
                 )
             )
 
@@ -330,6 +345,22 @@ def build_report(
             if record.variance is not None and record.variance < VERY_LOW_VARIANCE_THRESHOLD
         ),
     }
+    strategy_counter = Counter(record.extraction_strategy for record in records)
+    geometry_stats = {
+        "with_raw_path": sum(1 for record in records if record.raw_path),
+        "with_figure_bbox": sum(1 for record in records if len(record.figure_bbox) >= 4),
+        "with_crop_bbox": sum(1 for record in records if len(record.crop_bbox) >= 4),
+        "with_caption_bbox": sum(1 for record in records if len(record.caption_bbox) >= 4),
+        "caption_confidence_ge_0_5": sum(
+            1 for record in records if record.caption_confidence >= 0.5
+        ),
+        "raw_only": sum(
+            1
+            for record in records
+            if record.extraction_strategy == "xobject_raw"
+            or (record.raw_path and len(record.crop_bbox) < 4)
+        ),
+    }
 
     chapters = chapter_summary(records)
     pages = page_summary(records)
@@ -340,6 +371,8 @@ def build_report(
         "global": {
             "path_stats": path_stats,
             "content_stats": content_stats,
+            "strategy_stats": dict(strategy_counter),
+            "geometry_stats": geometry_stats,
         },
         "top_figure_heavy_chapters": chapters[:20],
         "top_figure_heavy_pages": pages[:20],
