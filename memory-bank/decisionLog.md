@@ -2,6 +2,15 @@
 
 ## 2026-05-13
 
+### DEC-049: VSIX npm audit hotfix 以 lockfile 升級 `fast-uri` 並發布 asset-aware `v0.6.31`
+
+| 項目 | 內容 |
+|------|------|
+| **決策** | 對 `v0.6.30` 發現的 VSIX npm audit high severity finding，不用 `npm audit fix --force` 做大範圍升級；採最小 hotfix：更新 `vscode-extension/package-lock.json`，讓 transitive `fast-uri` 解析到 patched `3.1.2`，並同步 bump repo/VSIX 版本到 `0.6.31`。 |
+| **問題** | `npm audit` 指出 `fast-uri <=3.1.1` 存在 path traversal / host confusion 高風險 advisory。實際 dependency chain 是 `@vscode/vsce -> @secretlint/node -> @secretlint/config-loader -> ajv -> fast-uri`，本地 lockfile 安裝到 `fast-uri@3.1.0`。 |
+| **解決方案** | 先確認 `npm view fast-uri version` 為 `3.1.2`，再用 `npm update fast-uri --package-lock-only` 更新 lockfile，重新 `npm ci` 後 `npm audit --audit-level=high` 回 `0 vulnerabilities`，`npm ls fast-uri` 顯示 `fast-uri@3.1.2`。完成 VSIX/Python/package/Docker/release audits 後，發布 `v0.6.31` GitHub Release。 |
+| **影響** | `v0.6.31` 是 security hotfix release，功能內容等同 `v0.6.30`，但 VSIX dependency tree 不再帶該 high severity npm audit finding。後續 extension dependency 更新仍應優先走 lockfile/semver 範圍內最小修復，不要用 force fix 引入不可控 major drift。 |
+
 ### DEC-048: asset-aware v0.6.30 release 必須基於最新 `origin/master`，並把 Figure crop 修復作為正式 patch release 發布
 
 | 項目 | 內容 |

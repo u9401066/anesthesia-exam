@@ -124,3 +124,14 @@
 - 已將 subrepo 從 detached `v0.6.29` 移到最新 `origin/master`，建立 `release/v0.6.30` 分支後重新套回 figure crop 修補。
 - 已更新 release metadata：`pyproject.toml`、`src/__init__.py`、VSIX `package.json/package-lock.json`、`CHANGELOG.md`、README/docs 版本文字。
 - Release gate 注意：本機目前缺 `npm`，VSIX `sync-assets:check`、`test:ci`、`test:install-smoke` 尚不能宣稱通過；tag 前必須以實際命令結果作準。
+
+## 2026-05-13 Hotfix: asset-aware v0.6.31
+
+- 已修復 VSIX `npm audit` high severity finding：transitive `fast-uri` 從 vulnerable `3.1.0` 更新到 patched `3.1.2`。
+- 已發布 asset-aware `v0.6.31` GitHub Release，包含 wheel、sdist 與 VSIX：`https://github.com/u9401066/asset-aware-mcp/releases/tag/v0.6.31`。
+- 驗證：
+  - `npm audit --audit-level=high` => `found 0 vulnerabilities`。
+  - `npm ls fast-uri` => `fast-uri@3.1.2`。
+  - VSIX `sync-assets:check`、`test:ci`、`test:install-smoke` 通過，install smoke 顯示 `u9401066.asset-aware-mcp@0.6.31` fresh/update install verified。
+  - asset-aware Python gates：ruff check、ruff format check、mypy、pytest `856 passed, 21 skipped`。
+  - Package/release gates：`uv build`、wheel install smoke `0.6.31`、Docker smoke `0.6.31`、release artifact audit、release harness audit。
