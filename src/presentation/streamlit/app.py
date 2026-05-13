@@ -37,7 +37,17 @@ from src.application.services.past_exam_figure_service import get_past_exam_figu
 from src.application.services.textbook_generation_service import get_textbook_generation_service
 from src.infrastructure import agent as agent_module
 from src.infrastructure.logging import bootstrap_logging, new_run_id
-from src.presentation.streamlit.async_chat import ChatStreamJobStore
+from src.domain.value_objects.answer import (
+    question_allows_multiple as _question_type_allows_multiple,
+    format_answer_letters as _format_answer_letters,
+    normalize_answer_letters as _normalize_answer_letters,
+)
+from src.presentation.streamlit.chat_panel import (
+    build_chat_stream_error_message,
+    compute_chat_history_height,
+    ensure_chat_stream_job_store,
+    is_missing_chat_job_error,
+)
 from src.presentation.streamlit.document_manifest import normalize_manifest_paths as _normalize_manifest_paths
 from src.presentation.streamlit.generation.controller import autosave_generated_questions_to_drafts
 from src.presentation.streamlit.generation.fragments import (
@@ -67,7 +77,6 @@ logger = bootstrap_logging(
     log_dir=LOG_DIR,
     extra_context={"run_id": APP_RUN_ID, "provider": "streamlit"},
 )
-CHAT_STREAM_JOBS = ChatStreamJobStore()
 
 # 設定頁面
 st.set_page_config(
@@ -522,6 +531,36 @@ def _clear_practice_answer_widget_state(questions: list[dict]) -> None:
             del st.session_state[widget_key]
 
 
+def _build_option_label(index: int, option: object) -> str:
+    """Build a stable visible option label, preserving already-prefixed options."""
+    prefix = chr(65 + index)
+    option_text = str(option or "").strip()
+    if not option_text:
+        return f"{prefix}. "
+
+    if re.match(rf"^{re.escape(prefix)}[\)\.:：、\s]", option_text):
+        return option_text
+    return f"{prefix}. {option_text}"
+
+
+def _letters_to_option_labels(letters: tuple[str, ...], option_labels: list[str]) -> list[str]:
+    labels: list[str] = []
+    for letter in letters:
+        idx = ord(letter) - 65
+        if 0 <= idx < len(option_labels):
+            labels.append(option_labels[idx])
+    return labels
+
+
+def _letters_from_option_labels(selected_labels: list[str]) -> tuple[str, ...]:
+    letters: set[str] = set()
+    for label in selected_labels:
+        match = re.match(r"^\s*([A-Z])", str(label or "").strip().upper())
+        if match and "A" <= match.group(1) <= "Z":
+            letters.add(match.group(1))
+    return tuple(sorted(letters))
+
+
 def start_practice_session(questions: list[dict], context: Optional[dict] = None) -> None:
     """Start a fresh practice round with cleared widget state and context metadata."""
     previous_questions = list(st.session_state.get("practice_questions", []))
@@ -566,11 +605,12 @@ def summarize_practice_results(questions: list[dict], practice_answers: dict[str
 
     for index, question in enumerate(questions):
         question_key = get_practice_question_key(question, index)
+        option_count = len(question.get("options") or [])
         user_answer = str(practice_answers.get(question_key, "") or "")
-        user_letter = user_answer[0] if user_answer else ""
-        correct_answer = str(question.get("correct_answer", "") or "")
-        is_answered = bool(user_letter)
-        is_correct = is_answered and user_letter == correct_answer
+        user_letters = _normalize_answer_letters(user_answer, option_count=option_count)
+        correct_letters = _normalize_answer_letters(question.get("correct_answer", ""), option_count=option_count)
+        is_answered = bool(user_letters)
+        is_correct = is_answered and user_letters == correct_letters
 
         if is_answered:
             answered_count += 1
@@ -591,8 +631,8 @@ def summarize_practice_results(questions: list[dict], practice_answers: dict[str
                 "pattern_label": PRACTICE_PATTERN_LABELS.get(pattern_value, "未分類"),
                 "topics": question.get("topics", []),
                 "difficulty": question.get("difficulty", "medium"),
-                "user_answer": user_letter or "-",
-                "correct_answer": correct_answer or "-",
+                "user_answer": _format_answer_letters(user_letters) or "-",
+                "correct_answer": _format_answer_letters(correct_letters) or "-",
                 "is_answered": is_answered,
                 "is_correct": is_correct,
                 "explanation": question.get("explanation", ""),
@@ -655,9 +695,10 @@ def build_practice_download_markdown(
 
     for index, question in enumerate(questions, start=1):
         question_key = get_practice_question_key(question, index - 1)
+        option_count = len(question.get("options") or [])
         user_answer = str(practice_answers.get(question_key, "") or "")
-        user_letter = user_answer[0] if user_answer else "-"
-        correct_answer = str(question.get("correct_answer", "") or "-")
+        user_letters = _normalize_answer_letters(user_answer, option_count=option_count)
+        correct_letters = _normalize_answer_letters(question.get("correct_answer", ""), option_count=option_count)
         exam_year = question.get("exam_year")
         exam_name = str(question.get("exam_name", "") or "")
         exam_label = f"{exam_year} 年 {exam_name}".strip() if exam_year or exam_name else "未標記考卷"
@@ -671,8 +712,8 @@ def build_practice_download_markdown(
                 "",
                 f"- 來源考卷：{exam_label}",
                 f"- 題號：{question.get('question_number') or index}",
-                f"- 你的答案：{user_letter}",
-                f"- 正確答案：{correct_answer}",
+                f"- 你的答案：{_format_answer_letters(user_letters) or '-'}",
+                f"- 正確答案：{_format_answer_letters(correct_letters) or '-'}",
                 f"- 難度：{question.get('difficulty', 'medium')}",
             ]
         )
@@ -1090,6 +1131,42 @@ def inject_app_styles() -> None:
                 background: rgba(255, 255, 255, 0.78);
                 border: 1px solid rgba(15, 118, 110, 0.08);
                 border-radius: 18px;
+            }
+
+            [data-testid="stChatInput"] {
+                background: linear-gradient(180deg, rgba(255, 255, 255, 0.96) 0%, rgba(248, 250, 249, 0.92) 100%);
+                border: 1px solid rgba(18, 82, 76, 0.14);
+                border-radius: 22px;
+                box-shadow: 0 12px 26px rgba(22, 53, 50, 0.10);
+                padding: 0.45rem 0.55rem;
+            }
+
+            [data-testid="stChatInput"] > div {
+                background: transparent !important;
+            }
+
+            [data-testid="stChatInput"] textarea {
+                background: transparent !important;
+                color: var(--text) !important;
+                border: none !important;
+                box-shadow: none !important;
+            }
+
+            [data-testid="stChatInput"] textarea::placeholder {
+                color: var(--muted) !important;
+                opacity: 1;
+            }
+
+            [data-testid="stChatInput"] button {
+                background: linear-gradient(180deg, #ff6b63 0%, #ff4d4f 100%) !important;
+                color: #fff !important;
+                border: none !important;
+                box-shadow: none !important;
+            }
+
+            [data-testid="stChatInput"] button:hover {
+                background: linear-gradient(180deg, #f25c54 0%, #e64546 100%) !important;
+                color: #fff !important;
             }
         </style>
         """,
@@ -1566,6 +1643,16 @@ def _copy_chat_payload_value(value: Any) -> Any:
     return value
 
 
+def _safe_year_value(value: Any) -> int | None:
+    try:
+        text = str(value).strip()
+        if not text:
+            return None
+        return int(text)
+    except (TypeError, ValueError):
+        return None
+
+
 def build_chat_context_label(question: dict, origin_label: str) -> str:
     """Build a short label for the active chat question context."""
     origin = str(origin_label or "題目").strip() or "題目"
@@ -1585,8 +1672,19 @@ def build_chat_context_payload(question: dict, origin_label: str) -> dict:
         "correct_answer": str(question.get("correct_answer") or "").strip(),
         "explanation": str(question.get("explanation") or "").strip(),
         "source": _copy_chat_payload_value(question.get("source") or {}),
+        "source_doc_id": question.get("source_doc_id"),
+        "source_page": question.get("source_page"),
+        "source_page_image_path": question.get("source_page_image_path"),
         "topics": list(question.get("topics") or []),
+        "question_type": str(
+            question.get("question_type") or question.get("type") or ""
+        ).strip(),
         "difficulty": str(question.get("difficulty") or "").strip(),
+        "generation_mode": question.get("generation_mode"),
+        "preview_only": bool(question.get("preview_only")),
+        "formal_save_ready": question.get("formal_save_ready"),
+        "evidence_pack": _copy_chat_payload_value(question.get("evidence_pack") or {}),
+        "source_confidence": question.get("source_confidence"),
         "exam_name": str(question.get("exam_name") or "").strip(),
         "exam_year": question.get("exam_year"),
         "question_number": question.get("question_number"),
@@ -1632,8 +1730,17 @@ def build_discussion_prompt(user_prompt: str, selected_question: dict | None) ->
         "correct_answer": selected_question.get("correct_answer"),
         "explanation": selected_question.get("explanation"),
         "source": selected_question.get("source"),
+        "source_doc_id": selected_question.get("source_doc_id"),
+        "source_page": selected_question.get("source_page"),
+        "source_page_image_path": selected_question.get("source_page_image_path"),
         "topics": selected_question.get("topics"),
+        "question_type": selected_question.get("question_type"),
         "difficulty": selected_question.get("difficulty"),
+        "generation_mode": selected_question.get("generation_mode"),
+        "preview_only": selected_question.get("preview_only"),
+        "formal_save_ready": selected_question.get("formal_save_ready"),
+        "evidence_pack": selected_question.get("evidence_pack"),
+        "source_confidence": selected_question.get("source_confidence"),
     }
 
     return (
@@ -2220,7 +2327,8 @@ def render_draft_workspace(*, show_hero: bool = True) -> None:
 
             detail_col1, detail_col2, detail_col3 = st.columns(3)
             with detail_col1:
-                st.markdown(f"**答案:** {question.get('correct_answer', '-')}")
+                    answer_letters = _normalize_answer_letters(question.get("correct_answer", "-"), option_count=len(question.get("options") or []))
+                    st.markdown(f"**答案:** {_format_answer_letters(answer_letters) or '-'}")
             with detail_col2:
                 st.markdown(f"**難度:** {question.get('difficulty', 'medium')}")
             with detail_col3:
@@ -2434,7 +2542,8 @@ def render_question_review_expander(question: dict, display_number: int, key_pre
 
         meta_col1, meta_col2, meta_col3 = st.columns(3)
         with meta_col1:
-            st.markdown(f"**答案:** {question.get('correct_answer', 'N/A')}")
+            correct_letters = _normalize_answer_letters(question.get("correct_answer", "N/A"), option_count=len(question.get("options") or []))
+            st.markdown(f"**答案:** {_format_answer_letters(correct_letters) or '-'}")
         with meta_col2:
             st.markdown(f"**難度:** {question.get('difficulty', 'medium')}")
         with meta_col3:
@@ -2511,7 +2620,13 @@ def load_scope_requests(status: str | None = None) -> list[dict]:
     from src.infrastructure.persistence.sqlite_scope_request_repo import get_scope_request_repository
 
     repo = get_scope_request_repository()
-    status_filter = ScopeRequestStatus(status) if status else None
+    status_filter = None
+    if status:
+        try:
+            status_filter = ScopeRequestStatus(status)
+        except ValueError:
+            logger.warning("streamlit_invalid_scope_status_filter", status=status)
+            status_filter = None
     requests = repo.list_all(status=status_filter, limit=200)
     return [req.to_dict() for req in requests]
 
@@ -2728,6 +2843,11 @@ with st.sidebar:
 _chat_panel_fragment = st.fragment if hasattr(st, "fragment") else (lambda func: func)
 
 
+def get_chat_stream_jobs():
+    """Return the per-session chat stream job store."""
+    return ensure_chat_stream_job_store(st.session_state)
+
+
 def rerun_chat_panel() -> None:
     """Prefer fragment-local reruns for chat interactions, with older Streamlit fallback."""
     try:
@@ -2747,14 +2867,21 @@ def sync_active_chat_stream() -> None:
     if not job_id or not isinstance(assistant_index, int):
         return
 
+    job_store = get_chat_stream_jobs()
     messages = st.session_state.get("messages") or []
     if assistant_index < 0 or assistant_index >= len(messages):
-        CHAT_STREAM_JOBS.cancel(job_id, reason="stream target message missing")
+        job_store.cancel(job_id, reason="stream target message missing")
+        logger.warning(
+            "chat_stream_target_missing",
+            job_id=job_id,
+            assistant_index=assistant_index,
+            message_count=len(messages),
+        )
         st.session_state.chat_active_job_id = None
         st.session_state.chat_active_assistant_index = None
         return
 
-    snapshot = CHAT_STREAM_JOBS.snapshot(job_id)
+    snapshot = job_store.snapshot(job_id)
     message = messages[assistant_index]
     streamed_content = str(snapshot.get("content") or "")
     status = str(snapshot.get("status") or "error")
@@ -2775,12 +2902,22 @@ def sync_active_chat_stream() -> None:
         if not str(message.get("content") or "").strip():
             message["content"] = f"[中止] {error_message or '回應已停止'}"
     else:
-        fallback_error = f"[錯誤] {error_message or '聊天串流失敗'}"
+        if is_missing_chat_job_error(error_message):
+            logger.warning("chat_stream_job_missing", job_id=job_id, assistant_index=assistant_index)
+        fallback_error = build_chat_stream_error_message(error_message)
         if streamed_content:
             message["content"] = f"{streamed_content}\n\n{fallback_error}"
         else:
             message["content"] = fallback_error
 
+    logger.info(
+        "chat_stream_terminal",
+        job_id=job_id,
+        assistant_index=assistant_index,
+        status=status,
+        content_len=len(str(message.get("content") or "")),
+        error=error_message,
+    )
     st.session_state.chat_active_job_id = None
     st.session_state.chat_active_assistant_index = None
 
@@ -2792,7 +2929,14 @@ def stop_active_chat_stream(reason: str = "回應已停止") -> None:
     messages = st.session_state.get("messages") or []
 
     if job_id:
-        CHAT_STREAM_JOBS.cancel(job_id, reason=reason)
+        cancelled = get_chat_stream_jobs().cancel(job_id, reason=reason)
+        logger.info(
+            "chat_stream_cancel_requested",
+            job_id=job_id,
+            assistant_index=assistant_index,
+            cancelled=cancelled,
+            reason=reason,
+        )
 
     if isinstance(assistant_index, int) and 0 <= assistant_index < len(messages):
         message = messages[assistant_index]
@@ -2838,7 +2982,7 @@ def render_chat_panel(current_page: str) -> None:
             if qp_col3.button("審閱清單", width="stretch"):
                 quick_prompt = CHAT_QUICK_PROMPTS[2]
 
-        chat_container = st.container(height=520)
+        chat_container = st.container(height=compute_chat_history_height(len(st.session_state.messages)))
         with chat_container:
             active_idx = st.session_state.get("chat_active_assistant_index")
             for message_index, message in enumerate(st.session_state.messages):
@@ -2873,13 +3017,21 @@ def render_chat_panel(current_page: str) -> None:
                 provider = st.session_state.agent_provider
                 if provider is None:
                     raise RuntimeError("agent provider unavailable")
-                job_id = CHAT_STREAM_JOBS.start(
+                job_id = get_chat_stream_jobs().start(
                     lambda _prompt=effective_prompt, _provider=provider: stream_agent_response(_prompt, _provider)
+                )
+                logger.info(
+                    "chat_stream_start",
+                    job_id=job_id,
+                    provider=st.session_state.agent_provider_name,
+                    prompt_len=len(prompt),
+                    effective_prompt_len=len(effective_prompt),
+                    has_question_context=bool(selected_question),
                 )
                 st.session_state.chat_active_job_id = job_id
                 st.session_state.chat_active_assistant_index = assistant_index
             except Exception as exc:  # noqa: BLE001
-                st.session_state.messages[assistant_index]["content"] = f"[錯誤] {exc}"
+                st.session_state.messages[assistant_index]["content"] = build_chat_stream_error_message(str(exc))
                 st.session_state.messages[assistant_index].pop("streaming", None)
                 st.session_state.chat_active_job_id = None
                 st.session_state.chat_active_assistant_index = None
@@ -2890,16 +3042,18 @@ def render_chat_panel(current_page: str) -> None:
 
         rerun_chat_panel()
 
-    if chat_stream_running and st.button("⏹️ 停止回應", key="chat_stop_stream", width="stretch"):
-        stop_active_chat_stream("使用者中止回應")
-        rerun_chat_panel()
-
-    if st.session_state.messages:
-        if st.button("🗑️ 清除對話", width="stretch"):
-            if chat_stream_running:
-                stop_active_chat_stream("使用者清除對話")
-            st.session_state.messages = []
-            rerun_chat_panel()
+    if chat_stream_running or st.session_state.messages:
+        action_col1, action_col2 = st.columns(2)
+        with action_col1:
+            if chat_stream_running and st.button("⏹️ 停止回應", key="chat_stop_stream", width="stretch"):
+                stop_active_chat_stream("使用者中止回應")
+                rerun_chat_panel()
+        with action_col2:
+            if st.session_state.messages and st.button("🗑️ 清除對話", width="stretch"):
+                if chat_stream_running:
+                    stop_active_chat_stream("使用者清除對話")
+                st.session_state.messages = []
+                rerun_chat_panel()
 
     if chat_stream_running:
         time.sleep(0.15)
@@ -3572,7 +3726,12 @@ with main_col:
                     )
 
                     available_years = sorted(
-                        {int(entry["exam_year"]) for entry in past_exam_catalog if entry.get("exam_year") is not None}
+                        {
+                            year
+                            for entry in past_exam_catalog
+                            for year in [_safe_year_value(entry.get("exam_year"))]
+                            if year is not None
+                        }
                     )
                     if available_years:
                         year_col1, year_col2 = st.columns(2)
@@ -3784,40 +3943,58 @@ with main_col:
 
                     # 選項
                     options = q.get("options", [])
-                    option_labels = [
-                        f"{chr(65 + j)}. {opt}" if not opt.startswith(chr(65 + j)) else opt
-                        for j, opt in enumerate(options)
-                    ]
+                    option_labels = [_build_option_label(j, opt) for j, opt in enumerate(options)]
+                    option_count = len(option_labels)
+                    allows_multiple = _question_type_allows_multiple(q, option_count=option_count)
 
                     # 作答
                     current_answer = st.session_state.practice_answers.get(q_id, "")
-                    try:
-                        current_index = option_labels.index(current_answer) if current_answer in option_labels else None
-                    except ValueError:
+                    current_letters = _normalize_answer_letters(current_answer, option_count=option_count)
+
+                    if allows_multiple:
+                        selected = st.multiselect(
+                            f"選擇答案 (題目 {i + 1})",
+                            options=option_labels,
+                            default=_letters_to_option_labels(current_letters, option_labels),
+                            key=f"q_{q_id}",
+                            label_visibility="collapsed",
+                            disabled=st.session_state.practice_submitted,
+                        )
+                        selected_letters = _letters_from_option_labels(selected)
+                        if selected_letters:
+                            st.session_state.practice_answers[q_id] = _format_answer_letters(selected_letters)
+                        elif not st.session_state.practice_submitted:
+                            st.session_state.practice_answers[q_id] = ""
+                    else:
                         current_index = None
+                        if current_letters:
+                            current_index = ord(current_letters[0]) - 65 if ord(current_letters[0]) - 65 < len(option_labels) else None
+                        selected = st.radio(
+                            f"選擇答案 (題目 {i + 1})",
+                            options=option_labels,
+                            index=current_index,
+                            key=f"q_{q_id}",
+                            label_visibility="collapsed",
+                            disabled=st.session_state.practice_submitted,
+                        )
 
-                    selected = st.radio(
-                        f"選擇答案 (題目 {i + 1})",
-                        options=option_labels,
-                        index=current_index,
-                        key=f"q_{q_id}",
-                        label_visibility="collapsed",
-                        disabled=st.session_state.practice_submitted,
-                    )
-
-                    if selected:
-                        st.session_state.practice_answers[q_id] = selected
+                        if selected is not None:
+                            selected_letters = _letters_from_option_labels([selected])
+                            st.session_state.practice_answers[q_id] = _format_answer_letters(selected_letters)
+                        elif not st.session_state.practice_submitted:
+                            st.session_state.practice_answers[q_id] = ""
 
                     # 已提交時顯示結果
                     if st.session_state.practice_submitted:
-                        correct = q.get("correct_answer", "")
-                        user_answer = st.session_state.practice_answers.get(q_id, "")
-                        user_letter = user_answer[0] if user_answer else ""
+                        correct_letters = _normalize_answer_letters(q.get("correct_answer", ""), option_count=option_count)
+                        user_letters = _normalize_answer_letters(st.session_state.practice_answers.get(q_id, ""), option_count=option_count)
+                        user_display = _format_answer_letters(user_letters) or "-"
+                        correct_display = _format_answer_letters(correct_letters) or "-"
 
-                        if user_letter == correct:
-                            st.success(f"✅ 正確！答案：{correct}")
+                        if user_letters == correct_letters:
+                            st.success(f"✅ 正確！答案：{correct_display}")
                         else:
-                            st.error(f"❌ 錯誤！您的答案：{user_letter}，正確答案：{correct}")
+                            st.error(f"❌ 錯誤！您的答案：{user_display}，正確答案：{correct_display}")
 
                         # 詳解按鈕
                         if st.button("📖 查看詳解", key=f"exp_{q_id}"):
@@ -4288,7 +4465,7 @@ with main_col:
                                 else question.get("question_text", "")
                             ),
                             "難度": question.get("difficulty", "medium"),
-                            "答案": question.get("correct_answer", "") or "-",
+                            "答案": _format_answer_letters(_normalize_answer_letters(question.get("correct_answer", ""), len(question.get("options") or []))) or "-",
                             "詳解": "已有" if str(question.get("explanation") or "").strip() else "待補",
                             "頁碼": question.get("source_page") or "-",
                         }
@@ -4371,7 +4548,11 @@ with main_col:
 
                         meta_col1, meta_col2, meta_col3 = st.columns(3)
                         with meta_col1:
-                            st.markdown(f"**答案:** {selected_past_exam_question.get('correct_answer', '-')}")
+                            correct_letters = _normalize_answer_letters(
+                                selected_past_exam_question.get("correct_answer", "-"),
+                                option_count=len(selected_past_exam_question.get("options") or []),
+                            )
+                            st.markdown(f"**答案:** {_format_answer_letters(correct_letters) or '-'}")
                         with meta_col2:
                             st.markdown(f"**難度:** {selected_past_exam_question.get('difficulty', 'medium')}")
                         with meta_col3:
@@ -4447,7 +4628,7 @@ with main_col:
                                     [
                                         {
                                             "來源": reference.get("label", ""),
-                                            "答案": reference.get("correct_answer", ""),
+                                            "答案": _format_answer_letters(reference.get("correct_answer", "")),
                                             "主題": ", ".join(reference.get("topics", [])),
                                             "相似度": f"{float(reference.get('score', 0.0)):.2f}",
                                             "題目": _truncate_text(reference.get("question_text", ""), 72),
@@ -4749,19 +4930,25 @@ with main_col:
                             ):
                                 with st.spinner("龍蝦補題中..."):
                                     agent_provider = cast(Any, st.session_state.agent_provider)
-                                    dispatch_result = dispatch_service.dispatch(
-                                        req["id"],
-                                        agent_provider,
-                                    )
-                                invalidate_scope_request_caches()
-                                invalidate_question_bank_caches()
-                                if dispatch_result.generated_count > 0:
-                                    st.success(
-                                        f"龍蝦已寫回 {dispatch_result.generated_count} 題；本次計入需求進度 {dispatch_result.applied_count} 題。"
-                                    )
-                                else:
-                                    st.warning("龍蝦這次沒有成功寫入題目；詳細摘要已寫入管理備註。")
-                                st.rerun()
+                                    try:
+                                        dispatch_result = dispatch_service.dispatch(req["id"], agent_provider)
+                                    except Exception as exc:
+                                        logger.exception(
+                                            "streamlit_scope_dispatch_failed",
+                                            request_id=req.get("id"),
+                                            error=str(exc),
+                                        )
+                                        st.error(f"派工失敗：{exc}")
+                                    else:
+                                        invalidate_scope_request_caches()
+                                        invalidate_question_bank_caches()
+                                        if dispatch_result.generated_count > 0:
+                                            st.success(
+                                                f"龍蝦已寫回 {dispatch_result.generated_count} 題；本次計入需求進度 {dispatch_result.applied_count} 題。"
+                                            )
+                                        else:
+                                            st.warning("龍蝦這次沒有成功寫入題目；詳細摘要已寫入管理備註。")
+                                        st.rerun()
 
                         if req.get("status") not in {"approved", "in_progress"}:
                             st.caption("先核准需求，再直接派給龍蝦補題。")

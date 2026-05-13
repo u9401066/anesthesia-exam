@@ -7,6 +7,7 @@ import re
 import time
 import uuid
 from dataclasses import dataclass
+from json import JSONDecodeError
 from typing import Any
 
 import streamlit as st
@@ -100,7 +101,8 @@ def build_generation_prompt(
             prompt += f"- 文件 ID: {', '.join(selected_doc_ids)}\n"
     prompt += f"- 生成模式: {'preview 草稿' if preview_only_mode else '正式來源追蹤'}\n"
     if selected_section_details:
-        sec_names = [section["title"] for section in selected_section_details]
+        sec_names = [str(section.get("title") or "").strip() for section in selected_section_details]
+        sec_names = [name for name in sec_names if name]
         prompt += f"- 指定章節: {', '.join(sec_names)}\n"
     if additional_instructions:
         prompt += f"- 額外要求: {additional_instructions}\n"
@@ -240,11 +242,12 @@ def _build_section_focus(selected_section_details: list[dict]) -> str:
         return ""
 
     sec_list = "\n".join(
-        f"  - {section['title']} (P.{section.get('page', '?')}, doc: {section['doc_id'][:12]})"
+        f"  - {section.get('title', '-') } (P.{section.get('page', '?')}, doc: {(section.get('doc_id') or '')[:12]})"
         for section in selected_section_details
     )
     section_ids = "\n".join(
-        f"  - {section['id']} ({section['title']})" for section in selected_section_details
+        f"  - {section.get('id', '-') } ({section.get('title', '-')})"
+        for section in selected_section_details
     )
     return f"""
 ### 📑 聚焦章節
@@ -305,31 +308,11 @@ def extract_questions_from_response(text: str) -> list[dict]:
     questions: list[dict] = []
     seen_texts: set[str] = set()
 
-    code_blocks = re.findall(r"```(?:json)?\s*(\{.+?\})\s*```", text, re.DOTALL)
+    raw_candidates: list[str] = []
+    raw_candidates.extend(re.findall(r"```(?:json)?\s*(\{.+?\})\s*```", text, re.DOTALL))
+    raw_candidates.extend(_extract_json_candidates(text))
 
-    brace_objects: list[str] = []
-    index = 0
-    while index < len(text):
-        if text[index] == "{":
-            depth = 0
-            start = index
-            for cursor in range(index, len(text)):
-                if text[cursor] == "{":
-                    depth += 1
-                elif text[cursor] == "}":
-                    depth -= 1
-                    if depth == 0:
-                        candidate = text[start : cursor + 1]
-                        if "question_text" in candidate and "options" in candidate:
-                            brace_objects.append(candidate)
-                        index = cursor + 1
-                        break
-            else:
-                index += 1
-        else:
-            index += 1
-
-    for raw_json in code_blocks + brace_objects:
+    for raw_json in raw_candidates:
         try:
             obj = json.loads(raw_json)
         except json.JSONDecodeError:
@@ -340,27 +323,118 @@ def extract_questions_from_response(text: str) -> list[dict]:
             except json.JSONDecodeError:
                 continue
 
-        if not isinstance(obj, dict):
-            continue
-        if not obj.get("question_text") or not obj.get("options"):
+        if isinstance(obj, list):
+            payloads = obj
+        elif isinstance(obj, dict):
+            payloads = [obj]
+        else:
             continue
 
-        fingerprint = obj["question_text"][:80]
-        if fingerprint in seen_texts:
-            continue
-        seen_texts.add(fingerprint)
-        questions.append(normalize_ai_question(obj))
+        for payload in payloads:
+            if not isinstance(payload, dict):
+                continue
+            if not payload.get("question_text") or not payload.get("options"):
+                continue
+
+            fingerprint = str(payload.get("question_text") or "")[:80]
+            if fingerprint in seen_texts:
+                continue
+            seen_texts.add(fingerprint)
+            questions.append(normalize_ai_question(payload))
 
     return questions
 
 
+def _extract_json_candidates(text: str) -> list[str]:
+    decoder = json.JSONDecoder()
+    candidates: list[str] = []
+    index = 0
+    text_len = len(text)
+
+    while index < len(text):
+        if text[index] not in "{[":
+            index += 1
+            continue
+        try:
+            _, end = decoder.raw_decode(text[index:])
+        except JSONDecodeError:
+            index += 1
+            continue
+        start = index
+        end = start + end
+        if end <= text_len:
+            candidates.append(text[start:end])
+        index = end
+
+    return candidates
+
+
+def normalize_question_type(value: object) -> str:
+    """Normalize model/provider question type aliases to stable UI schema values."""
+    raw = str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
+    aliases = {
+        "mcq": "single_choice",
+        "single": "single_choice",
+        "single_choice": "single_choice",
+        "choice": "single_choice",
+        "multiple": "multiple_choice",
+        "multi": "multiple_choice",
+        "multi_choice": "multiple_choice",
+        "multiple_choice": "multiple_choice",
+        "true_false": "true_false",
+        "tf": "true_false",
+        "是非題": "true_false",
+        "單選題": "single_choice",
+        "多選題": "multiple_choice",
+    }
+    return aliases.get(raw, raw or "single_choice")
+
+
+def normalize_answer_labels(value: object) -> str:
+    """Normalize answer aliases such as 1/2 or full-width punctuation to A,B labels."""
+    if isinstance(value, list):
+        parts = [str(item) for item in value]
+    else:
+        text = str(value or "").strip().upper()
+        text = (
+            text.replace("，", ",")
+            .replace("、", ",")
+            .replace("；", ",")
+            .replace(";", ",")
+            .replace("(", "")
+            .replace(")", "")
+        )
+        parts = re.split(r"[\s,]+", text)
+
+    labels: list[str] = []
+    digit_map = {"1": "A", "2": "B", "3": "C", "4": "D", "5": "E"}
+    for part in parts:
+        token = str(part or "").strip().upper().strip(".:：")
+        if not token:
+            continue
+        token = digit_map.get(token, token)
+        if re.fullmatch(r"[A-H]", token) and token not in labels:
+            labels.append(token)
+    return ",".join(labels)
+
+
 def normalize_ai_question(raw: dict) -> dict:
     """Normalize a generated JSON question into the Streamlit review schema."""
+    normalized_question_type = normalize_question_type(
+        raw.get("question_type") or raw.get("type") or raw.get("question_kind")
+    )
     question: dict = {
         "id": raw.get("id", str(uuid.uuid4())),
         "question_text": raw.get("question_text", ""),
         "options": raw.get("options", []),
-        "correct_answer": raw.get("correct_answer", ""),
+        "correct_answer": normalize_answer_labels(
+            raw.get("correct_answer")
+            or raw.get("correct_answers")
+            or raw.get("answer")
+            or ""
+        ),
+        "question_type": normalized_question_type,
+        "type": normalized_question_type,
         "explanation": raw.get("explanation", ""),
         "difficulty": raw.get("difficulty", "medium"),
         "topics": raw.get("topics", []),
@@ -368,18 +442,25 @@ def normalize_ai_question(raw: dict) -> dict:
 
     cleaned_options = []
     for option in question["options"]:
-        cleaned_options.append(re.sub(r"^[A-Da-d][.、:：]\s*", "", str(option)))
+        cleaned_options.append(re.sub(r"^[A-Za-z][.、:：]\s*", "", str(option)))
     question["options"] = cleaned_options
 
     source: dict = {}
     if raw.get("source_doc"):
         source["document"] = raw["source_doc"]
+    elif raw.get("source_doc_id"):
+        source["document"] = raw["source_doc_id"]
     elif raw.get("source") and isinstance(raw["source"], dict):
         source = raw["source"]
     if raw.get("source_chapter"):
         source["chapter"] = raw["source_chapter"]
     if raw.get("stem_source") and isinstance(raw["stem_source"], dict):
         source["stem_source"] = raw["stem_source"]
+    elif raw.get("source_page") or raw.get("source_text"):
+        source["stem_source"] = {
+            "page": raw.get("source_page"),
+            "original_text": raw.get("source_text") or raw.get("original_text") or "",
+        }
     if raw.get("answer_source") and isinstance(raw["answer_source"], dict):
         source["answer_source"] = raw["answer_source"]
     if raw.get("explanation_sources") and isinstance(raw["explanation_sources"], list):

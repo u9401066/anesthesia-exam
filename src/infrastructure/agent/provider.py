@@ -15,6 +15,7 @@ import json
 import os
 import shutil
 import subprocess
+import threading
 import time
 import uuid
 from dataclasses import dataclass
@@ -26,6 +27,82 @@ from urllib.error import HTTPError, URLError
 from src.infrastructure.logging import get_logger
 
 logger = get_logger(__name__)
+
+
+def _safe_int(value: object, default: int, min_value: Optional[int] = None, max_value: Optional[int] = None) -> int:
+    """Parse an environment integer safely and clamp to an optional range."""
+    if isinstance(value, int) and not isinstance(value, bool):
+        candidate = value
+    elif isinstance(value, float) and not isinstance(value, bool):
+        candidate = int(value)
+    elif isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return default
+        try:
+            candidate = int(stripped)
+        except ValueError:
+            return default
+    else:
+        return default
+
+    if min_value is not None and candidate < min_value:
+        return min_value
+    if max_value is not None and candidate > max_value:
+        return max_value
+    return candidate
+
+
+def _resolve_crush_executable_path() -> str:
+    explicit = os.getenv("EXAM_CRUSH_PATH")
+    if explicit:
+        return explicit.strip()
+
+    exe = shutil.which("crush")
+    if exe:
+        return exe
+
+    repo_root = Path(__file__).resolve().parents[3]
+    bundled = repo_root / "crush" / ("crush.exe" if os.name == "nt" else "crush")
+    if bundled.exists():
+        return str(bundled)
+
+    return "crush"
+
+
+def _terminate_process(process: subprocess.Popen[str], *, timeout: float = 2.0) -> None:
+    """Terminate a process safely and force-kill on timeout."""
+    if process.poll() is not None:
+        return
+    try:
+        process.terminate()
+        process.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        try:
+            process.kill()
+            process.wait(timeout=timeout)
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+
+def _iter_process_lines(process: subprocess.Popen[str], timeout_sec: int) -> Iterator[str]:
+    watchdog = None
+    if timeout_sec > 0:
+        watchdog = threading.Timer(timeout_sec, _terminate_process, args=(process,))
+        watchdog.daemon = True
+        watchdog.start()
+
+    try:
+        assert process.stdout is not None
+        for line in iter(process.stdout.readline, ""):
+            if not line:
+                break
+            yield line
+    finally:
+        if watchdog is not None and watchdog.is_alive():
+            watchdog.cancel()
 
 
 def _dedupe_strings(values: list[str]) -> list[str]:
@@ -306,9 +383,14 @@ class AgentProviderConfig:
     ) -> "AgentProviderConfig":
         provider = (provider_override or os.getenv("EXAM_AGENT_PROVIDER", "crush")).strip().lower()
         if provider == "openclaw":
-            timeout = int(os.getenv("EXAM_OPENCLAW_TIMEOUT") or os.getenv("EXAM_AGENT_TIMEOUT") or "300")
+            timeout = _safe_int(
+                os.getenv("EXAM_OPENCLAW_TIMEOUT") or os.getenv("EXAM_AGENT_TIMEOUT"),
+                default=300,
+                min_value=1,
+                max_value=3600,
+            )
         else:
-            timeout = int(os.getenv("EXAM_AGENT_TIMEOUT", "120"))
+            timeout = _safe_int(os.getenv("EXAM_AGENT_TIMEOUT"), default=120, min_value=1, max_value=3600)
 
         model = (model_override or os.getenv("EXAM_AGENT_MODEL") or "").strip() or None
         if model is None and crush_config_path.exists():
@@ -319,12 +401,7 @@ class AgentProviderConfig:
             except Exception:
                 model = None
 
-        crush_executable = os.getenv("EXAM_CRUSH_PATH")
-        if not crush_executable:
-            crush_executable = shutil.which("crush")
-
-        if not crush_executable:
-            crush_executable = "D:/workspace260203/crush/crush.exe"
+        crush_executable = _resolve_crush_executable_path()
 
         # OpenCode: 從 opencode.json 讀取模型設定
         opencode_executable = os.getenv("EXAM_OPENCODE_PATH") or shutil.which("opencode")
@@ -488,8 +565,7 @@ class CrushAgentProvider:
         )
 
         try:
-            assert process.stdout is not None
-            for line in iter(process.stdout.readline, ""):
+            for line in _iter_process_lines(process, self.config.timeout):
                 if line:
                     total_chars += len(line)
                     yield line
@@ -501,7 +577,7 @@ class CrushAgentProvider:
                 raise RuntimeError(f"Crush 結束碼：{process.returncode}")
             log.info("agent_stream_done", duration_ms=elapsed_ms, total_chars=total_chars)
         finally:
-            process.terminate()
+            _terminate_process(process)
 
 
 class OpenCodeAgentProvider:
@@ -586,8 +662,7 @@ class OpenCodeAgentProvider:
         )
 
         try:
-            assert process.stdout is not None
-            for line in iter(process.stdout.readline, ""):
+            for line in _iter_process_lines(process, self.config.timeout):
                 if line:
                     total_chars += len(line)
                     # 偵測 MCP 工具調用跡象
@@ -603,7 +678,7 @@ class OpenCodeAgentProvider:
                 raise RuntimeError(f"OpenCode 結束碼：{process.returncode}")
             log.info("agent_stream_done", duration_ms=elapsed_ms, total_chars=total_chars, mcp_calls=mcp_calls_detected)
         finally:
-            process.terminate()
+            _terminate_process(process)
 
 
 class CopilotSdkAgentProvider:
@@ -711,7 +786,10 @@ class CodexAgentProvider:
         }
         with self._open(f"{self._get_base_url()}/responses", payload) as response:
             raw = response.read().decode("utf-8", errors="replace")
-        data = json.loads(raw)
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"Codex responses 回應非 JSON：{raw[:160]}") from exc
         return extract_responses_api_text(data).strip()
 
     def _run_via_chat_completions(self, prompt: str) -> str:
@@ -723,7 +801,10 @@ class CodexAgentProvider:
         }
         with self._open(f"{self._get_base_url()}/chat/completions", payload) as response:
             raw = response.read().decode("utf-8", errors="replace")
-        data = json.loads(raw)
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"Codex chat-completions 回應非 JSON：{raw[:160]}") from exc
         return extract_chat_completion_text(data).strip()
 
     def _stream_via_responses(self, prompt: str) -> Iterator[str]:
@@ -736,7 +817,10 @@ class CodexAgentProvider:
             for message in iter_sse_data_messages(response):
                 if message == "[DONE]":
                     return
-                event = json.loads(message)
+                try:
+                    event = json.loads(message)
+                except json.JSONDecodeError:
+                    continue
                 event_type = str(event.get("type") or "").strip()
                 if event_type == "response.output_text.delta":
                     delta = str(event.get("delta") or "")
@@ -757,7 +841,10 @@ class CodexAgentProvider:
             for message in iter_sse_data_messages(response):
                 if message == "[DONE]":
                     return
-                event = json.loads(message)
+                try:
+                    event = json.loads(message)
+                except json.JSONDecodeError:
+                    continue
                 choices = event.get("choices") or []
                 if not choices:
                     continue
@@ -917,6 +1004,17 @@ class OpenClawAgentProvider:
         config_path = self.config.openclaw_config_path
         if mode == "agent" and config_path and not config_path.exists():
             return False, f"找不到 OpenClaw 設定：{config_path}"
+        if mode == "agent" and config_path:
+            try:
+                config_payload = json.loads(config_path.read_text(encoding="utf-8"))
+            except Exception as exc:  # noqa: BLE001
+                return False, f"OpenClaw 設定無法解析：{exc}"
+            agents = config_payload.get("agents") or {}
+            agent_id = self._get_agent_id()
+            if agent_id not in agents and agent_id != "main":
+                return False, f"OpenClaw 設定缺少 agent：{agent_id}"
+            if not resolve_openclaw_default_model(config_payload):
+                return False, "OpenClaw 設定缺少可用模型"
 
         try:
             result = self._run_cli([exe, "models", "status", "--plain"], timeout=10)
@@ -955,11 +1053,9 @@ class OpenClawAgentProvider:
             if text:
                 log.info("agent_run_done", duration_ms=elapsed_ms, output_len=len(text))
                 return text
-
-        cleaned_output = combined_output.strip()
-        if cleaned_output:
-            log.info("agent_run_done", duration_ms=elapsed_ms, output_len=len(cleaned_output))
-            return cleaned_output
+            raise RuntimeError("OpenClaw JSON 缺少可見文字")
+        if combined_output.strip():
+            raise RuntimeError("OpenClaw 未回傳有效 JSON")
 
         log.error("agent_run_error", duration_ms=elapsed_ms, error="OpenClaw 回傳空內容")
         raise RuntimeError("OpenClaw 回傳空內容")
