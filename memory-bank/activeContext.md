@@ -6,6 +6,14 @@
 
 ## Current Focus
 
+**2026-05-13 release 補充：asset-aware 圖像裁切修復已從舊 `v0.6.29` tag 重新套到最新 `origin/master`，目前在 subrepo `release/v0.6.30` 分支準備發版。v0.6.30 release scope 包含 PyMuPDF page-region crop、caption-anchor crop（Miller Fig. 33.1）、multi-panel A/B group crop（Miller Fig. 33.4）、decimal caption regex、FigureAsset geometry metadata、isolated fast fallback timeout 與 LightRAG lazy import。已保留 dirty patch 備份 `.codex-backups/asset-aware-v0.6.30-dirty-20260513T110521Z.patch`。注意：本機目前沒有 `npm`，所以 VSIX `sync-assets/test:ci/test:install-smoke` release gate 需要安裝 npm/Node 工具鏈後才可視為通過；在此之前不可宣稱 VSIX gate 完整通過。**
+
+**2026-05-13 補充：已針對 asset-aware 的 PyMuPDF figure extraction 做完整迭代修復，解決 Miller 圖片「只有 raw image、沒有 PDF text layer / label / caption」的核心問題。修復策略是讓 xobject 圖像不再只輸出 `doc.extract_image()` 的 raw bitmap，而是用 `page.get_image_rects(xref)` 取得 page bbox 後以 `page.get_pixmap(clip=...)` 產生 display crop；同時在 `FigureAsset` 保留 `raw_path / figure_bbox / crop_bbox / caption_bbox / caption_confidence / extraction_strategy`。caption 偵測已支援 `Fig. 42.1` 這類 decimal figure number，並以 bbox 做 spatial matching；若同一 caption 下方/附近有多個 xobject panel，會輸出 `caption_group_page_crop`，避免多 panel 圖被拆成多張碎圖。focused tests 已通過 `50 passed`；MCP targeted reingest 已重建 Chapter 33/42，最終 audit：Chapter 33 從原本 `63 figures / 26 captions` 改為 `44 figures / 33 captions / 44 crop_bbox / 33 caption_bbox`，Chapter 42 從原本 `56 figures / 20 captions` 改為 `38 figures / 28 captions / 38 crop_bbox / 28 caption_bbox`，且 `xobject_raw=0`。視覺 contact sheets 位於 `data/reports/figure_crop_audit/20260513T0918/`；抽樣確認圖內 label 與 caption 已進入 display crops。MCP `search_source_location` 對 Chapter 42 仍正常，OpenClaw embedded smoke 回 `OK`，Web service 已重啟且 `127.0.0.1:8501` 回 `200 OK`。**
+
+**2026-05-12 補充：`libs/asset-aware-mcp` 已由本地 `v0.6.8` 系列升級到上游 latest `v0.6.29`，並保留升級前 dirty files 備份：`.codex/backups/asset-aware-mcp-v0.6.8-dirty-20260512T155356Z/`，另在 subrepo 留有 git stash `pre-v0.6.29 asset-aware local backup 20260512T155356Z`。升級後重新套用 LightRAG lazy import，避免 `ENABLE_LIGHTRAG=false` 時 optional KG dependency 影響 OpenClaw/web。已透過 MCP stdio 對 `98` 份 PDF 重新 ingest：`87/87` Miller 分章、`8` 份歷屆考題、`2` 份 uploads 完成，只有單一完整大檔 `data/2020 Miller's Anesthesia 9th.pdf` 在 90 分鐘保護時間達到 `timeout`；但該大檔仍已落地 manifest/markdown/blocks。最新報告在 `data/reports/asset_aware_reingest/mcp_reingest_20260512T160030Z.json`，artifact totals 為 `6727` pages、`1434` figures、`496` tables，`98/98` 有 manifest/markdown/blocks、`97/98` 有 segmentation。MCP lookup smoke 已確認 `search_source_location` 可查 Chapter 21：`propofol=43`、`ketamine=25`、`etomidate=19` matches；OpenClaw smoke 也確認 `asset-aware` 現載入 `62` 個工具與 `exam-generator` `26` 個工具。Web user service 已重新安裝並啟動，`http://127.0.0.1:8501` 回 `200 OK`。v0.6.29 的 `marker` extra 因 `marker-pdf` 舊版與 `Pillow>=12.2.0` 安全需求衝突而保持空集合，本輪全量重拆走安全 PyMuPDF/blocks/segmentation 主路徑；若之後需要 Marker bbox 級 citation，應等 Marker 支援新版 Pillow 或獨立隔離 Marker runtime。**
+
+**2026-05-12 補充：OpenClaw 已完成 repo-local runtime 更新與 user-level systemd Web 服務接線驗證。`vendor/openclaw-runtime` 目前為 `OpenClaw 2026.5.7 (eeef486)`，systemd unit 明確以 `EXAM_AGENT_PROVIDER=openclaw`、`EXAM_OPENCLAW_MODE=agent` 與 repo-local `vendor/openclaw-state/openclaw.json` 啟動；完整 agent smoke 已確認 `asset-aware` 48 個工具與 `exam-generator` 26 個工具同時進入 system prompt，模型回覆 `OK`、`fallbackUsed=False`。本輪 root cause 是 `asset-aware` 在 `ENABLE_LIGHTRAG=false` 的 OpenClaw 環境下仍 eager import `LightRAGAdapter`，而目前安裝的 `lightrag` 版本缺少舊的 `EmbeddingFunc` 匯出，導致 bundled MCP 啟動時被 optional dependency 拖垮；現已改為只有啟用 LightRAG 時才載入 adapter。Web 服務已重啟且 `http://127.0.0.1:8501` 回 `200 OK`。**
+
 **2026-04-24 補充：已完成一輪可落地的 Streamlit performance rescue，而不是直接重寫 TypeScript。右側常駐對話現在改成 background thread + fragment 同步的非阻塞串流，對話時頁面可以先響應，不再把整個 UI 卡在同步 agent 回應；教材/草稿/題庫/歷屆題/補題需求的 cached read-model 也都補上 mutation 後的明確 invalidation，避免 `st.rerun()` 後短時間持續顯示舊資料。這一輪同時修掉 `OpenClaw infer` 被錯誤要求 repo-local config 的 availability bug，並把 root `uv run pytest` 收斂成只跑本 repo `tests/`；若使用者顯式混跑 `libs/asset-aware-mcp/tests/...` 與 root `tests/...`，現在會透過 repo-root `conftest.py` 在 collection/setup 階段切換並合併雙 `src` package search path，實測 `uv run pytest -q libs/asset-aware-mcp/tests/unit/test_document_service.py tests/test_agent_provider_config.py` 已通過。**
 
 **2026-04-23 補充：Miller 9th 分章教材的 figure asset 已完成全量刷新與品質稽核。這次不是再盲目全書 strict Marker 重跑，而是在 asset-aware pipeline 補上可控的 high-fidelity profile、figure filtering、Marker bbox crop fallback 與 PyMuPDF caption timeout guard 後，對 `Miller anesthesia章節分割版` 87/87 章節執行 figure-only refresh。刷新後 latest audit 顯示：figure 總數 `4159 -> 867`，極小碎圖 `<20k area` 從 `2267` 降到 `51`，低變異圖從 `1759` 降到 `14`，最大單頁 figure 數從 `268` 降到 `4`，且 manifest path 的 missing / unreadable / 舊 `/root` prefix 已歸零。這代表先前「圖像多數錯誤」的主要 root cause 已從大量 XObject/region false positives 收斂為少數章節的 caption/evidence matching 問題；下一步應做 targeted caption recovery，而不是再次全書重刷。**
@@ -159,17 +167,28 @@
 - **知識圖譜已可用但仍非最穩定 gate**：LightRAG/Ollama 的本機模型 fallback 與 root `data/` 平面對齊已修好，root-plane KG smoke query 已成功；但對多文件或較大批次 extraction 仍可能出現 chunk timeout，因此教材正式入庫仍應以 `search_source_location` + evidence pack 為硬性 gate，KG 作為輔助檢索
 - **Web 生成頁仍屬 prompt 編排式整合**：UI gating 已正確，但正式生成仍需要把 pipeline tool 調用做成更穩定的服務層接線
 - **作者工具仍未完整**：草稿箱已具 draft-first、相似題提醒、歷史模板、blueprint、QA checklist、版本歷史與 promote 前摘要基礎，但尚未支援 filter presets、版本回滾與更細的 promote gate override UX
-- **systemd 服務在目前 workspace 內無法直接啟動**：unit / install script 已備妥，且 `/etc/systemd/system/anesthesia-exam-web.service` 已落檔；但此容器 PID 1 非 systemd，因此 `systemctl` 無法連 bus
+- **systemd user service 已在目前主機可用**：`anesthesia-exam-web.service` 已可由 `./scripts/install_systemd_service.sh --user` 安裝並 restart；若需要開機後不登入也常駐，下一步才是啟用 linger 或改 system-level service
 - **Miller 圖像 caption coverage 仍需 targeted 補強**：碎圖與壞路徑已收斂，但 chapter 30、42、59、66、32 等章節仍有較高 no-caption ratio；詳解/出題若需要圖像證據，應先做章節級 caption/evidence recovery，不要把無 caption 圖直接當作可靠引用
+- **完整 Miller 單一巨檔不適合作為同步全量 ingest 主路徑**：v0.6.29 對分章與歷屆題穩定，但 `2020 Miller's Anesthesia 9th.pdf` 單檔 3336 頁在 90 分鐘保護時間內停在 manifest generation；正式出題應優先使用 87 份分章 doc_id，單一巨檔只作備援全文 artifact
+- **Miller 圖像 extraction 主路徑已從 raw xobject 改為 page-region display crop**：Chapter 33/42 已驗證；下一步若要全量更新，應對 87 章跑同一路徑並用 `caption_group_page_crop / caption_bbox / xobject_raw=0` 作 gate
 
 ## Next Steps
 
 1. **追 `112` 年答案來源**：一旦取得原始答案檔，直接重跑 `scripts/import_written_past_exams.py --only 112` 補齊 answer coverage
 2. **決定 oral / ultrasound 歷屆是否納入**：若要收錄，先定義非單選題在 repository / UI 的表達方式
-3. **重 ingest 正式教材**：用 `use_marker=True` 重新建立可精確追來源的 doc_id
+3. **精準 citation 後續策略**：目前 v0.6.29 已用 MCP 重建 Miller 分章與歷屆題 PyMuPDF/blocks/segmentation artifacts；若要 Marker bbox 級來源，需等 `marker-pdf` 相容 `Pillow>=12.2.0` 或另做隔離 Marker runtime
 4. **補 browser smoke test**：驗證 `📋 出題需求`、題庫審查按鈕與統計頁 heartbeat 卡片的互動流程
 5. **擴草稿箱下一刀**：補 filter presets、版本回滾與更清楚的 promote override UX，讓版本歷史不只可看也可回復
 6. **補 UI / Agent 接線**：讓生成頁正式消費 pipeline tools，並保留目前已驗證的 source-ready gate / preview mode UX
-7. **在真正的 systemd 主機驗證 service lifecycle**：執行 `./scripts/install_systemd_service.sh`，確認 enable/restart/journal 行為
+7. **決定 systemd 常駐等級**：目前 user-level service 已驗證；若需要 reboot 後不登入仍常駐，改評估 `loginctl enable-linger` 或 system-level unit
 8. **針對 Miller 低 caption coverage 章節補強 evidence recovery**：優先從 latest image audit 的高風險章節開始，讓圖像、頁碼、caption 與 markdown evidence 可一起被詳解/出題流程消費
 9. **持續量測 Streamlit rerun hot path**：目前 UX bug 已收斂，但下一步應用真實頁面耗時量測確認還有哪些 fragment / query 是剩餘瓶頸
+10. **全量刷新 Miller figure artifacts**：先以本次 Chapter 33/42 的 audit 指標為 gate，對 87 章重新 ingest 或 figure refresh，確保正式題庫不再使用舊 raw-only images
+
+## 2026-05-13 Asset-aware Figure Review-first 修復狀態
+
+- 已用 subagents 先完成 review，再修復 asset-aware extractor/service、MCP ingest workflow、Web/OpenClaw/source UX 相關高風險點。
+- Chapter 33/42 已重新建立新 schema figure artifacts：Chapter 33 = 44 figures / 33 captions / raw_only=0；Chapter 42 = 38 figures / 28 captions / raw_only=0；策略為 `caption_group_page_crop` + `xobject_page_crop`。
+- 全 87 audit 目前健康基線：777 records、missing=0、unreadable=0、raw_only=0；其中 252 筆已有新 bbox/caption metadata，476 筆仍是舊 manifest `unknown` strategy。
+- Chapter 30 的 PyMuPDF fast fallback 仍會卡住；已從既有 image files 保守恢復 49 figures，strategy 標記為 `recovered_existing_image`，未偽造 caption/bbox。
+- 不應再直接跑無保護的全量 figure refresh；若要全 87 轉新 schema，必須採章節級外層 timeout、保留舊 manifest、防止 zero-figure overwrite，並以 audit gate 驗收。

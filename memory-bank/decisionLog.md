@@ -1,5 +1,45 @@
 # Decision Log
 
+## 2026-05-13
+
+### DEC-048: asset-aware v0.6.30 release 必須基於最新 `origin/master`，並把 Figure crop 修復作為正式 patch release 發布
+
+| 項目 | 內容 |
+|------|------|
+| **決策** | 不在 detached `v0.6.29` tag 上直接 commit/tag；先備份 dirty patch，再切到最新 `origin/master` 建立 `release/v0.6.30`，將 PyMuPDF figure crop 修復、metadata、tests 與 release docs 一起發成 `0.6.30`。 |
+| **問題** | 本地修補最初掛在 `v0.6.29` tag，而遠端 `master` 已經前進 53 commits。若直接 tag，本次修復會漏掉 master 上的 release harness、docs、VSIX 與 citation workflow 更新，造成新版基準倒退。 |
+| **解決方案** | 先輸出 `.codex-backups/asset-aware-v0.6.30-dirty-20260513T110521Z.patch`，再 stash、fast-forward local master 到 `origin/master`、建立 release branch、套回修補。v0.6.30 的 release scope 明確聚焦：page-region crop、caption-anchor crop、A/B multi-panel group crop、decimal caption regex、FigureAsset geometry metadata、isolated fast fallback timeout 與 LightRAG lazy import。 |
+| **影響** | Tag/push 前 release gate 必須重新跑在最新 master 基準上。本機目前缺 `npm`，所以 VSIX release gate 不能被視為已通過；若要正式 tag，必須安裝/提供 Node/npm 或在可用環境補跑 extension checks。 |
+
+## 2026-05-12
+
+### DEC-047: Miller 圖像資產以 PyMuPDF page-region display crop 作為主輸出，raw xobject 只保留為 fallback/diagnostic
+
+| 項目 | 內容 |
+|------|------|
+| **決策** | asset-aware 的 PyMuPDF figure extraction 不再把 `doc.extract_image(xref)` 的 raw embedded image 當作正式教材圖像；正式 display asset 改為 `page.get_pixmap(clip=...)` 的 page-region crop，並把 `raw_path / figure_bbox / crop_bbox / caption_bbox / caption_confidence / extraction_strategy` 寫入 `FigureAsset`。 |
+| **問題** | Miller PDF 常把圖像 bitmap、PDF text layer、label、arrow/vector 與 caption 分開儲存。raw xobject 只會抽到 bitmap 本體，因此網站與 agent 看到的圖常常沒有文字、沒有 panel label、沒有圖說；同頁 FIFO caption matching 也會讓 subfigure 對錯 caption 或完全空 caption。 |
+| **解決方案** | 用 `page.get_image_rects(xref)` 取得 image bbox，再 render 擴張後的 page clip；caption 偵測支援 `Fig. 42.1` decimal 編號並保留 bbox；caption association 改為 spatial matching；若同一 caption 附近有多個 xobject panel，合併為 `caption_group_page_crop`。保留 raw path 作診斷，但 UX/考題應優先使用 display crop path。 |
+| **影響** | Chapter 33/42 targeted reingest 已驗證：`xobject_raw=0`、caption bbox 可用、圖內 label 與圖說進入 display crops。這條路徑在主 runtime 不依賴 Marker，因此與 v0.6.29 的 Pillow 安全 baseline 相容。後續全量 Miller refresh 應沿用此 gate，而不是回退舊 Marker/Torch stack。 |
+
+### DEC-046: asset-aware 升級到 v0.6.29 後採安全 PyMuPDF/blocks/segmentation 主路徑，Marker bbox 能力改為後續隔離策略
+
+| 項目 | 內容 |
+|------|------|
+| **決策** | 將 `libs/asset-aware-mcp` 升級到上游 latest `v0.6.29`，保留升級前 dirty files 備份與 stash；重新套用 LightRAG lazy import，但不把 v0.6.8 時代的 `marker-pdf` / Torch stack 直接回套進 v0.6.29。全量教材重拆先走 v0.6.29 目前安全的 PyMuPDF/blocks/segmentation pipeline。 |
+| **問題** | 使用者需要最新 asset-aware，並用 MCP 重新拆解全部 PDF 供 exam generation 使用；但 v0.6.29 的 `marker` extra 是刻意留空，因為目前 `marker-pdf 1.10.2` 仍要求 `Pillow<11`，與安全 runtime 的 `Pillow>=12.2.0` 衝突。若直接回套舊依賴，等於用 citation 需求換掉 dependency security baseline。 |
+| **解決方案** | 先備份 dirty files 到 `.codex/backups/asset-aware-mcp-v0.6.8-dirty-20260512T155356Z/`，再 checkout `v0.6.29`、`uv sync`，只重新套用 LightRAG lazy import。接著用 MCP stdio 對 `98` 份 PDF ingest：`87/87` Miller 分章、`8` 份歷屆考題、`2` 份 uploads 完成；單一完整 Miller 巨檔 3336 頁在 90 分鐘保護時間 timeout，但仍產出 manifest/markdown/blocks。MCP lookup smoke 對 Chapter 21 `propofol/ketamine/etomidate` 查詢成功。 |
+| **影響** | exam generation 現在有可用的最新 v0.6.29 artifact corpus，正式出題應優先使用分章 doc_id 與 `search_source_location`。若後續要 bbox/Marker 級 citation，應等 Marker 支援新版 Pillow，或建立隔離 Marker runtime；不要在主服務環境回退到舊且安全性衝突的依賴組合。 |
+
+### DEC-045: OpenClaw 服務化整合採 repo-local agent config；LightRAG 對 asset-aware MCP 保持 optional，不讓停用的 KG dependency 拖垮 Web/agent
+
+| 項目 | 內容 |
+|------|------|
+| **決策** | user-level `anesthesia-exam-web.service` 預設使用 repo-local OpenClaw agent mode 與 `vendor/openclaw-state/openclaw.json`，其中 MCP server 由 OpenClaw bundled MCP 啟動；`asset-aware` 在 `ENABLE_LIGHTRAG=false` 時不得 import LightRAG adapter。 |
+| **問題** | OpenClaw runtime 更新到 `2026.5.7` 後，agent smoke 一開始可跑模型但 bundled `asset-aware` MCP 啟動失敗。root cause 是 `asset-aware` composition root 在設定判斷前 eager import `LightRAGAdapter`，而目前安裝的 `lightrag` 已缺少舊 `EmbeddingFunc` 匯出，造成 optional KG dependency 直接讓整個 MCP server crash。 |
+| **解決方案** | 將 `LightRAGAdapter` 改為 lazy import，只有 `settings.enable_lightrag` 為真時才載入；OpenClaw service config 則維持 `ENABLE_LIGHTRAG=false`，讓教材 asset/search/tooling 可先穩定提供給 agent。更新後完整 OpenClaw smoke 顯示 `asset-aware` 48 個工具與 `exam-generator` 26 個工具皆進入 system prompt，`fallbackUsed=False`。 |
+| **影響** | Web 服務與 OpenClaw agent 現在可以共用同一套 repo-local MCP config；正式教材出題仍可走 `search_source_location` / asset-aware tools，但 KG/LightRAG 仍是後續可選能力。另已確認 OpenClaw npm production audit 有高/critical advisories，不能用 `npm audit fix --force` 盲目降級處理，應等待或追上游修正版。 |
+
 ## 2026-04-24
 
 ### DEC-043: Streamlit 先採「非阻塞串流 + 顯式 cache invalidation + 單區塊渲染」救 UX，不急著直接重寫 TypeScript
@@ -430,3 +470,5 @@
 | 圖片題處理 | PyMuPDF 抽取 / Marker 抽取 / vision model | 待討論 |
 | 來源驗證失敗處理 | 拒絕儲存 / 標記警告 / 人工審核 | 待討論 |
 | 2026-02-13 | 將 Streamlit 底層 Agent 從 Crush 單一綁定改為可插拔 Provider 架構（crush/opencode/copilot-sdk）。 | 降低單點依賴風險，讓 UI 成為可替換包裝層；可依環境與成本切換底層推理引擎，並保留既有 Crush + MCP 工作流相容性。 |
+| 2026-05-13 | Miller figure assets 採 page-region crop 優先，不再把 raw XObject 當 primary artifact。 | raw XObject 常缺 PDF text overlays / labels / captions；page crop 可保留圖中文字與圖說。caption matching 以幾何硬 gate 為準，找不到安全配對時寧可空 caption，不做 FIFO 誤綁。 |
+| 2026-05-13 | 全量 figure refresh 必須防 zero-figure overwrite 並有 per-fallback timeout。 | Chapter 30 暴露 PyMuPDF fast fallback 可卡住；refresh 不能先刪 images，也不能用 0 figures 覆蓋舊 manifest。全量更新應以 audit gate 驗收，而不是盲目重刷。 |
