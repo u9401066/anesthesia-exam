@@ -1,4 +1,3 @@
-````skill
 ---
 name: image-question-generator
 description: 圖片題生成器，從教材擷取圖片並生成相關題目。Triggers: 圖片題, 圖表題, 影像題, image question, 看圖辨識, 圖形題, 心電圖題, X光題.
@@ -9,9 +8,9 @@ compatibility:
   - claude-code
 allowed-tools:
   - image_extract
-  - source_lookup
-  - source_cite
-  - exam_save_question
+  - asset-aware__get_section_content
+  - asset-aware__search_source_location
+  - exam-generator__exam_save_question
 ---
 
 # 圖片題生成器 (Image Question Generator)
@@ -222,4 +221,3 @@ D. 竇性心搏過速 (Sinus Tachycardia)
 | Diagram | 流程/機制圖 | 概念理解 |
 | Equipment | 設備照片 | 操作/識別 |
 
-````

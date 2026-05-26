@@ -1,4 +1,3 @@
-````skill
 ---
 name: exam-assembler
 description: 試卷組裝器，將題目組合成完整試卷。Triggers: 組卷, 組裝試卷, assemble, 建立試卷, 試卷組合, 產生試卷.
@@ -279,4 +278,3 @@ exam_config = {
 }
 ```
 
-````

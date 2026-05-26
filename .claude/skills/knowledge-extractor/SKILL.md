@@ -1,4 +1,3 @@
-````skill
 ---
 name: knowledge-extractor
 description: 從教材中抽取概念、實體、關係，建立知識圖譜。Triggers: 抽取概念, 知識抽取, 概念提取, extract concepts, 建立知識圖譜, knowledge graph.
@@ -10,7 +9,7 @@ compatibility:
 allowed-tools:
   - read_file
   - grep_search
-  - source_lookup
+  - asset-aware__get_section_content
 ---
 
 # 知識抽取器 (Knowledge Extractor)
@@ -159,4 +158,3 @@ for rel in relationships:
 └── 3-hop 關係: 89 組
 ```
 
-````

@@ -1,4 +1,3 @@
-````skill
 ---
 name: source-tracker
 description: 來源追蹤器，使用 MCP 工具驗證題目來源真實性。Triggers: 來源追蹤, 追蹤出處, source, 出處, citation, 引用, 來源驗證.
@@ -8,13 +7,13 @@ compatibility:
   - crush
   - claude-code
 allowed-tools:
-  - search_source_location
-  - get_section_content
-  - fetch_document_asset
-  - inspect_document_manifest
-  - exam_get_question
-  - exam_update_question
-  - exam_mark_validated
+  - asset-aware__search_source_location
+  - asset-aware__get_section_content
+  - asset-aware__fetch_document_asset
+  - asset-aware__inspect_document_manifest
+  - exam-generator__exam_get_question
+  - exam-generator__exam_update_question
+  - exam-generator__exam_mark_validated
 ---
 
 # 來源追蹤器 (Source Tracker)
@@ -42,7 +41,7 @@ allowed-tools:
 
 ```python
 # 取得題目詳情
-question = exam_get_question(question_id="abc123")
+question = exam-generator__exam_get_question(question_id="abc123")
 
 # 取得來源資訊
 source = question["source"]
@@ -58,7 +57,7 @@ source = question["source"]
 
 ```python
 # 使用 asset-aware-mcp 搜尋來源位置
-result = search_source_location(
+result = asset-aware__search_source_location(
     doc_id="miller9",
     query=source["original_text"][:50],  # 用原文片段搜尋
     block_types=["Text"]
@@ -76,7 +75,7 @@ if result["matches"]:
 
 ```python
 # 如果需要更詳細的比對
-content = get_section_content(
+content = asset-aware__get_section_content(
     doc_id="miller9",
     section_id="sec_chapter15"
 )
@@ -90,7 +89,7 @@ if source["original_text"] in content:
 
 ```python
 # 標記驗證結果
-exam_mark_validated(
+exam-generator__exam_mark_validated(
     question_id="abc123",
     passed=True,
     notes="來源已驗證：P.156 內容正確"
@@ -160,7 +159,7 @@ class Source:
 
 📋 驗證結果: ✅ VERIFIED
 
-已更新 exam_mark_validated(passed=True)
+已更新 exam-generator__exam_mark_validated(passed=True)
 ```
 
 ---
@@ -190,7 +189,7 @@ class Source:
 - [ ] 重新查詢正確來源
 - [ ] 標記為待人工審核
 
-已更新 exam_mark_validated(passed=False, notes="...")
+已更新 exam-generator__exam_mark_validated(passed=False, notes="...")
 ```
 
 ---
@@ -199,7 +198,7 @@ class Source:
 
 ```python
 # 批次驗證所有題目
-questions = exam_list_questions(limit=100)
+questions = exam-generator__exam_list_questions(limit=100)
 
 results = {
     "verified": [],
@@ -224,4 +223,3 @@ print(f"❌ 驗證失敗: {len(results['failed'])}")
 print(f"⚠️ 無來源: {len(results['no_source'])}")
 ```
 
-````

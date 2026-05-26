@@ -1,4 +1,3 @@
-````skill
 ---
 name: mcq-generator
 description: 選擇題生成器，使用 MCP 工具查詢知識庫並生成有真實來源的選擇題。Triggers: 選擇題, 單選題, 多選題, MCQ, multiple choice, 四選一, 五選一, 選項題.
@@ -8,11 +7,11 @@ compatibility:
   - crush
   - claude-code
 allowed-tools:
-  - consult_knowledge_graph
-  - search_source_location
-  - get_section_content
-  - exam_save_question
-  - exam_validate_question
+  - asset-aware__consult_knowledge_graph
+  - asset-aware__search_source_location
+  - asset-aware__get_section_content
+  - exam-generator__exam_save_question
+  - exam-generator__exam_validate_question
 ---
 
 # 選擇題生成器 (MCQ Generator)
@@ -46,13 +45,13 @@ Agent: 從記憶中編造題目 + 編造來源
 
 ```mermaid
 flowchart TD
-    A[用戶: 出題] --> B[consult_knowledge_graph]
+    A[用戶: 出題] --> B[asset-aware__consult_knowledge_graph]
     B --> C{有相關內容?}
-    C -->|是| D[search_source_location]
+    C -->|是| D[asset-aware__search_source_location]
     C -->|否| E[告知用戶需要先索引教材]
     D --> F[根據真實內容生成題目]
-    F --> G[exam_validate_question]
-    G -->|通過| H[exam_save_question + 真實來源]
+    F --> G[exam-generator__exam_validate_question]
+    G -->|通過| H[exam-generator__exam_save_question + 真實來源]
     G -->|失敗| F
 ```
 
@@ -64,7 +63,7 @@ flowchart TD
 
 ```python
 # 使用 asset-aware-mcp 的 RAG 查詢
-result = consult_knowledge_graph(
+result = asset-aware__consult_knowledge_graph(
     query="propofol pharmacology mechanism",
     mode="hybrid"
 )
@@ -75,7 +74,7 @@ result = consult_knowledge_graph(
 
 ```python
 # 取得精確的頁碼和位置
-source = search_source_location(
+source = asset-aware__search_source_location(
     doc_id="miller9",
     query="GABA-A receptor",
     block_types=["Text"]
@@ -107,14 +106,14 @@ question = {
 
 ```python
 # 驗證格式
-exam_validate_question(
+exam-generator__exam_validate_question(
     question_text=question["question_text"],
     options=question["options"],
     correct_answer=question["correct_answer"]
 )
 
 # 儲存（包含真實來源）
-exam_save_question(
+exam-generator__exam_save_question(
     question_text=question["question_text"],
     options=question["options"],
     correct_answer=question["correct_answer"],
@@ -164,9 +163,8 @@ D. 抑制多巴胺釋放
 
 ## ⚠️ 注意事項
 
-1. **永遠先查詢**：不要跳過 `consult_knowledge_graph`
-2. **確認來源存在**：用 `search_source_location` 驗證
+1. **永遠先查詢**：不要跳過 `asset-aware__consult_knowledge_graph`
+2. **確認來源存在**：用 `asset-aware__search_source_location` 驗證
 3. **如果查不到相關內容**：告知用戶需要先索引教材
 4. **不要編造**：如果知識庫沒有相關內容，就不要出那個主題的題目
 
-````

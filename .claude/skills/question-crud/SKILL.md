@@ -1,4 +1,3 @@
-````skill
 ---
 name: question-crud
 description: 題目 CRUD 操作 - 透過 MCP 工具管理考題生命週期。Triggers: 新增題目, 修改題目, 刪除題目, 查詢題目, 題目CRUD, 編輯題目, 更新題目, 還原題目, 審計日誌.
@@ -8,18 +7,18 @@ compatibility:
   - crush
   - claude-code
 allowed-tools:
-  - exam_save_question
-  - exam_list_questions
-  - exam_get_question
-  - exam_update_question
-  - exam_delete_question
-  - exam_restore_question
-  - exam_validate_question
-  - exam_mark_validated
-  - exam_get_audit_log
-  - exam_search
-  - exam_create_exam
-  - exam_get_stats
+  - exam-generator__exam_save_question
+  - exam-generator__exam_list_questions
+  - exam-generator__exam_get_question
+  - exam-generator__exam_update_question
+  - exam-generator__exam_delete_question
+  - exam-generator__exam_restore_question
+  - exam-generator__exam_validate_question
+  - exam-generator__exam_mark_validated
+  - exam-generator__exam_get_audit_log
+  - exam-generator__exam_search
+  - exam-generator__exam_create_exam
+  - exam-generator__exam_get_stats
 ---
 
 # Question CRUD Skill
@@ -32,7 +31,7 @@ allowed-tools:
 
 - `source_doc`、`source_page`、`source_lines`、`source_text` 必須來自 **MCP 查詢結果**
 - 不可憑記憶或 AI 幻覺填寫來源
-- 正確流程：`consult_knowledge_graph` → `search_source_location` → `exam_save_question`
+- 正確流程：`asset-aware__consult_knowledge_graph` → `asset-aware__search_source_location` → `exam-generator__exam_save_question`
 
 詳見：[mcq-generator Skill](../mcq-generator/SKILL.md)
 
@@ -43,7 +42,7 @@ allowed-tools:
 ### 📝 建立題目
 
 ```
-exam_save_question
+exam-generator__exam_save_question
 ```
 
 | 參數 | 類型 | 必填 | 說明 |
@@ -81,14 +80,14 @@ exam_save_question
   "difficulty": "medium",
   "topics": ["藥理學", "靜脈麻醉藥", "Propofol"],
   "skill_used": "mcq-generator",
-  "reasoning": "根據 search_source_location 返回的 P.125 內容..."
+  "reasoning": "根據 asset-aware__search_source_location 返回的 P.125 內容..."
 }
 ```
 
 ### 📋 列出題目
 
 ```
-exam_list_questions
+exam-generator__exam_list_questions
 ```
 
 | 參數 | 類型 | 說明 |
@@ -100,7 +99,7 @@ exam_list_questions
 ### 🔍 搜尋題目
 
 ```
-exam_search
+exam-generator__exam_search
 ```
 
 | 參數 | 類型 | 必填 | 說明 |
@@ -111,7 +110,7 @@ exam_search
 ### 📖 取得題目詳情
 
 ```
-exam_get_question
+exam-generator__exam_get_question
 ```
 
 | 參數 | 類型 | 必填 | 說明 |
@@ -126,7 +125,7 @@ exam_get_question
 ### ✏️ 更新題目
 
 ```
-exam_update_question
+exam-generator__exam_update_question
 ```
 
 | 參數 | 類型 | 必填 | 說明 |
@@ -144,7 +143,7 @@ exam_update_question
 ### 🗑️ 刪除題目
 
 ```
-exam_delete_question
+exam-generator__exam_delete_question
 ```
 
 | 參數 | 類型 | 必填 | 說明 |
@@ -158,7 +157,7 @@ exam_delete_question
 ### ♻️ 還原題目
 
 ```
-exam_restore_question
+exam-generator__exam_restore_question
 ```
 
 | 參數 | 類型 | 必填 | 說明 |
@@ -168,7 +167,7 @@ exam_restore_question
 ### ✅ 驗證題目格式
 
 ```
-exam_validate_question
+exam-generator__exam_validate_question
 ```
 
 | 參數 | 類型 | 必填 | 說明 |
@@ -181,7 +180,7 @@ exam_validate_question
 ### ✅ 標記驗證結果
 
 ```
-exam_mark_validated
+exam-generator__exam_mark_validated
 ```
 
 | 參數 | 類型 | 必填 | 說明 |
@@ -193,7 +192,7 @@ exam_mark_validated
 ### 📜 取得審計日誌
 
 ```
-exam_get_audit_log
+exam-generator__exam_get_audit_log
 ```
 
 | 參數 | 類型 | 必填 | 說明 |
@@ -204,7 +203,7 @@ exam_get_audit_log
 ### 📊 取得統計
 
 ```
-exam_get_stats
+exam-generator__exam_get_stats
 ```
 
 無需參數，回傳題庫統計資訊。
@@ -217,22 +216,22 @@ exam_get_stats
 
 ```mermaid
 flowchart TD
-    A[用戶請求出題] --> B[consult_knowledge_graph 查詢知識]
-    B --> C[search_source_location 取得精確來源]
+    A[用戶請求出題] --> B[asset-aware__consult_knowledge_graph 查詢知識]
+    B --> C[asset-aware__search_source_location 取得精確來源]
     C --> D[根據真實內容生成題目]
-    D --> E[exam_validate_question 驗證格式]
-    E -->|通過| F[exam_save_question 儲存]
-    F --> G[exam_mark_validated 標記已驗證]
+    D --> E[exam-generator__exam_validate_question 驗證格式]
+    E -->|通過| F[exam-generator__exam_save_question 儲存]
+    F --> G[exam-generator__exam_mark_validated 標記已驗證]
 ```
 
 ### 修改題目流程
 
 ```mermaid
 flowchart TD
-    A[接收修改請求] --> B[exam_get_question 取得現有題目]
+    A[接收修改請求] --> B[exam-generator__exam_get_question 取得現有題目]
     B --> C[修改內容]
-    C --> D[exam_validate_question 驗證]
-    D -->|通過| E[exam_update_question 更新]
+    C --> D[exam-generator__exam_validate_question 驗證]
+    D -->|通過| E[exam-generator__exam_update_question 更新]
     E --> F[記錄修改原因]
 ```
 
@@ -262,27 +261,27 @@ flowchart TD
 用戶: 幫我出一題關於 Propofol 的選擇題
 
 Agent 操作:
-1. consult_knowledge_graph("propofol pharmacology")
+1. asset-aware__consult_knowledge_graph("propofol pharmacology")
    → 取得知識內容
    
-2. search_source_location(doc_id="textbook", query="propofol GABA")
+2. asset-aware__search_source_location(doc_id="textbook", query="propofol GABA")
    → 取得 page=125, lines="12-18", original_text="..."
    
 3. 根據真實內容生成題目
    
-4. exam_validate_question 驗證格式
+4. exam-generator__exam_validate_question 驗證格式
    
-5. exam_save_question {
+5. exam-generator__exam_save_question {
      "question_text": "...",
      "source_doc": "textbook",
      "source_page": 125,
      "source_lines": "12-18",
      "source_text": "...(從 MCP 取得的原文)",
      "skill_used": "mcq-generator",
-     "reasoning": "根據 search_source_location 返回的內容..."
+     "reasoning": "根據 asset-aware__search_source_location 返回的內容..."
    }
    
-6. exam_mark_validated 標記已驗證
+6. exam-generator__exam_mark_validated 標記已驗證
 ```
 
 ### 範例 2: 修改已存在的題目
@@ -291,8 +290,8 @@ Agent 操作:
 用戶: 把題目 abc123 的答案改成 C
 
 Agent 操作:
-1. exam_get_question 取得題目詳情
-2. exam_update_question {
+1. exam-generator__exam_get_question 取得題目詳情
+2. exam-generator__exam_update_question {
      "question_id": "abc123",
      "correct_answer": "C",
      "actor_name": "user-request",
@@ -306,8 +305,7 @@ Agent 操作:
 用戶: 這題是怎麼出出來的？
 
 Agent 操作:
-1. exam_get_question 取得題目
+1. exam-generator__exam_get_question 取得題目
 2. 回傳 generation_context 和 audit_log
 ```
 
-````

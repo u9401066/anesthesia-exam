@@ -1,4 +1,3 @@
-````skill
 ---
 name: knowledge-indexer
 description: PDF 教材解析與 RAG 索引建立，保留頁碼和行號 metadata。Triggers: 索引教材, 解析 PDF, 建立索引, index, parse pdf, 上傳教材, 導入教材.
@@ -12,7 +11,7 @@ allowed-tools:
   - write_file
   - list_dir
   - pdf_parse
-  - source_lookup
+  - asset-aware__get_section_content
 ---
 
 # 知識索引器 (Knowledge Indexer)
@@ -123,4 +122,3 @@ save_metadata_map(document_id, chunks)
 索引 ID: idx_miller_9th_20260203
 ```
 
-````

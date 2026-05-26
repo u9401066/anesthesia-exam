@@ -1,4 +1,3 @@
-````skill
 ---
 name: export-formatter
 description: 匯出格式器，將試卷匯出為多種格式。Triggers: 匯出, export, 下載, PDF, Word, 列印, 輸出格式.
@@ -279,4 +278,3 @@ def export_to_moodle(exam):
 📁 已儲存至: data/exams/exam_20260203_001.pdf
 ```
 
-````

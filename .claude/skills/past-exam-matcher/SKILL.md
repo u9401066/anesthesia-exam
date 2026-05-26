@@ -1,4 +1,3 @@
-````skill
 ---
 name: past-exam-matcher
 description: 考古題比對器，比對新題目與歷屆考題的相似度。Triggers: 考古題比對, 比對考古題, 歷屆比對, match past, 類似考古題, 考過沒.
@@ -9,7 +8,7 @@ compatibility:
   - claude-code
 allowed-tools:
   - semantic_search
-  - list_past_exams
+  - exam-generator__exam_get_past_exam
   - get_past_exam_question
 ---
 
@@ -252,4 +251,3 @@ def batch_match(questions, threshold=0.85):
 ✅ 通過: 45 題 (無高度相似)
 ```
 
-````

@@ -1,4 +1,3 @@
-````skill
 ---
 name: essay-generator
 description: 問答題/申論題生成器，支援簡答、解釋、比較、分析等題型。Triggers: 問答題, 申論題, 簡答題, essay, short answer, 解釋題, 比較題, 分析題.
@@ -8,9 +7,9 @@ compatibility:
   - crush
   - claude-code
 allowed-tools:
-  - source_lookup
-  - source_cite
-  - exam_save_question
+  - asset-aware__get_section_content
+  - asset-aware__search_source_location
+  - exam-generator__exam_save_question
 ---
 
 # 問答題生成器 (Essay Generator)
@@ -49,7 +48,7 @@ essay_types = {
 ### Step 2: 查詢相關內容
 
 ```python
-contexts = source_lookup(
+contexts = asset-aware__get_section_content(
     query=topic,
     scope=scope,
     top_k=10  # 問答題需要更多上下文
@@ -194,4 +193,3 @@ prompt = f"""
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 ```
 
-````

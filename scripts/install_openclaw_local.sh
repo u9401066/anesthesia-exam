@@ -7,6 +7,7 @@ OPENCLAW_HOME="$VENDOR_DIR/openclaw-runtime"
 OPENCLAW_STATE_DIR="$VENDOR_DIR/openclaw-state"
 
 NODE_VERSION="${OPENCLAW_NODE_VERSION:-v24.15.0}"
+OPENCLAW_VERSION="${OPENCLAW_VERSION:-2026.5.22}"
 NODE_DIST_BASENAME=""
 
 case "$(uname -s)-$(uname -m)" in
@@ -76,9 +77,9 @@ JSON
 fi
 
 echo "使用本地 Node: $("$NODE_BIN" -v)"
-echo "安裝 / 更新 repo 內 OpenClaw..."
+echo "安裝 / 更新 repo 內 OpenClaw: $OPENCLAW_VERSION"
 export PATH="$NODE_INSTALL_DIR/bin:$PATH"
-"$NPM_BIN" install --prefix "$OPENCLAW_HOME" openclaw@latest
+"$NPM_BIN" install --prefix "$OPENCLAW_HOME" "openclaw@$OPENCLAW_VERSION"
 
 if [[ ! -x "$OPENCLAW_BIN" ]]; then
     echo "OpenClaw 安裝完成但找不到執行檔：$OPENCLAW_BIN" >&2

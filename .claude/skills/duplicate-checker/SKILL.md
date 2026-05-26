@@ -1,4 +1,3 @@
-````skill
 ---
 name: duplicate-checker
 description: 重複題目檢查器，檢測語意重複和過度相似的題目。Triggers: 查重, 重複檢查, duplicate, 相似題, 題目查重, 檢查重複.
@@ -175,4 +174,3 @@ def batch_duplicate_check(questions):
 └── 建議: 保留但調整方向
 ```
 
-````

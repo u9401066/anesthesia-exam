@@ -1,4 +1,3 @@
-````skill
 ---
 name: difficulty-classifier
 description: 難度分類器，基於 Ragas 標準評估題目難度。Triggers: 難度分類, 難度評估, difficulty, 評估難度, 調整難度.
@@ -199,4 +198,3 @@ def suggest_difficulty_change(question, target_difficulty):
         ]
 ```
 
-````

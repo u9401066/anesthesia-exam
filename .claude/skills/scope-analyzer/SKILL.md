@@ -1,4 +1,3 @@
-````skill
 ---
 name: scope-analyzer
 description: 分析出題範圍，識別章節、主題、知識點分佈。Triggers: 分析範圍, 範圍分析, scope, 章節分析, 主題分析, 知識點, analyze scope, 出題範圍.
@@ -10,7 +9,7 @@ compatibility:
 allowed-tools:
   - read_file
   - grep_search
-  - source_lookup
+  - asset-aware__get_section_content
 ---
 
 # 範圍分析器 (Scope Analyzer)
@@ -128,4 +127,3 @@ for topic in structure.topics:
 └── 臨床應用場景
 ```
 
-````

@@ -1,4 +1,3 @@
-````skill
 ---
 name: past-exam-analyzer
 description: 考古題分析器，分析歷屆考題的出題模式和重點分布。Triggers: 考古題分析, 歷屆考題, past exam, 考古題, 歷屆, 出題模式, 考題分析.
@@ -8,9 +7,9 @@ compatibility:
   - crush
   - claude-code
 allowed-tools:
-  - list_past_exams
-  - get_past_exam
-  - analyze_distribution
+  - exam-generator__exam_get_past_exam
+  - exam-generator__exam_get_past_exam
+  - exam-generator__exam_build_past_exam_blueprint
 ---
 
 # 考古題分析器 (Past Exam Analyzer)
@@ -40,7 +39,7 @@ allowed-tools:
 ```python
 def load_past_exams(years=5):
     """載入近 N 年的考古題"""
-    exams = list_past_exams(
+    exams = exam-generator__exam_get_past_exam(
         exam_type="board",  # 專科考試
         years=years
     )
@@ -243,4 +242,3 @@ def analyze_trends(exams):
 └── 圖表判讀 (藥物濃度曲線)
 ```
 
-````

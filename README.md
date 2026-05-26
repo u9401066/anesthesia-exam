@@ -79,6 +79,9 @@ uv run python main.py
 # 安裝 / 啟用 / 啟動 systemd service
 ./scripts/install_systemd_service.sh
 
+# unit template 或環境變數更新後，也用同一支腳本刷新並重啟服務
+./scripts/install_systemd_service.sh
+
 # 查看狀態
 systemctl status anesthesia-exam-web.service --no-pager
 
@@ -91,6 +94,14 @@ systemctl restart anesthesia-exam-web.service
 - `deploy/systemd/anesthesia-exam-web.service`
 - `scripts/install_systemd_service.sh`
 - `scripts/run_web.sh`
+
+systemd unit 預設使用 `EXAM_AGENT_PROVIDER=openclaw`、`EXAM_OPENCLAW_MODE=agent` 與 repo-local OpenClaw 設定。第一次部署或重建 OpenClaw 設定後，先執行：
+
+```bash
+./scripts/install_openclaw_local.sh
+./scripts/configure_openclaw_repo_agent.sh
+./scripts/install_systemd_service.sh
+```
 
 若部署路徑不是目前 repo 位置，請先調整 unit 內的 `WorkingDirectory`、`ExecStart` 與 `User`。
 
@@ -110,10 +121,11 @@ git submodule update --init --recursive
 
 Streamlit 現在是 UI 包裝層，底層 Agent 可切換：
 
-- `crush`（預設）
+- `crush`
 - `opencode`（CLI 模式）
 - `copilot-sdk`（HTTP API 模式）
 - `codex`（OpenAI API 模式，適合聊天頁 / 詳解生成 / 出題工作台）
+- `openclaw`（repo-local CLI + MCP agent 模式；systemd 預設）
 
 透過環境變數設定：
 

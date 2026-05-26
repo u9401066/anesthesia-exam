@@ -1,4 +1,3 @@
-````skill
 ---
 name: question-validator
 description: 題目驗證器，檢查題目品質、正確性、來源依據。Triggers: 驗證題目, 檢查題目, validate, 品質檢查, QA, 審核題目, check question.
@@ -8,9 +7,9 @@ compatibility:
   - crush
   - claude-code
 allowed-tools:
-  - source_lookup
-  - source_verify
-  - get_question
+  - asset-aware__get_section_content
+  - asset-aware__verify_citation_ref
+  - exam-generator__exam_get_question
 ---
 
 # 題目驗證器 (Question Validator)
@@ -36,14 +35,14 @@ allowed-tools:
 ### Step 1: 載入題目
 
 ```python
-question = get_question(question_id)
+question = exam-generator__exam_get_question(question_id)
 ```
 
 ### Step 2: 事實驗證
 
 ```python
 # 對照原始來源
-source_text = source_lookup(
+source_text = asset-aware__get_section_content(
     document=question.source.document,
     page=question.source.page,
     lines=question.source.lines
@@ -94,7 +93,7 @@ ambiguity = check_ambiguity(question.stem)
 
 ```python
 # 確認來源存在且可追溯
-source_valid = source_verify(
+source_valid = asset-aware__verify_citation_ref(
     document=question.source.document,
     page=question.source.page,
     text=question.source.original_text
@@ -184,4 +183,3 @@ source_valid = source_verify(
 4. **來源無法驗證** - 不可追溯
 5. **題目有歧義** - 可能有多種解讀
 
-````

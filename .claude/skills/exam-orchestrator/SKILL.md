@@ -1,4 +1,3 @@
-````skill
 ---
 name: exam-orchestrator
 description: 考卷生成主編排器，解析考試配置並調度所有子 Skills 完成完整出題流程。Triggers: 生成考卷, 出考題, 模擬考, 產生試題, generate exam, create test, 出題, 考試, 測驗, quiz, exam, 製作考卷.
@@ -24,10 +23,10 @@ allowed-tools:
   - write_file
   - list_dir
   - grep_search
-  - exam_save_question
-  - exam_list_questions
-  - exam_create_exam
-  - exam_get_stats
+  - exam-generator__exam_save_question
+  - exam-generator__exam_list_questions
+  - exam-generator__exam_create_exam
+  - exam-generator__exam_get_stats
 ---
 
 # 考卷生成主編排器 (Exam Orchestrator)
@@ -289,12 +288,12 @@ Orchestrator 行為:
 
 | Tool | 用途 |
 | ---- | ---- |
-| `exam_save_question` | 儲存生成的題目 |
-| `exam_list_questions` | 查詢已有題目 |
-| `exam_create_exam` | 創建考卷記錄 |
-| `exam_get_stats` | 獲取統計資訊 |
-| `source_lookup` | 查詢教材來源 |
-| `source_cite` | 格式化來源引用 |
+| `exam-generator__exam_save_question` | 儲存生成的題目 |
+| `exam-generator__exam_list_questions` | 查詢已有題目 |
+| `exam-generator__exam_create_exam` | 創建考卷記錄 |
+| `exam-generator__exam_get_stats` | 獲取統計資訊 |
+| `asset-aware__get_section_content` | 查詢教材來源 |
+| `asset-aware__search_source_location` | 格式化來源引用 |
 
 ---
 
@@ -335,4 +334,3 @@ exam-orchestrator (編排器)
 4. **考古題去重**：避免與考古題過度相似
 5. **批次處理**：大量題目分批生成避免超時
 
-````

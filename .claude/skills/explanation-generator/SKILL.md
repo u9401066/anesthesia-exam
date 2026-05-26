@@ -1,4 +1,3 @@
-````skill
 ---
 name: explanation-generator
 description: 詳解生成器，為題目生成詳細解答說明。Triggers: 詳解, 解答, explanation, 生成解答, 解析, 答案說明, 為什麼.
@@ -8,9 +7,9 @@ compatibility:
   - crush
   - claude-code
 allowed-tools:
-  - source_lookup
-  - get_question
-  - update_question
+  - asset-aware__get_section_content
+  - exam-generator__exam_get_question
+  - exam-generator__exam_update_question
 ---
 
 # 詳解生成器 (Explanation Generator)
@@ -36,10 +35,10 @@ allowed-tools:
 ### Step 1: 載入題目與來源
 
 ```python
-question = get_question(question_id)
+question = exam-generator__exam_get_question(question_id)
 
 # 取得原始來源內容
-source_content = source_lookup(
+source_content = asset-aware__get_section_content(
     document=question.source.document,
     page=question.source.page,
     context_lines=20  # 擴展上下文
@@ -209,4 +208,3 @@ def batch_generate_explanations(questions):
     }
 ```
 
-````

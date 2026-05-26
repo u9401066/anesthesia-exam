@@ -1,4 +1,3 @@
-````skill
 ---
 name: question-set-generator
 description: 題組題生成器，建立共用情境的關聯題目組。Triggers: 題組, 題組題, question set, 情境題, 病例題, 連續題.
@@ -8,9 +7,9 @@ compatibility:
   - crush
   - claude-code
 allowed-tools:
-  - source_lookup
-  - source_cite
-  - exam_save_question
+  - asset-aware__get_section_content
+  - asset-aware__search_source_location
+  - exam-generator__exam_save_question
 ---
 
 # 題組題生成器 (Question Set Generator)
@@ -197,4 +196,3 @@ D. 停止手術
    Easy      Medium      Medium       Hard
 ```
 
-````

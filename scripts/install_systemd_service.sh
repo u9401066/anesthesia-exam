@@ -81,5 +81,6 @@ if command -v systemd-analyze >/dev/null 2>&1; then
 fi
 
 "${SYSTEMCTL[@]}" daemon-reload
-"${SYSTEMCTL[@]}" enable --now "$SERVICE_NAME"
+"${SYSTEMCTL[@]}" enable "$SERVICE_NAME"
+"${SYSTEMCTL[@]}" restart "$SERVICE_NAME"
 "${SYSTEMCTL[@]}" status "$SERVICE_NAME" --no-pager
