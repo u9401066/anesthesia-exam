@@ -10,6 +10,7 @@ from typing import Protocol
 
 from src.application.services.exam_tool_application_service import ExamToolApplicationService
 from src.application.services.heartbeat_service import CoverageGap, HeartbeatService
+from src.application.services.openclaw_session_keys import build_openclaw_session_key
 from src.domain.entities.scope_request import ScopeRequestStatus
 from src.infrastructure.agent.provider import extract_last_json_object
 from src.infrastructure.logging import get_logger
@@ -28,7 +29,7 @@ class AgentProviderLike(Protocol):
 
     name: str
 
-    def run(self, prompt: str) -> str: ...
+    def run(self, prompt: str, session_key: str | None = None) -> str: ...
 
 
 class QuestionToolLike(Protocol):
@@ -139,7 +140,13 @@ class ScopeRequestDispatchService:
         )
         return "\n".join(parts)
 
-    def dispatch(self, request_id: str, provider: AgentProviderLike) -> ScopeRequestDispatchResult:
+    def dispatch(
+        self,
+        request_id: str,
+        provider: AgentProviderLike,
+        *,
+        session_key: str | None = None,
+    ) -> ScopeRequestDispatchResult:
         request = self.scope_repo.get_by_id(request_id)
         if request is None:
             raise ValueError(f"找不到出題需求：{request_id}")
@@ -150,10 +157,11 @@ class ScopeRequestDispatchService:
 
         previous_status = request.status
         prompt = self.build_dispatch_prompt(request_id)
+        resolved_session_key = session_key or build_openclaw_session_key("scope", request_id)
         self.scope_repo.update_status(request.id, ScopeRequestStatus.IN_PROGRESS)
 
         try:
-            raw_response = provider.run(prompt).strip()
+            raw_response = provider.run(prompt, session_key=resolved_session_key).strip()
             payload = self._extract_payload(raw_response)
             question_ids = self._extract_question_ids(payload)
             if not question_ids:

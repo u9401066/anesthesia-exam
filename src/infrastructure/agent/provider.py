@@ -17,13 +17,13 @@ import shutil
 import subprocess
 import threading
 import time
-import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator, Optional, Protocol
 from urllib import request
 from urllib.error import HTTPError, URLError
 
+from src.application.services.openclaw_session_keys import build_openclaw_session_key
 from src.infrastructure.logging import get_logger
 
 logger = get_logger(__name__)
@@ -198,6 +198,12 @@ def resolve_openclaw_default_model(config: dict) -> str | None:
 
 def extract_openclaw_text(payload: dict) -> str:
     """Extract model text from an OpenClaw JSON response."""
+    nested_result = payload.get("result")
+    if isinstance(nested_result, dict):
+        nested_text = extract_openclaw_text(nested_result)
+        if nested_text:
+            return nested_text
+
     meta = payload.get("meta") or {}
     for key in ("finalAssistantVisibleText", "finalAssistantRawText"):
         final_text = meta.get(key)
@@ -343,9 +349,9 @@ class IAgentProvider(Protocol):
 
     def is_available(self) -> tuple[bool, str]: ...
 
-    def run(self, prompt: str) -> str: ...
+    def run(self, prompt: str, session_key: Optional[str] = None) -> str: ...
 
-    def stream(self, prompt: str) -> Iterator[str]: ...
+    def stream(self, prompt: str, session_key: Optional[str] = None) -> Iterator[str]: ...
 
 
 @dataclass
@@ -527,7 +533,8 @@ class CrushAgentProvider:
         except Exception as e:
             return False, f"Crush 檢查失敗：{e}"
 
-    def run(self, prompt: str) -> str:
+    def run(self, prompt: str, session_key: Optional[str] = None) -> str:
+        _ = session_key
         log = logger.bind(provider="crush", model=self.config.model)
         log.info("agent_run_start", prompt_len=len(prompt))
         t0 = time.monotonic()
@@ -547,7 +554,8 @@ class CrushAgentProvider:
         log.info("agent_run_done", duration_ms=elapsed_ms, output_len=len(result.stdout))
         return result.stdout.strip()
 
-    def stream(self, prompt: str) -> Iterator[str]:
+    def stream(self, prompt: str, session_key: Optional[str] = None) -> Iterator[str]:
+        _ = session_key
         log = logger.bind(provider="crush", model=self.config.model)
         log.info("agent_stream_start", prompt_len=len(prompt))
         t0 = time.monotonic()
@@ -623,7 +631,8 @@ class OpenCodeAgentProvider:
         except Exception as e:
             return False, f"OpenCode 檢查失敗：{e}"
 
-    def run(self, prompt: str) -> str:
+    def run(self, prompt: str, session_key: Optional[str] = None) -> str:
+        _ = session_key
         log = logger.bind(provider="opencode", model=self.config.opencode_model)
         log.info("agent_run_start", prompt_len=len(prompt))
         t0 = time.monotonic()
@@ -643,7 +652,8 @@ class OpenCodeAgentProvider:
         log.info("agent_run_done", duration_ms=elapsed_ms, output_len=len(result.stdout))
         return result.stdout.strip()
 
-    def stream(self, prompt: str) -> Iterator[str]:
+    def stream(self, prompt: str, session_key: Optional[str] = None) -> Iterator[str]:
+        _ = session_key
         log = logger.bind(provider="opencode", model=self.config.opencode_model)
         log.info("agent_stream_start", prompt_len=len(prompt))
         t0 = time.monotonic()
@@ -731,10 +741,12 @@ class CopilotSdkAgentProvider:
         except json.JSONDecodeError:
             return raw
 
-    def run(self, prompt: str) -> str:
+    def run(self, prompt: str, session_key: Optional[str] = None) -> str:
+        _ = session_key
         return self._call_api(prompt)
 
-    def stream(self, prompt: str) -> Iterator[str]:
+    def stream(self, prompt: str, session_key: Optional[str] = None) -> Iterator[str]:
+        _ = session_key
         yield self._call_api(prompt)
 
 
@@ -876,7 +888,8 @@ class CodexAgentProvider:
         except Exception as e:  # noqa: BLE001
             return False, f"Codex 檢查失敗：{e}"
 
-    def run(self, prompt: str) -> str:
+    def run(self, prompt: str, session_key: Optional[str] = None) -> str:
+        _ = session_key
         log = logger.bind(provider="codex", model=self._get_model())
         log.info("agent_run_start", prompt_len=len(prompt))
         t0 = time.monotonic()
@@ -898,7 +911,8 @@ class CodexAgentProvider:
         log.error("agent_run_error", duration_ms=elapsed_ms, error=str(last_error))
         raise RuntimeError(f"Codex 執行失敗：{last_error}")
 
-    def stream(self, prompt: str) -> Iterator[str]:
+    def stream(self, prompt: str, session_key: Optional[str] = None) -> Iterator[str]:
+        _ = session_key
         log = logger.bind(provider="codex", model=self._get_model())
         log.info("agent_stream_start", prompt_len=len(prompt))
         t0 = time.monotonic()
@@ -965,24 +979,26 @@ class OpenClawAgentProvider:
             "--json",
         ]
 
-    def _build_agent_command(self, prompt: str) -> list[str]:
+    def _default_session_key(self) -> str:
+        return build_openclaw_session_key("site-default", agent_id=self._get_agent_id())
+
+    def _build_agent_command(self, prompt: str, session_key: Optional[str] = None) -> list[str]:
         return [
             self._get_executable(),
             "agent",
-            "--local",
             "--agent",
             self._get_agent_id(),
-            "--session-id",
-            uuid.uuid4().hex,
+            "--session-key",
+            (session_key or self._default_session_key()),
             "--json",
             "--message",
             prompt,
         ]
 
-    def _build_command(self, prompt: str) -> list[str]:
+    def _build_command(self, prompt: str, session_key: Optional[str] = None) -> list[str]:
         if self._get_mode() == "infer":
             return self._build_infer_command(prompt)
-        return self._build_agent_command(prompt)
+        return self._build_agent_command(prompt, session_key=session_key)
 
     def _run_cli(self, args: list[str], *, timeout: int) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
@@ -1033,11 +1049,12 @@ class OpenClawAgentProvider:
             return True, f"可用, mode=agent, agent={self._get_agent_id()}, model={current_model or self._get_model()}"
         return True, f"可用, mode=infer, model={current_model or self._get_model()}"
 
-    def run(self, prompt: str) -> str:
-        log = logger.bind(provider="openclaw", model=self._get_model())
+    def run(self, prompt: str, session_key: Optional[str] = None) -> str:
+        resolved_session_key = session_key or self._default_session_key()
+        log = logger.bind(provider="openclaw", model=self._get_model(), session_key=resolved_session_key)
         log.info("agent_run_start", prompt_len=len(prompt))
         t0 = time.monotonic()
-        result = self._run_cli(self._build_command(prompt), timeout=self.config.timeout)
+        result = self._run_cli(self._build_command(prompt, session_key=resolved_session_key), timeout=self.config.timeout)
         elapsed_ms = int((time.monotonic() - t0) * 1000)
         combined_output = "\n".join(part for part in [result.stdout, result.stderr] if part).strip()
 
@@ -1060,8 +1077,8 @@ class OpenClawAgentProvider:
         log.error("agent_run_error", duration_ms=elapsed_ms, error="OpenClaw 回傳空內容")
         raise RuntimeError("OpenClaw 回傳空內容")
 
-    def stream(self, prompt: str) -> Iterator[str]:
-        yield self.run(prompt)
+    def stream(self, prompt: str, session_key: Optional[str] = None) -> Iterator[str]:
+        yield self.run(prompt, session_key=session_key)
 
 
 def create_agent_provider(config: AgentProviderConfig) -> IAgentProvider:

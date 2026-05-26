@@ -14,6 +14,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
+from src.application.services.openclaw_session_keys import build_openclaw_session_key
+from src.infrastructure.agent.provider import AgentProviderConfig, create_agent_provider
 from src.infrastructure.logging import get_logger
 
 PROJECT_DIR = Path(__file__).resolve().parents[3]
@@ -33,6 +35,7 @@ class TelegramAdminConfig:
     api_base_url: str = "https://api.telegram.org"
     timeout_seconds: int = 10
     poll_timeout_seconds: int = 30
+    allow_openclaw_ask: bool = False
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> "TelegramAdminConfig":
@@ -48,6 +51,7 @@ class TelegramAdminConfig:
         api_base_url = str(source.get("TELEGRAM_API_BASE_URL") or cls.api_base_url).strip().rstrip("/")
         timeout_seconds = _positive_int(source.get("TELEGRAM_TIMEOUT_SECONDS"), 10)
         poll_timeout_seconds = _positive_int(source.get("TELEGRAM_POLL_TIMEOUT_SECONDS"), 30)
+        ask_enabled_raw = str(source.get("TELEGRAM_OPENCLAW_ASK_ENABLED") or "").strip().lower()
         return cls(
             enabled=enabled,
             bot_token=token,
@@ -55,6 +59,7 @@ class TelegramAdminConfig:
             api_base_url=api_base_url,
             timeout_seconds=timeout_seconds,
             poll_timeout_seconds=poll_timeout_seconds,
+            allow_openclaw_ask=ask_enabled_raw in {"1", "true", "yes", "on"},
         )
 
     @property
@@ -325,6 +330,7 @@ class TelegramAdminBot:
         self.config = config
         self.client = client
         self.status_service = status_service
+        self._current_chat_id: str | None = None
 
     @classmethod
     def from_env(cls) -> "TelegramAdminBot":
@@ -349,7 +355,12 @@ class TelegramAdminBot:
         text = str(message.get("text") or "").strip()
         if not text:
             return False
-        response = self._route(text)
+        previous_chat_id = self._current_chat_id
+        self._current_chat_id = str(chat_id)
+        try:
+            response = self._route(text)
+        finally:
+            self._current_chat_id = previous_chat_id
         self.client.send_message(str(chat_id), response)
         return True
 
@@ -376,6 +387,8 @@ class TelegramAdminBot:
 
     def _route(self, text: str) -> str:
         command = text.split()[0].split("@", 1)[0].lower()
+        if command == "/ask":
+            return self._ask_openclaw(text, chat_id=str(self._current_chat_id or "admin"))
         routes: dict[str, Callable[[], str]] = {
             "/status": self.status_service.build_status_text,
             "/jobs": self.status_service.build_jobs_text,
@@ -386,6 +399,29 @@ class TelegramAdminBot:
             "/start": self.status_service.build_help_text,
         }
         return routes.get(command, self.status_service.build_help_text)()
+
+    def _ask_openclaw(self, text: str, *, chat_id: str) -> str:
+        if not self.config.allow_openclaw_ask:
+            return "OpenClaw Telegram ask is disabled. Set TELEGRAM_OPENCLAW_ASK_ENABLED=true to enable read-only admin asks."
+        question = text.partition(" ")[2].strip()
+        if not question:
+            return "Usage: /ask <read-only admin question>"
+        prompt = "\n".join(
+            [
+                "你是 anesthesia-exam 網站的 OpenClaw 考題管理員。",
+                "這是 Telegram 管理員的 read-only 詢問；不得新增、修改、刪除題庫資料，不得執行 destructive command。",
+                "請根據你可見的網站、OpenClaw、MCP 與題庫管理上下文回答。",
+                "",
+                f"管理員問題: {question}",
+            ]
+        )
+        config = AgentProviderConfig.load(
+            project_dir=PROJECT_DIR,
+            crush_config_path=PROJECT_DIR / "crush.json",
+            provider_override="openclaw",
+        )
+        provider = create_agent_provider(config)
+        return provider.run(prompt, session_key=build_openclaw_session_key("telegram", chat_id))
 
 
 def format_status_snapshot(snapshot: SiteStatusSnapshot) -> str:

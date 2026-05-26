@@ -6,6 +6,10 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
+from src.application.services.openclaw_session_keys import (  # noqa: E402
+    build_openclaw_session_key,
+    normalize_openclaw_session_part,
+)
 from src.infrastructure.agent.provider import (  # noqa: E402
     AgentProviderConfig,
     OpenClawAgentProvider,
@@ -108,6 +112,21 @@ warning: cached state refreshed
     }
 
 
+def test_extract_openclaw_text_supports_gateway_result_payload() -> None:
+    from src.infrastructure.agent.provider import extract_openclaw_text
+
+    payload = {
+        "runId": "run-1",
+        "status": "ok",
+        "result": {
+            "payloads": [{"text": "OK", "mediaUrl": None}],
+            "meta": {"finalAssistantVisibleText": "OK"},
+        },
+    }
+
+    assert extract_openclaw_text(payload) == "OK"
+
+
 def test_agent_provider_config_loads_codex_settings_from_env(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setenv("EXAM_AGENT_PROVIDER", "codex")
     monkeypatch.setenv("EXAM_CODEX_MODEL", "gpt-5.3-codex")
@@ -201,3 +220,31 @@ def test_openclaw_infer_mode_does_not_require_repo_local_config(tmp_path: Path) 
 
     assert available is True
     assert "mode=infer" in reason
+
+
+def test_openclaw_agent_command_uses_stable_session_key_and_gateway_mode(tmp_path: Path) -> None:
+    provider = OpenClawAgentProvider(
+        AgentProviderConfig(
+            provider="openclaw",
+            working_dir=tmp_path,
+            timeout=30,
+            openclaw_executable="/tmp/openclaw",
+            openclaw_model="gb10/Qwen.gguf",
+            openclaw_mode="agent",
+            openclaw_agent_id="main",
+            openclaw_config_path=tmp_path / "openclaw.json",
+        )
+    )
+
+    command = provider._build_agent_command("hello", session_key="agent:main:web:user-1")
+
+    assert "--session-key" in command
+    assert "agent:main:web:user-1" in command
+    assert "--session-id" not in command
+    assert "--local" not in command
+
+
+def test_openclaw_session_key_helper_normalizes_parts_and_avoids_main_session() -> None:
+    assert normalize_openclaw_session_part(" question/abc 123 ") == "question-abc-123"
+    assert build_openclaw_session_key("job", "heartbeat 1") == "agent:main:job:heartbeat-1"
+    assert build_openclaw_session_key("web", "user") != "agent:main:main"

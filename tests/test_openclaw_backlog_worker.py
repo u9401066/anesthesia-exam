@@ -48,9 +48,11 @@ class FakeProvider:
     def __init__(self, response: str = '{"saved_count": 2, "question_ids": ["q1", "q2"]}'):
         self.response = response
         self.prompts = []
+        self.session_keys = []
 
-    def run(self, prompt: str) -> str:
+    def run(self, prompt: str, session_key: str | None = None) -> str:
         self.prompts.append(prompt)
+        self.session_keys.append(session_key)
         return self.response
 
 
@@ -58,8 +60,8 @@ class FakeDispatchService:
     def __init__(self):
         self.calls = []
 
-    def dispatch(self, request_id, provider):
-        self.calls.append((request_id, provider.name))
+    def dispatch(self, request_id, provider, session_key=None):
+        self.calls.append((request_id, provider.name, session_key))
         return type("DispatchResultStub", (), {"generated_count": 3, "summary": "ok"})()
 
 
@@ -94,7 +96,7 @@ def test_worker_dispatches_scope_request_job_and_marks_done(tmp_path: Path):
 
     assert result.processed_jobs == 1
     assert result.generated_questions == 3
-    assert dispatch.calls == [("scope_123", "openclaw")]
+    assert dispatch.calls == [("scope_123", "openclaw", "agent:main:scope:scope_123")]
     assert heartbeat.done_calls == [(str(job_path), 3)]
     assert heartbeat.error_calls == []
 
@@ -123,6 +125,7 @@ def test_worker_runs_prompt_job_without_scope_request(tmp_path: Path):
     assert result.processed_jobs == 1
     assert result.generated_questions == 2
     assert len(provider.prompts) == 1
+    assert provider.session_keys == ["agent:main:job:heartbeat_prompt"]
     assert "最後只輸出 JSON" in provider.prompts[0]
     assert "本輪只處理 1 題" in provider.prompts[0]
     assert "不要先輸出計畫" in provider.prompts[0]

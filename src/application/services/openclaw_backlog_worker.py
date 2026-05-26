@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from src.application.services.heartbeat_service import HeartbeatService
+from src.application.services.openclaw_session_keys import build_openclaw_session_key
 from src.application.services.scope_request_dispatch_service import ScopeRequestDispatchService
 from src.infrastructure.agent.provider import extract_last_json_object
 from src.infrastructure.logging import get_logger
@@ -20,7 +21,7 @@ class AgentProviderLike(Protocol):
 
     name: str
 
-    def run(self, prompt: str) -> str: ...
+    def run(self, prompt: str, session_key: str | None = None) -> str: ...
 
 
 @dataclass
@@ -120,13 +121,20 @@ class OpenClawBacklogWorker:
     def _process_job(self, job: dict[str, Any], provider: AgentProviderLike) -> int:
         request_id = str(job.get("source_request_id") or "").strip()
         if request_id:
-            dispatch_result = self.dispatch_service.dispatch(request_id, provider)
+            dispatch_result = self.dispatch_service.dispatch(
+                request_id,
+                provider,
+                session_key=build_openclaw_session_key("scope", request_id),
+            )
             generated = max(0, int(getattr(dispatch_result, "generated_count", 0) or 0))
             if generated <= 0:
                 raise ValueError("OpenClaw dispatch completed without saved_count > 0")
             return generated
 
-        raw_response = provider.run(self._build_job_prompt(job)).strip()
+        raw_response = provider.run(
+            self._build_job_prompt(job),
+            session_key=build_openclaw_session_key("job", str(job.get("job_id") or "unknown")),
+        ).strip()
         payload = extract_last_json_object(raw_response)
         if not isinstance(payload, dict):
             payload = self._extract_fenced_json(raw_response) or {}

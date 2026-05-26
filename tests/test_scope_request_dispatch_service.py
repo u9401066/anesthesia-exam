@@ -57,9 +57,11 @@ class _FakeProvider:
     def __init__(self, payload: dict):
         self.payload = payload
         self.prompts: list[str] = []
+        self.session_keys: list[str | None] = []
 
-    def run(self, prompt: str) -> str:
+    def run(self, prompt: str, session_key: str | None = None) -> str:
         self.prompts.append(prompt)
+        self.session_keys.append(session_key)
         return json.dumps(self.payload, ensure_ascii=False)
 
 
@@ -126,6 +128,7 @@ def test_dispatch_auto_persists_question_payload_when_agent_skips_save_ids() -> 
     assert result.question_ids == ["q-1"]
     assert request.fulfilled_count == 1
     assert request.status == ScopeRequestStatus.FULFILLED
+    assert provider.session_keys == ["agent:main:scope:req-1"]
     assert question_tool.saved_args[0]["actor_name"] == "openclaw"
     assert question_tool.saved_args[0]["source_doc"] == "doc_27___risk_of_anesthesia_6812de"
     assert "補存 1 題" in (request.admin_notes or "")

@@ -551,7 +551,12 @@ def parse_question_from_output(text: str) -> dict | None:
     return None
 
 
-def stream_agent_generate(prompt: str, provider, execution_ui: GenerationExecutionUi) -> tuple[str, list[dict]]:
+def stream_agent_generate(
+    prompt: str,
+    provider,
+    execution_ui: GenerationExecutionUi,
+    session_key: str | None = None,
+) -> tuple[str, list[dict]]:
     """Stream generation output into the grouped UI placeholders."""
     logger.info("generation_start", provider=getattr(provider, "name", "unknown"), prompt_len=len(prompt))
     started_at = time.monotonic()
@@ -561,7 +566,7 @@ def stream_agent_generate(prompt: str, provider, execution_ui: GenerationExecuti
     last_update_time = time.time()
 
     try:
-        for line in provider.stream(prompt):
+        for line in provider.stream(prompt, session_key=session_key):
             if not line:
                 continue
 

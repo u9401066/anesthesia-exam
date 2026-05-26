@@ -27,12 +27,14 @@ import random
 import shutil
 import subprocess
 import time
+import uuid
 from datetime import datetime
 from typing import Any, Optional, cast
 
 import streamlit as st
 
 from src.application.services.past_exam_explanation_service import get_past_exam_explanation_service
+from src.application.services.openclaw_session_keys import build_openclaw_session_key, normalize_openclaw_session_part
 from src.application.services.past_exam_figure_service import get_past_exam_figure_service
 from src.application.services.textbook_generation_service import get_textbook_generation_service
 from src.infrastructure import agent as agent_module
@@ -1607,6 +1609,7 @@ def ingest_pdf_via_agent(
     page_ranges_text: str,
     marker_max_pages_per_chunk: int,
     extract_figures: bool,
+    session_key: str | None = None,
 ) -> str:
     """透過 agent 觸發 asset-aware 的 ingest_documents"""
     page_ranges = parse_page_ranges_text(page_ranges_text)
@@ -1634,7 +1637,7 @@ def ingest_pdf_via_agent(
 4) source_ready（true/false）
 5) message
 """
-    return provider.run(prompt)
+    return provider.run(prompt, session_key=session_key)
 
 
 def _copy_chat_payload_value(value: Any) -> Any:
@@ -1717,6 +1720,31 @@ def get_active_chat_question_context() -> dict | None:
     return payload
 
 
+def get_openclaw_web_client_id() -> str:
+    """Return a stable per-browser-session id for OpenClaw session partitioning."""
+    value = str(st.session_state.get("openclaw_web_client_id") or "").strip()
+    if not value:
+        value = uuid.uuid4().hex[:16]
+        st.session_state.openclaw_web_client_id = value
+    return normalize_openclaw_session_part(value, fallback="web")
+
+
+def build_openclaw_web_session_key(kind: str, *parts: Any) -> str:
+    """Build a per-user web session-key while keeping one shared OpenClaw agent."""
+    return build_openclaw_session_key(kind, get_openclaw_web_client_id(), *parts)
+
+
+def build_chat_openclaw_session_key(selected_question: dict | None) -> str:
+    """Use per-question chat memory when a question context is active, otherwise per-user web memory."""
+    if selected_question:
+        question_id = str(selected_question.get("id") or "").strip()
+        if not question_id:
+            question_text = str(selected_question.get("question_text") or "").strip()
+            question_id = hashlib.sha1(question_text.encode("utf-8")).hexdigest()[:12] if question_text else "unknown"
+        return build_openclaw_web_session_key("question", question_id)
+    return build_openclaw_web_session_key("web")
+
+
 def build_discussion_prompt(user_prompt: str, selected_question: dict | None) -> str:
     """將題目上下文包進聊天 prompt"""
     if not selected_question:
@@ -1750,15 +1778,15 @@ def build_discussion_prompt(user_prompt: str, selected_question: dict | None) ->
     )
 
 
-def stream_agent_response(prompt: str, provider):
+def stream_agent_response(prompt: str, provider, session_key: str | None = None):
     """聊天用流式回應"""
-    for chunk in provider.stream(prompt):
+    for chunk in provider.stream(prompt, session_key=session_key):
         yield chunk
 
 
-def run_agent_sync(prompt: str, provider) -> str:
+def run_agent_sync(prompt: str, provider, session_key: str | None = None) -> str:
     """聊天用同步回應"""
-    return provider.run(prompt)
+    return provider.run(prompt, session_key=session_key)
 
 
 @st.cache_data(ttl=15, show_spinner=False)
@@ -3017,13 +3045,19 @@ def render_chat_panel(current_page: str) -> None:
                 provider = st.session_state.agent_provider
                 if provider is None:
                     raise RuntimeError("agent provider unavailable")
+                chat_session_key = build_chat_openclaw_session_key(selected_question)
                 job_id = get_chat_stream_jobs().start(
-                    lambda _prompt=effective_prompt, _provider=provider: stream_agent_response(_prompt, _provider)
+                    lambda _prompt=effective_prompt, _provider=provider, _session_key=chat_session_key: stream_agent_response(
+                        _prompt,
+                        _provider,
+                        session_key=_session_key,
+                    )
                 )
                 logger.info(
                     "chat_stream_start",
                     job_id=job_id,
                     provider=st.session_state.agent_provider_name,
+                    session_key=chat_session_key,
                     prompt_len=len(prompt),
                     effective_prompt_len=len(effective_prompt),
                     has_question_context=bool(selected_question),
@@ -3189,6 +3223,10 @@ with main_col:
                                             etl_page_ranges,
                                             int(etl_chunk_pages),
                                             bool(etl_extract_figures),
+                                            session_key=build_openclaw_web_session_key(
+                                                "web-etl",
+                                                hashlib.sha1(str(saved_path).encode("utf-8")).hexdigest()[:12],
+                                            ),
                                         )
                                         st.session_state.etl_last_result = result_text
                                         invalidate_document_caches()
@@ -3509,6 +3547,7 @@ with main_col:
                         prompt=prompt,
                         provider=provider,
                         execution_ui=generation_ui,
+                        session_key=build_openclaw_web_session_key("generation", uuid.uuid4().hex[:12]),
                     )
 
                     # 更新 session state

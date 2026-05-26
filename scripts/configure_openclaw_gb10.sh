@@ -43,6 +43,43 @@ JSON
 "$OPENCLAW_BIN" config set models.mode '"replace"' --strict-json
 "$OPENCLAW_BIN" config set "models.providers.${GB10_PROVIDER_ID}" "$PROVIDER_JSON" --strict-json
 "$OPENCLAW_BIN" models set "${GB10_PROVIDER_ID}/${GB10_MODEL_ID}"
+"$OPENCLAW_BIN" config patch --stdin <<'JSON'
+{
+  "agents": {
+    "defaults": {
+      "contextInjection": "continuation-skip",
+      "bootstrapMaxChars": 6000,
+      "bootstrapTotalMaxChars": 24000,
+      "experimental": {
+        "localModelLean": true
+      },
+      "skills": [
+        "difficulty-classifier",
+        "duplicate-checker",
+        "essay-generator",
+        "exam-assembler",
+        "exam-orchestrator",
+        "explanation-generator",
+        "image-question-generator",
+        "knowledge-extractor",
+        "knowledge-indexer",
+        "mcq-generator",
+        "past-exam-analyzer",
+        "past-exam-matcher",
+        "pdf-asset-extractor",
+        "question-crud",
+        "question-set-generator",
+        "question-validator",
+        "scope-analyzer",
+        "source-tracker"
+      ]
+    }
+  },
+  "tools": {
+    "toolSearch": true
+  }
+}
+JSON
 "$OPENCLAW_BIN" config validate
 
 AGENT_MODELS_CACHE="$PROJECT_DIR/vendor/openclaw-state/agents/main/agent/models.json"
