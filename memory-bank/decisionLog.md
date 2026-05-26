@@ -1,5 +1,16 @@
 # Decision Log
 
+## 2026-05-26
+
+### DEC-050: 多人 Web 場景下維持單一 OpenClaw agent，但用 session-key 分流記憶與工具上下文
+
+| 項目 | 內容 |
+|------|------|
+| **決策** | 保留一隻網站常駐 OpenClaw agent `main`，但禁止所有入口共用 `agent:main:main`。Web chat 依使用者 session 與題目分流，worker 用 `agent:main:job:{job_id}`，scope dispatch 用 `agent:main:scope:{scope_request_id}`，Telegram `/ask` 用 `agent:main:telegram:{chat_id}`。 |
+| **問題** | 多人 Web、背景 worker、scope request 與 Telegram 若共用同一個 default session，會互相污染對話歷史，最後造成 default session overflow；即使封存舊 session，fresh agent turn 仍可能因 OpenClaw 直接暴露所有 MCP/skills/tool schema 而超過 local model 實際可承受上下文。 |
+| **解決方案** | 在 provider 加 `session_key` 支援並讓各入口傳入穩定 key；封存舊 `agent:main:main`。同時把 repo-local OpenClaw config 調成 lean profile：`tools.toolSearch=true`、`localModelLean=true`、`contextInjection=continuation-skip`、bootstrap caps 與題庫/教材管理 skill allowlist，並把同樣設定落到 `scripts/configure_openclaw_gb10.sh`。 |
+| **影響** | 單一 OpenClaw 仍可作為網站考題管理員存在，但記憶隔離符合多人使用。MCP 工具仍完整可用，只是模型先看 compact `tool_search_code`，需要時再搜尋/呼叫實際 asset-aware 或 exam-generator 工具，避免每回合把所有 schema 直接塞進 prompt。 |
+
 ## 2026-05-13
 
 ### DEC-049: VSIX npm audit hotfix 以 lockfile 升級 `fast-uri` 並發布 asset-aware `v0.6.31`
