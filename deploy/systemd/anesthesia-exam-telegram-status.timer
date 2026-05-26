@@ -1,0 +1,12 @@
+[Unit]
+Description=Send Anesthesia Exam Telegram status report periodically
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=1h
+AccuracySec=1min
+Persistent=true
+Unit=anesthesia-exam-telegram-status.service
+
+[Install]
+WantedBy=timers.target

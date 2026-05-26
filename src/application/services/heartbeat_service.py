@@ -203,10 +203,11 @@ class HeartbeatService:
         parts.extend(
             [
                 "",
-                "請使用 MCP 工具 consult_knowledge_graph 查詢相關知識，",
-                "然後用 search_source_location 取得精確來源，",
-                "最後用 exam_save_question 將題目存入題庫。",
+                "請使用 MCP 工具 asset-aware__consult_knowledge_graph 查詢相關知識，",
+                "然後用 asset-aware__search_source_location 取得精確來源，",
+                "最後用 exam-generator__exam_save_question 將題目存入題庫。",
                 "每題必須包含完整來源追蹤（頁碼、原文 snippet）。",
+                "不要讀取大型 full manifest；優先選 Miller 分章 doc_id 做精準搜尋。",
             ]
         )
 
@@ -342,11 +343,16 @@ class HeartbeatService:
             logger.info("heartbeat_run_complete", gaps_found=len(gaps), jobs_written=0, skipped=len(gaps), dry_run=True)
             return result
 
-        # 檢查是否已有相同 topic 的 pending job，避免重複
-        existing_pending = {j["topic"] for j in self.list_jobs(status="pending")}
+        # 檢查是否已有相同 topic 的 pending/error job，避免 timer 對 blocked 主題重複建 job
+        existing_blocking = {
+            j["topic"]
+            for status in ("pending", "error")
+            for j in self.list_jobs(status=status)
+            if j.get("topic")
+        }
 
         for gap in gaps[:max_requests]:
-            if gap.topic in existing_pending:
+            if gap.topic in existing_blocking:
                 skipped += 1
                 continue
 

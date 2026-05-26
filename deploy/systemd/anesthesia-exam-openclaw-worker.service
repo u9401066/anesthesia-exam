@@ -1,0 +1,25 @@
+[Unit]
+Description=Anesthesia Exam OpenClaw Backlog Worker
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=__RUN_USER__
+Group=__RUN_GROUP__
+WorkingDirectory=__PROJECT_DIR__
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=-__PROJECT_DIR__/.env
+Environment=EXAM_AGENT_PROVIDER=openclaw
+Environment=EXAM_OPENCLAW_MODE=agent
+Environment=EXAM_OPENCLAW_AGENT_ID=main
+Environment=EXAM_OPENCLAW_CONFIG_PATH=__PROJECT_DIR__/vendor/openclaw-state/openclaw.json
+Environment=EXAM_OPENCLAW_MODEL=gb10/Qwen3.5-122B-A10B-Q5_K_M-00001-of-00003.gguf
+Environment=EXAM_OPENCLAW_TIMEOUT=900
+Environment=EXAM_AGENT_TIMEOUT=900
+ExecStart=__PROJECT_DIR__/.venv/bin/python __PROJECT_DIR__/scripts/run_openclaw_heartbeat_worker.py --max-jobs 1 --heartbeat-max-requests 5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
