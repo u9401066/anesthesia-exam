@@ -59,6 +59,20 @@ ITE考題與詳解/
 # 資料目錄 (不追蹤)
 data/
 
+# AI 工具本地執行狀態與備份（不追蹤）
+.codex/
+.codex-backups/
+.cline/
+.clinerules/
+.openclaw/
+.asset-aware-mcp/
+*.bak
+/_audit_probe.txt
+/=2.0
+
+# 本地便利 symlink
+/skills
+
 # 批次/稽核報告輸出
 reports/
 
