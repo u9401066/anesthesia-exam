@@ -13,7 +13,7 @@ fi
 cd "$PROJECT_DIR"
 
 exec "$PYTHON_BIN" -m streamlit run src/presentation/streamlit/app.py \
-    --server.port 8501 \
-    --server.address 0.0.0.0 \
+    --server.port "${STREAMLIT_SERVER_PORT:-8501}" \
+    --server.address "${STREAMLIT_SERVER_ADDRESS:-0.0.0.0}" \
     --server.headless=true \
     "$@"

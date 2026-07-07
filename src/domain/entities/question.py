@@ -11,6 +11,55 @@ from enum import Enum
 from typing import Optional
 
 
+def _coerce_enum(enum_cls, value, default):
+    """Coerce enum-like value safely, with fallback."""
+    if isinstance(value, enum_cls):
+        return value
+    if not isinstance(value, str):
+        return default
+
+    candidate = value.strip()
+    if not candidate:
+        return default
+    try:
+        return enum_cls(candidate)
+    except ValueError:
+        lowered = candidate.lower()
+        for member in enum_cls:
+            if member.value.lower() == lowered:
+                return member
+        return default
+
+
+def _coerce_int(value, default: int) -> int:
+    if isinstance(value, bool):
+        return default
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        stripped = value.strip()
+        if stripped.isdigit() or (stripped.startswith("-") and stripped[1:].isdigit()):
+            try:
+                return int(stripped)
+            except ValueError:
+                return default
+    return default
+
+
+def _coerce_str(value, default: str = ""):
+    if value is None:
+        return default
+    return str(value)
+
+
+def _coerce_list_of_str(value, default: list[str] | None = None) -> list[str]:
+    if default is None:
+        default = []
+    if not isinstance(value, list):
+        return default
+    return [str(item).strip() for item in value if str(item).strip()]
+
+
 class QuestionType(str, Enum):
     """題型枚舉"""
 
@@ -70,12 +119,18 @@ class SourceLocation:
 
     @classmethod
     def from_dict(cls, data: dict) -> "SourceLocation":
+        if not isinstance(data, dict):
+            data = {}
         return cls(
-            page=data.get("page", 0),
-            line_start=data.get("line_start", 0),
-            line_end=data.get("line_end", 0),
-            bbox=tuple(data["bbox"]) if data.get("bbox") else None,
-            original_text=data.get("original_text", ""),
+            page=_coerce_int(data.get("page"), 0),
+            line_start=_coerce_int(data.get("line_start"), 0),
+            line_end=_coerce_int(data.get("line_end"), 0),
+            bbox=(
+                tuple(coordinate for coordinate in data["bbox"])
+                if isinstance(data.get("bbox"), (list, tuple)) and len(data["bbox"]) == 4
+                else None
+            ),
+            original_text=_coerce_str(data.get("original_text"), ""),
         )
 
 
@@ -140,6 +195,8 @@ class Source:
 
     @classmethod
     def from_dict(cls, data: dict) -> "Source":
+        if not isinstance(data, dict):
+            data = {}
         stem = None
         if data.get("stem_source"):
             stem = SourceLocation.from_dict(data["stem_source"])
@@ -151,21 +208,21 @@ class Source:
         explanations = [SourceLocation.from_dict(s) for s in data.get("explanation_sources", [])]
 
         return cls(
-            document=data.get("document", ""),
-            chapter=data.get("chapter"),
-            section=data.get("section"),
+            document=_coerce_str(data.get("document"), ""),
+            chapter=_coerce_str(data.get("chapter"), None),
+            section=_coerce_str(data.get("section"), None),
             stem_source=stem,
             answer_source=answer,
             explanation_sources=explanations,
-            figure_id=data.get("figure_id"),
-            figure_caption=data.get("figure_caption"),
-            figure_page=data.get("figure_page"),
-            is_verified=data.get("is_verified", False),
-            pdf_hash=data.get("pdf_hash"),
+            figure_id=_coerce_str(data.get("figure_id"), None),
+            figure_caption=_coerce_str(data.get("figure_caption"), None),
+            figure_page=_coerce_int(data.get("figure_page"), 0) or None,
+            is_verified=bool(data.get("is_verified", False)),
+            pdf_hash=_coerce_str(data.get("pdf_hash"), None),
             # 向後相容
-            page=data.get("page"),
-            lines=data.get("lines"),
-            original_text=data.get("original_text"),
+            page=_coerce_int(data.get("page"), 0) or None,
+            lines=_coerce_str(data.get("lines"), None),
+            original_text=_coerce_str(data.get("original_text"), None),
         )
 
 
@@ -236,26 +293,29 @@ class Question:
     @classmethod
     def from_dict(cls, data: dict) -> "Question":
         """從字典建立實體"""
+        if not isinstance(data, dict):
+            data = {}
         source = None
         if data.get("source"):
             source = Source.from_dict(data["source"])
 
         return cls(
-            id=data.get("id", str(uuid.uuid4())),
-            question_text=data.get("question_text", data.get("question", "")),
-            options=data.get("options", []),
-            correct_answer=data.get("correct_answer", data.get("answer", "")),
-            explanation=data.get("explanation", ""),
+            id=_coerce_str(data.get("id"), str(uuid.uuid4())),
+            question_text=_coerce_str(data.get("question_text", data.get("question", "")), ""),
+            options=_coerce_list_of_str(data.get("options"), default=[]),
+            correct_answer=_coerce_str(data.get("correct_answer", data.get("answer", "")), ""),
+            explanation=_coerce_str(data.get("explanation", ""), ""),
             source=source,
-            question_type=QuestionType(data.get("question_type", "single_choice")),
-            difficulty=Difficulty(data.get("difficulty", "medium")),
-            topics=data.get("topics", []),
-            exam_track=ExamTrack(data["exam_track"]) if data.get("exam_track") else None,
-            points=data.get("points", 1),
-            image_path=data.get("image_path"),
+            question_type=_coerce_enum(QuestionType, data.get("question_type"), QuestionType.SINGLE_CHOICE),
+            difficulty=_coerce_enum(Difficulty, data.get("difficulty"), Difficulty.MEDIUM),
+            topics=_coerce_list_of_str(data.get("topics"), default=[]),
+            exam_track=_coerce_enum(ExamTrack, data.get("exam_track"), None),
+            points=_coerce_int(data.get("points"), 1),
+            image_path=_coerce_str(data.get("image_path"), None),
             is_validated=bool(data.get("is_validated", False)),
-            validation_notes=data.get("validation_notes"),
-            created_by=data.get("created_by", "agent"),
+            validation_notes=_coerce_str(data.get("validation_notes"), None),
+            created_at=datetime.fromisoformat(data["created_at"]) if data.get("created_at") else datetime.now(),
+            created_by=_coerce_str(data.get("created_by", "agent"), "agent"),
         )
 
     def format_display(self) -> str:

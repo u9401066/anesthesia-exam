@@ -32,6 +32,7 @@ from datetime import datetime
 from typing import Any, Optional, cast
 
 import streamlit as st
+import streamlit.components.v1 as components
 
 from src.application.services.past_exam_explanation_service import get_past_exam_explanation_service
 from src.application.services.openclaw_session_keys import build_openclaw_session_key, normalize_openclaw_session_part
@@ -2978,120 +2979,60 @@ def stop_active_chat_stream(reason: str = "回應已停止") -> None:
 
 @_chat_panel_fragment
 def render_chat_panel(current_page: str) -> None:
-    """Render the persistent assistant panel behind a fragment rerun boundary."""
+    """Render OpenClaw Gateway instead of maintaining a second Streamlit chat runtime."""
     _ = current_page
-    sync_active_chat_stream()
-    chat_stream_running = bool(st.session_state.get("chat_active_job_id"))
 
-    with st.container(border=True):
-        st.subheader("💬 AI 助手")
+    configured_gateway_url = str(
+        os.getenv("OPENCLAW_GATEWAY_PUBLIC_URL")
+        or os.getenv("EXAM_OPENCLAW_GATEWAY_PUBLIC_URL")
+        or os.getenv("OPENCLAW_GATEWAY_URL")
+        or ""
+    ).strip()
+    gateway_url = configured_gateway_url
+    if not gateway_url:
+        host = ""
+        scheme = "http"
+        try:
+            headers = getattr(st, "context", None).headers  # type: ignore[attr-defined]
+            host = str(
+                headers.get("x-forwarded-host")
+                or headers.get("host")
+                or ""
+            ).strip()
+            scheme = str(headers.get("x-forwarded-proto") or "http").split(",", 1)[0].strip() or "http"
+        except Exception:
+            host = ""
+        gateway_url = f"{scheme}://{host}/openclaw/" if host else "/openclaw/"
+    if gateway_url.startswith("http") and not gateway_url.endswith("/"):
+        gateway_url = f"{gateway_url}/"
 
-        selected_question = get_active_chat_question_context()
+    selected_question = get_active_chat_question_context()
+    session_key = build_chat_openclaw_session_key(selected_question)
+
+    st.markdown("### OpenClaw Gateway")
+    st.caption(
+        "右側對話已改用 OpenClaw 內建 Control UI/WebChat；"
+        "本站不再維護第二套 Streamlit chat runtime。"
+    )
+    st.link_button("在新分頁開啟 OpenClaw", gateway_url, use_container_width=True)
+
+    with st.expander("交給 OpenClaw 的目前上下文", expanded=bool(selected_question)):
+        st.caption("Gateway session key 建議值")
+        st.code(session_key, language="text")
+
         if selected_question:
-            source_state = "精確來源可用" if question_has_precise_source(selected_question) else "來源待補強"
-            context_col1, context_col2 = st.columns([3.4, 1])
-            with context_col1:
-                st.caption(f"目前上下文：{st.session_state.chat_question_context_label} · {source_state}")
-            with context_col2:
-                if st.button("清除題目", key="chat_context_clear", width="stretch"):
-                    clear_chat_question_context()
-                    rerun_chat_panel()
+            prompt = build_discussion_prompt("請先讀取這題上下文，等待我下一步提問。", selected_question)
+            st.caption("把下面內容貼到 OpenClaw WebChat，即可讓龍蝦接手目前題目。")
+            st.code(prompt, language="markdown")
         else:
-            st.caption("目前上下文：未指定題目。請在作答、審題或生成預覽按「🦞 問龍蝦這題」。")
+            st.info("目前沒有選定題目；OpenClaw Gateway 仍可直接管理網站、MCP 與工作佇列。")
 
-        quick_prompt = ""
-        if not st.session_state.messages:
-            render_empty_state("從右側開始即時討論", "你可以詢問題目詳解、誘答選項設計，或請 AI 幫你檢查目前工作流。")
-            qp_col1, qp_col2, qp_col3 = st.columns(3)
-            if qp_col1.button("流程建議", width="stretch"):
-                quick_prompt = CHAT_QUICK_PROMPTS[0]
-            if qp_col2.button("檢查詳解", width="stretch"):
-                quick_prompt = CHAT_QUICK_PROMPTS[1]
-            if qp_col3.button("審閱清單", width="stretch"):
-                quick_prompt = CHAT_QUICK_PROMPTS[2]
-
-        chat_container = st.container(height=compute_chat_history_height(len(st.session_state.messages)))
-        with chat_container:
-            active_idx = st.session_state.get("chat_active_assistant_index")
-            for message_index, message in enumerate(st.session_state.messages):
-                with st.chat_message(message["role"]):
-                    content = str(message.get("content") or "")
-                    if chat_stream_running and message_index == active_idx and message.get("role") == "assistant":
-                        st.markdown(content + "▌" if content else "▌")
-                    else:
-                        st.markdown(content)
-
-        if not st.session_state.agent_available:
-            st.warning("⚠️ Agent 未連線")
-
-        prompt = st.chat_input(
-            "輸入問題...",
-            key="chat_input",
-            disabled=(not st.session_state.agent_available) or chat_stream_running,
-        )
-        if quick_prompt:
-            prompt = quick_prompt
-
-    if prompt:
-        st.session_state.messages.append({"role": "user", "content": prompt, "timestamp": datetime.now().isoformat()})
-
-        if st.session_state.agent_available:
-            effective_prompt = build_discussion_prompt(prompt, selected_question)
-            st.session_state.messages.append(
-                {"role": "assistant", "content": "", "timestamp": datetime.now().isoformat(), "streaming": True}
-            )
-            assistant_index = len(st.session_state.messages) - 1
-            try:
-                provider = st.session_state.agent_provider
-                if provider is None:
-                    raise RuntimeError("agent provider unavailable")
-                chat_session_key = build_chat_openclaw_session_key(selected_question)
-                job_id = get_chat_stream_jobs().start(
-                    lambda _prompt=effective_prompt, _provider=provider, _session_key=chat_session_key: stream_agent_response(
-                        _prompt,
-                        _provider,
-                        session_key=_session_key,
-                    )
-                )
-                logger.info(
-                    "chat_stream_start",
-                    job_id=job_id,
-                    provider=st.session_state.agent_provider_name,
-                    session_key=chat_session_key,
-                    prompt_len=len(prompt),
-                    effective_prompt_len=len(effective_prompt),
-                    has_question_context=bool(selected_question),
-                )
-                st.session_state.chat_active_job_id = job_id
-                st.session_state.chat_active_assistant_index = assistant_index
-            except Exception as exc:  # noqa: BLE001
-                st.session_state.messages[assistant_index]["content"] = build_chat_stream_error_message(str(exc))
-                st.session_state.messages[assistant_index].pop("streaming", None)
-                st.session_state.chat_active_job_id = None
-                st.session_state.chat_active_assistant_index = None
-        else:
-            st.session_state.messages.append(
-                {"role": "assistant", "content": "[錯誤] Agent 未連線", "timestamp": datetime.now().isoformat()}
-            )
-
-        rerun_chat_panel()
-
-    if chat_stream_running or st.session_state.messages:
-        action_col1, action_col2 = st.columns(2)
-        with action_col1:
-            if chat_stream_running and st.button("⏹️ 停止回應", key="chat_stop_stream", width="stretch"):
-                stop_active_chat_stream("使用者中止回應")
-                rerun_chat_panel()
-        with action_col2:
-            if st.session_state.messages and st.button("🗑️ 清除對話", width="stretch"):
-                if chat_stream_running:
-                    stop_active_chat_stream("使用者清除對話")
-                st.session_state.messages = []
-                rerun_chat_panel()
-
-    if chat_stream_running:
-        time.sleep(0.15)
-        rerun_chat_panel()
+    st.divider()
+    if configured_gateway_url:
+        st.caption("Gateway URL 來自 OPENCLAW_GATEWAY_PUBLIC_URL / EXAM_OPENCLAW_GATEWAY_PUBLIC_URL。")
+    else:
+        st.caption("Gateway 透過同一個網站 port 的 /openclaw/ 路徑反向代理，不需要外部另外開 18789。")
+    components.iframe(gateway_url, height=760, scrolling=True)
 
 
 # ===== 主區域：三欄佈局 (操作區 2/3 + 常駐 Chat 1/3) =====

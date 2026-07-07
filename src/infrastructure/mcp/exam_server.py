@@ -10,6 +10,7 @@ import time
 import uuid
 from datetime import datetime
 from pathlib import Path
+from json import JSONDecodeError
 
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
@@ -26,6 +27,8 @@ from src.infrastructure.persistence.sqlite_question_repo import get_question_rep
 # 結構化日誌
 logger = get_logger(__name__)
 mcp_logger = get_logger("mcp_trace")
+_ALLOWED_PIPELINE_STATUSES = {"active", "completed", "blocked", "failed"}
+_ALLOWED_PHASE_STATUSES = {"not_started", "in_progress", "completed", "blocked", "failed"}
 
 # 專案根目錄
 PROJECT_ROOT = Path(__file__).parent.parent.parent.parent
@@ -51,6 +54,48 @@ def _safe_args(arguments: dict) -> dict:
         else:
             safe[k] = v
     return safe
+
+
+def _coerce_limit(value, *, default: int = 20, min_value: int = 1, max_value: int = 200) -> int:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return default
+    if isinstance(value, int):
+        candidate = value
+    elif isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return default
+        try:
+            candidate = int(text)
+        except ValueError:
+            return default
+    else:
+        return default
+
+    return max(min_value, min(candidate, max_value))
+
+
+def _coerce_required_positive_int(value) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        candidate = value
+    elif isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        try:
+            candidate = int(text)
+        except ValueError:
+            return None
+    else:
+        return None
+
+    if candidate <= 0:
+        return None
+    return candidate
 
 
 def _build_pipeline_blueprint(pipeline_type: str) -> dict:
@@ -173,14 +218,34 @@ def _pipeline_run_path(run_id: str) -> Path:
 
 def _save_pipeline_run(state: dict) -> None:
     PIPELINE_RUNS_DIR.mkdir(parents=True, exist_ok=True)
-    _pipeline_run_path(state["run_id"]).write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+    target_path = _pipeline_run_path(state["run_id"])
+    temp_path = PIPELINE_RUNS_DIR / f".{target_path.name}.{uuid.uuid4().hex}.tmp"
+
+    try:
+        temp_path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+        temp_path.replace(target_path)
+    finally:
+        if temp_path.exists():
+            temp_path.unlink(missing_ok=True)
 
 
 def _load_pipeline_run(run_id: str) -> dict | None:
-    path = _pipeline_run_path(run_id)
+    normalized_run_id = str(run_id).strip()
+    if normalized_run_id.endswith(".json"):
+        normalized_run_id = normalized_run_id[:-5]
+    path = _pipeline_run_path(normalized_run_id)
     if not path.exists():
         return None
-    return json.loads(path.read_text(encoding="utf-8"))
+    try:
+        state = json.loads(path.read_text(encoding="utf-8"))
+    except (JSONDecodeError, OSError, UnicodeDecodeError):
+        logger.warning("pipeline_run_json_invalid", run_id=run_id, path=str(path))
+        return None
+
+    if not isinstance(state, dict):
+        logger.warning("pipeline_run_payload_invalid", run_id=run_id, payload_type=type(state).__name__)
+        return None
+    return state
 
 
 def _phase_index(phases: list[dict], phase_key: str) -> int:
@@ -867,9 +932,14 @@ def create_exam_mcp_server() -> Server:
 
         t0 = time.monotonic()
         log = mcp_logger.bind(tool=name)
-        log.info("mcp_tool_call_start", arguments=_safe_args(arguments))
+        log.info("mcp_tool_call_start", arguments=_safe_args(arguments) if isinstance(arguments, dict) else arguments)
 
         try:
+            if not isinstance(arguments, dict):
+                error = "arguments must be an object"
+                log.warning("mcp_tool_call_invalid_arguments", error=error)
+                return [TextContent(type="text", text=json.dumps({"error": error}, ensure_ascii=False))]
+
             registry = build_tool_handler_registry(
                 app_service=_build_question_tool_service(),
                 legacy_handlers={
@@ -889,6 +959,10 @@ def create_exam_mcp_server() -> Server:
                 },
             )
             result = dispatch_tool(name, arguments, registry)
+            if not isinstance(result, dict):
+                error = "tool handler did not return a dictionary"
+                log.warning("mcp_tool_call_invalid_result", tool=name, result_type=type(result).__name__)
+                return [TextContent(type="text", text=json.dumps({"error": error}, ensure_ascii=False))]
 
             elapsed_ms = int((time.monotonic() - t0) * 1000)
             success = result.get("success", not result.get("error"))
@@ -1456,7 +1530,12 @@ def run_past_exam_extraction(args: dict) -> dict:
 
 def get_pipeline_blueprint(args: dict) -> dict:
     """取得多階段 pipeline 藍圖。"""
+    if not isinstance(args, dict):
+        return {"success": False, "error": "arguments must be an object"}
+
     pipeline_type = args.get("pipeline_type", "exam-generation")
+    if not isinstance(pipeline_type, str):
+        return {"success": False, "error": "pipeline_type 必須是字串"}
     blueprint = _build_pipeline_blueprint(pipeline_type)
     prompt_names = []
     for phase in blueprint["phases"]:
@@ -1471,17 +1550,28 @@ def get_pipeline_blueprint(args: dict) -> dict:
 
 def start_pipeline_run(args: dict) -> dict:
     """建立可恢復的 pipeline run。"""
-    target_question_count = args.get("target_question_count", 10)
-    if target_question_count <= 0:
+    if not isinstance(args, dict):
+        return {"success": False, "error": "arguments must be an object"}
+
+    target_question_count = _coerce_required_positive_int(args.get("target_question_count", 10))
+    if target_question_count is None or target_question_count <= 0:
         return {"success": False, "error": "target_question_count 必須大於 0"}
 
+    source_doc_ids_raw = args.get("source_doc_ids", [])
+    source_doc_ids = [str(doc_id).strip() for doc_id in source_doc_ids_raw if str(doc_id).strip()] if isinstance(source_doc_ids_raw, list) else []
+    pipeline_type = args.get("pipeline_type", "exam-generation")
+    if not isinstance(pipeline_type, str):
+        pipeline_type = "exam-generation"
+    notes = args.get("notes")
+    notes = str(notes).strip() if notes is not None else None
+
     state = _build_pipeline_run(
-        name=args.get("name", "未命名 pipeline"),
-        objective=args.get("objective", ""),
-        pipeline_type=args.get("pipeline_type", "exam-generation"),
+        name=str(args.get("name", "未命名 pipeline")).strip() or "未命名 pipeline",
+        objective=str(args.get("objective", "")),
+        pipeline_type=pipeline_type.strip(),
         target_question_count=target_question_count,
-        source_doc_ids=args.get("source_doc_ids", []),
-        notes=args.get("notes"),
+        source_doc_ids=source_doc_ids,
+        notes=notes,
     )
     _save_pipeline_run(state)
 
@@ -1497,6 +1587,9 @@ def start_pipeline_run(args: dict) -> dict:
 
 def get_pipeline_run(args: dict) -> dict:
     """讀取 pipeline run 狀態。"""
+    if not isinstance(args, dict):
+        return {"success": False, "error": "arguments must be an object"}
+
     run_id = args.get("run_id", "")
     state = _load_pipeline_run(run_id)
     if not state:
@@ -1510,8 +1603,16 @@ def get_pipeline_run(args: dict) -> dict:
 
 def record_phase_result(args: dict) -> dict:
     """記錄某個 phase 的執行結果。"""
+    if not isinstance(args, dict):
+        return {"success": False, "error": "arguments must be an object"}
+
     run_id = args.get("run_id", "")
     phase_key = args.get("phase_key", "")
+    if not isinstance(run_id, str) or not str(run_id).strip():
+        return {"success": False, "error": "缺少 run_id"}
+    if not isinstance(phase_key, str) or not str(phase_key).strip():
+        return {"success": False, "error": "缺少 phase_key"}
+
     state = _load_pipeline_run(run_id)
     if not state:
         return {"success": False, "error": f"Pipeline run not found: {run_id}"}
@@ -1522,17 +1623,24 @@ def record_phase_result(args: dict) -> dict:
 
     phase = state["phases"][idx]
     now = datetime.now().isoformat()
-    phase["status"] = args.get("status", phase["status"])
+    status = args.get("status")
+    if isinstance(status, str) and status.strip():
+        status = status.strip()
+        if status not in _ALLOWED_PHASE_STATUSES:
+            return {"success": False, "error": f"status 僅接受: {sorted(_ALLOWED_PHASE_STATUSES)}"}
+        phase["status"] = status
+    else:
+        phase["status"] = phase["status"]
     if "summary" in args:
         phase["summary"] = args.get("summary", "")
-    if args.get("artifacts"):
+    if isinstance(args.get("artifacts"), dict):
         phase["artifacts"].update(args["artifacts"])
-    if args.get("metrics"):
+    if isinstance(args.get("metrics"), dict):
         phase["metrics"].update(args["metrics"])
     phase["updated_at"] = now
 
     state["updated_at"] = now
-    if args.get("next_action"):
+    if isinstance(args.get("next_action"), str) and args.get("next_action"):
         state["next_action"] = args["next_action"]
 
     if phase["status"] == "completed":
@@ -1561,8 +1669,15 @@ def record_phase_result(args: dict) -> dict:
 
 def validate_phase_gate(args: dict) -> dict:
     """驗證某個 phase 的 gate 是否通過。"""
+    if not isinstance(args, dict):
+        return {"success": False, "error": "arguments must be an object"}
+
     run_id = args.get("run_id", "")
     phase_key = args.get("phase_key", "")
+    if not isinstance(run_id, str) or not str(run_id).strip():
+        return {"success": False, "error": "缺少 run_id"}
+    if not isinstance(phase_key, str) or not str(phase_key).strip():
+        return {"success": False, "error": "缺少 phase_key"}
     state = _load_pipeline_run(run_id)
     if not state:
         return {"success": False, "error": f"Pipeline run not found: {run_id}"}
@@ -1583,12 +1698,20 @@ def validate_phase_gate(args: dict) -> dict:
 
 def list_pipeline_runs(args: dict) -> dict:
     """列出已存在的 pipeline runs。"""
+    if not isinstance(args, dict):
+        args = {}
+
     status_filter = args.get("status")
-    limit = args.get("limit", 20)
+    if status_filter is not None and status_filter not in _ALLOWED_PIPELINE_STATUSES:
+        return {"success": False, "error": f"status 僅接受: {sorted(_ALLOWED_PIPELINE_STATUSES)}"}
+
+    limit = _coerce_limit(args.get("limit"), default=20, min_value=1, max_value=200)
     runs = []
 
     for path in sorted(PIPELINE_RUNS_DIR.glob("*.json"), key=lambda item: item.stat().st_mtime, reverse=True):
-        state = json.loads(path.read_text(encoding="utf-8"))
+        state = _load_pipeline_run(path.stem)
+        if state is None:
+            continue
         if status_filter and state.get("status") != status_filter:
             continue
         runs.append(

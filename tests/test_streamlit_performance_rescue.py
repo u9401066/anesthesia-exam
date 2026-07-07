@@ -69,7 +69,7 @@ def test_chat_stream_start_lambda_avoids_session_state_lookup_in_background_thre
             continue
         if node.func.attr != "start":
             continue
-        if not isinstance(node.func.value, ast.Name) or node.func.value.id != "CHAT_STREAM_JOBS":
+        if ast.unparse(node.func.value) != "get_chat_stream_jobs()":
             continue
         if not node.args or not isinstance(node.args[0], ast.Lambda):
             continue
@@ -79,7 +79,33 @@ def test_chat_stream_start_lambda_avoids_session_state_lookup_in_background_thre
         assert not has_session_state_lookup
         return
 
-    raise AssertionError("CHAT_STREAM_JOBS.start(lambda: ...) call not found")
+    raise AssertionError("get_chat_stream_jobs().start(lambda: ...) call not found")
+
+
+def test_streamlit_chat_jobs_are_scoped_to_session_state() -> None:
+    source = APP_PATH.read_text(encoding="utf-8")
+
+    assert "CHAT_STREAM_JOBS = ChatStreamJobStore()" not in source
+
+    node = _function_node("get_chat_stream_jobs")
+    return_values = [
+        ast.unparse(return_node.value)
+        for return_node in ast.walk(node)
+        if isinstance(return_node, ast.Return) and return_node.value is not None
+    ]
+    assert "ensure_chat_stream_job_store(st.session_state)" in return_values
+
+
+def test_streamlit_chat_panel_logs_chat_lifecycle_events() -> None:
+    source = APP_PATH.read_text(encoding="utf-8")
+
+    for event_name in (
+        "chat_stream_start",
+        "chat_stream_cancel_requested",
+        "chat_stream_job_missing",
+        "chat_stream_terminal",
+    ):
+        assert event_name in source
 
 
 def test_streamlit_avoids_st_tabs_for_heavy_panels() -> None:

@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import queue
+import shutil
 import subprocess
 import threading
 from dataclasses import dataclass
@@ -11,13 +13,43 @@ from pathlib import Path
 from typing import AsyncIterator, Iterator, List, Optional
 
 
+def _resolve_crush_executable(explicit: str | None = None) -> str:
+    if explicit and explicit.strip():
+        return explicit.strip()
+
+    exe = shutil.which("crush")
+    if exe:
+        return exe
+
+    repo_root = Path(__file__).resolve().parents[3]
+    bundled = repo_root / "crush" / ("crush.exe" if os.name == "nt" else "crush")
+    if bundled.exists():
+        return str(bundled)
+    return "crush"
+
+
+def _terminate_process(process: subprocess.Popen[str], timeout: float = 2.0) -> None:
+    if process.poll() is not None:
+        return
+    try:
+        process.terminate()
+        process.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        try:
+            process.kill()
+            process.wait(timeout=timeout)
+        except Exception:
+            pass
+
+
 @dataclass
 class CrushStreamConfig:
     """Crush 流式配置"""
 
-    executable_path: str = r"D:\workspace260203\crush\crush.exe"
+    executable_path: str = _resolve_crush_executable()
     working_dir: Optional[str] = None
     model: Optional[str] = None
+    timeout: int = 120
 
 
 class CrushStreamingClient:
@@ -29,12 +61,16 @@ class CrushStreamingClient:
 
     def _validate_executable(self) -> None:
         """驗證 Crush 執行檔存在"""
-        if not Path(self.config.executable_path).exists():
-            raise FileNotFoundError(f"Crush executable not found: {self.config.executable_path}")
+        executable = self.config.executable_path
+        if executable and Path(executable).exists():
+            return
+        if executable and shutil.which(executable):
+            return
+        raise FileNotFoundError(f"Crush executable not found: {self.config.executable_path}")
 
     def _build_command(self, prompt: str) -> List[str]:
         """建構命令列參數"""
-        cmd: List[str] = [self.config.executable_path, "run", "--verbose"]
+        cmd: List[str] = [str(self.config.executable_path), "run", "--verbose"]
 
         if self.config.model:
             cmd.extend(["--model", self.config.model])
@@ -70,19 +106,19 @@ class CrushStreamingClient:
             assert process.stdout is not None
             assert process.stderr is not None
 
-            # 逐行讀取輸出
             for line in iter(process.stdout.readline, ""):
                 if line:
                     yield line
 
-            process.wait()
+            process.wait(timeout=self.config.timeout)
 
             if process.returncode != 0:
                 stderr = process.stderr.read()
                 raise RuntimeError(f"Crush error: {stderr}")
-
+        except subprocess.TimeoutExpired as exc:
+            raise TimeoutError(f"Crush 串流超時（{self.config.timeout} 秒）") from exc
         finally:
-            process.terminate()
+            _terminate_process(process)
 
     def stream_chars(self, prompt: str, chunk_size: int = 1) -> Iterator[str]:
         """
@@ -116,14 +152,15 @@ class CrushStreamingClient:
                     break
                 yield char
 
-            process.wait()
+            process.wait(timeout=self.config.timeout)
 
             if process.returncode != 0:
                 stderr = process.stderr.read()
                 raise RuntimeError(f"Crush error: {stderr}")
-
+        except subprocess.TimeoutExpired as exc:
+            raise TimeoutError(f"Crush 串流超時（{self.config.timeout} 秒）") from exc
         finally:
-            process.terminate()
+            _terminate_process(process)
 
     async def astream(self, prompt: str) -> AsyncIterator[str]:
         """
@@ -151,14 +188,20 @@ class CrushStreamingClient:
             async for line in process.stdout:
                 yield line.decode("utf-8")
 
-            await process.wait()
+            await asyncio.wait_for(process.wait(), timeout=self.config.timeout)
 
             if process.returncode != 0:
                 stderr = await process.stderr.read()
                 raise RuntimeError(f"Crush error: {stderr.decode('utf-8')}")
-
+        except asyncio.TimeoutError as exc:
+            raise TimeoutError(f"Crush 串流超時（{self.config.timeout} 秒）") from exc
         finally:
-            process.terminate()
+            if process.returncode is None:
+                process.terminate()
+                try:
+                    await asyncio.wait_for(process.wait(), timeout=2)
+                except asyncio.TimeoutError:
+                    process.kill()
 
 
 class ThreadedCrushStream:
@@ -174,18 +217,31 @@ class ThreadedCrushStream:
         self._thread: Optional[threading.Thread] = None
         self._is_running = False
 
-    def start(self, prompt: str) -> None:
-        """開始執行並在背景收集輸出"""
-        cmd: List[str] = [self.config.executable_path, "run", "--verbose"]
-
+    def _build_command(self, prompt: str) -> List[str]:
+        cmd: List[str] = [str(self.config.executable_path), "run", "--verbose"]
         if self.config.model:
             cmd.extend(["--model", self.config.model])
-
         if self.config.working_dir:
             cmd.extend(["--cwd", self.config.working_dir])
-
         cmd.append(prompt)
+        return cmd
 
+    def _validate_executable(self) -> bool:
+        executable = self.config.executable_path
+        if executable and Path(executable).exists():
+            return True
+        if executable and shutil.which(executable):
+            return True
+        return False
+
+    def start(self, prompt: str) -> None:
+        """開始執行並在背景收集輸出"""
+        if not self._validate_executable():
+            self.output_queue.put(f"[ERROR] Crush executable not found: {self.config.executable_path}")
+            self.output_queue.put(None)
+            return
+
+        cmd = self._build_command(prompt)
         self._is_running = True
         self._thread = threading.Thread(target=self._run_process, args=(cmd,), daemon=True)
         self._thread.start()
@@ -210,8 +266,14 @@ class ThreadedCrushStream:
                 if line:
                     self.output_queue.put(line)
 
-            self._process.wait()
+            self._process.wait(timeout=self.config.timeout)
+            if self._process.returncode != 0 and self._process.stderr is not None:
+                self.output_queue.put(f"[ERROR] {self._process.stderr.read()}")
 
+        except subprocess.TimeoutExpired:
+            self.output_queue.put(f"[ERROR] Crush 串流超時（{self.config.timeout} 秒）")
+            if self._process:
+                _terminate_process(self._process)
         except Exception as e:
             self.output_queue.put(f"[ERROR] {e}")
         finally:
@@ -233,4 +295,4 @@ class ThreadedCrushStream:
         """停止執行"""
         self._is_running = False
         if self._process:
-            self._process.terminate()
+            _terminate_process(self._process)

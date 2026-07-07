@@ -7,6 +7,11 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.presentation.streamlit.async_chat import ChatStreamJobStore
+from src.presentation.streamlit.chat_panel import (
+    build_chat_stream_error_message,
+    compute_chat_history_height,
+    ensure_chat_stream_job_store,
+)
 
 
 def test_chat_stream_job_collects_chunks_without_blocking_start() -> None:
@@ -105,3 +110,36 @@ def test_chat_stream_job_cancel_unknown_job_returns_false() -> None:
     store = ChatStreamJobStore()
 
     assert store.cancel("missing-job") is False
+
+
+def test_chat_stream_job_store_is_reused_within_same_session_state() -> None:
+    session_state: dict[str, object] = {}
+
+    first = ensure_chat_stream_job_store(session_state)
+    second = ensure_chat_stream_job_store(session_state)
+
+    assert first is second
+    assert session_state["_chat_stream_jobs"] is first
+
+
+def test_chat_stream_job_store_replaces_invalid_session_state_value() -> None:
+    session_state: dict[str, object] = {"_chat_stream_jobs": "broken"}
+
+    store = ensure_chat_stream_job_store(session_state)
+
+    assert isinstance(store, ChatStreamJobStore)
+    assert session_state["_chat_stream_jobs"] is store
+
+
+def test_chat_stream_error_message_hides_internal_missing_job_marker() -> None:
+    message = build_chat_stream_error_message("chat job not found")
+
+    assert message.startswith("[錯誤]")
+    assert "chat job not found" not in message
+    assert "重新送出" in message
+
+
+def test_chat_history_height_stays_compact_for_short_conversations() -> None:
+    assert compute_chat_history_height(0) == 240
+    assert compute_chat_history_height(2) == 364
+    assert compute_chat_history_height(20) == 420

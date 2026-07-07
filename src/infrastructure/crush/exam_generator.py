@@ -12,11 +12,40 @@ import json
 import logging
 import re
 import subprocess
+import os
+import shutil
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
 from typing import Callable, Generator, Optional
+
+
+def _resolve_crush_executable(explicit: str | None = None) -> str:
+    if explicit and explicit.strip():
+        return explicit.strip()
+    exe = shutil.which("crush")
+    if exe:
+        return exe
+    repo_root = Path(__file__).resolve().parents[3]
+    bundled = repo_root / "crush" / ("crush.exe" if os.name == "nt" else "crush")
+    if bundled.exists():
+        return str(bundled)
+    return explicit or "crush"
+
+
+def _terminate_process(process: subprocess.Popen[str], timeout: float = 2.0) -> None:
+    if process.poll() is not None:
+        return
+    try:
+        process.terminate()
+        process.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        try:
+            process.kill()
+            process.wait(timeout=timeout)
+        except Exception:
+            pass
 
 # 設定 logger
 logger = logging.getLogger(__name__)
@@ -87,13 +116,15 @@ class ExamGenerator:
 
     def __init__(
         self,
-        crush_path: str = r"D:\workspace260203\crush\crush.exe",
+        crush_path: str = "",
         working_dir: Optional[str] = None,
         model: Optional[str] = None,
+        timeout: int = 120,
     ):
-        self.crush_path = Path(crush_path)
+        self.crush_path = Path(_resolve_crush_executable(crush_path))
         self.working_dir = Path(working_dir) if working_dir else Path.cwd()
         self.model = model
+        self.timeout = timeout
 
         # 生成狀態
         self.current_phase = GenerationPhase.INITIALIZING
@@ -109,7 +140,9 @@ class ExamGenerator:
 
     def _validate(self):
         """驗證 Crush 執行檔"""
-        if not self.crush_path.exists():
+        if self.crush_path.exists() or shutil.which(str(self.crush_path)):
+            return
+        raise FileNotFoundError(f"Crush not found: {self.crush_path}")
             raise FileNotFoundError(f"Crush not found: {self.crush_path}")
 
     def set_event_handler(self, handler: Callable[[GenerationEvent], None]):
@@ -254,11 +287,10 @@ class ExamGenerator:
         self._emit_event(GenerationPhase.INITIALIZING, "正在初始化生成器...")
 
         # 建構命令
-        cmd = [str(self.crush_path), "run", "--cwd", str(self.working_dir), prompt]
-
+        cmd = [str(self.crush_path), "run", "--cwd", str(self.working_dir)]
         if self.model:
-            cmd.insert(2, "--model")
-            cmd.insert(3, self.model)
+            cmd.extend(["--model", self.model])
+        cmd.append(prompt)
 
         logger.debug(f"Command: {' '.join(cmd[:4])}...")
 
@@ -325,7 +357,7 @@ class ExamGenerator:
                     question_index=len(self.questions),
                 )
 
-            process.wait()
+            process.wait(timeout=self.timeout)
 
             if process.returncode != 0:
                 self._emit_event(GenerationPhase.ERROR, f"生成失敗 (code: {process.returncode})")
@@ -341,7 +373,7 @@ class ExamGenerator:
             self._emit_event(GenerationPhase.ERROR, str(e))
             raise
         finally:
-            process.terminate()
+            _terminate_process(process)
 
         return self.questions
 

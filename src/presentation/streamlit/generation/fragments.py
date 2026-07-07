@@ -4,10 +4,17 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from typing import Callable
 
 import streamlit as st
 
+from src.domain.value_objects.answer import (
+    format_answer_letters as _format_answer_letters,
+    coerce_question_type as _coerce_question_type,
+    normalize_answer_letters as _normalize_answer_letters,
+    question_allows_multiple as _question_allows_multiple,
+)
 from src.application.services.question_similarity_service import get_question_similarity_service
 from src.application.services.textbook_generation_service import get_textbook_generation_service
 from src.infrastructure.logging import get_logger
@@ -16,9 +23,39 @@ from src.presentation.streamlit.generation.controller import clear_generated_que
 logger = get_logger(__name__)
 
 
+def _build_option_label(index: int, option: object) -> str:
+    prefix = chr(65 + index)
+    option_text = str(option or "").strip()
+    if not option_text:
+        return f"{prefix}. "
+    if re.match(rf"^{re.escape(prefix)}[\)\.:：、\s]", option_text):
+        return option_text
+    return f"{prefix}. {option_text}"
+
+
 def question_formal_save_ready(question: dict) -> bool:
     """Use the singleton service directly to avoid brittle symbol-level imports."""
     return get_textbook_generation_service().question_formal_save_ready(question)
+
+
+def _review_question_type(question: dict) -> str:
+    return _coerce_question_type(
+        question.get("question_type"),
+        fallback_pattern=question.get("pattern"),
+    )
+
+
+_QUESTION_TYPE_LABELS = {
+    "single_choice": "單選題",
+    "multiple_choice": "多選題",
+    "true_false": "是非題",
+    "fill_in_blank": "填空題",
+    "short_answer": "簡答題",
+    "essay": "問答題",
+    "image_based": "圖片題",
+}
+
+_CHOICE_QUESTION_TYPES = {"single_choice", "multiple_choice", "true_false", "image_based"}
 
 
 def ensure_review_question_widget_key(question: dict, fallback_index: int) -> str:
@@ -117,17 +154,21 @@ def render_question_card_inline(question: dict, index: int) -> None:
     st.markdown(f"### ✅ 第 {index} 題 (已儲存)")
     st.markdown(f"**{question.get('question_text', '')}**")
 
-    options = question.get("options", [])
+    options = list(question.get("options", []) or [])
+    option_count = len(options)
+    correct_letters = _normalize_answer_letters(question.get("correct_answer", ""), option_count=option_count)
+
     for option_index, option in enumerate(options):
         prefix = chr(65 + option_index)
-        if prefix == question.get("correct_answer"):
-            st.markdown(f"✅ **{prefix}. {option}**")
+        option_label = _build_option_label(option_index, option)
+        if prefix in correct_letters:
+            st.markdown(f"✅ **{option_label}**")
         else:
-            st.markdown(f"　{prefix}. {option}")
+            st.markdown(f"　{option_label}")
 
     col1, col2 = st.columns(2)
     with col1:
-        st.caption(f"📝 答案: {question.get('correct_answer', 'N/A')}")
+        st.caption(f"📝 答案: {_format_answer_letters(correct_letters) or '-'}")
     with col2:
         difficulty = question.get("difficulty", "medium")
         difficulty_emoji = {"easy": "🟢", "medium": "🟡", "hard": "🔴"}.get(difficulty, "⚪")
@@ -239,32 +280,80 @@ def render_question_review_form(
                 key=f"review_q_text_{review_key}",
             )
 
-            options = question.get("options", [])
-            for option_index in range(4):
-                prefix = chr(65 + option_index)
-                default_value = options[option_index] if option_index < len(options) else ""
-                edited_option = st.text_input(
-                    f"選項 {prefix}",
-                    value=default_value,
-                    key=f"review_opt_{review_key}_{option_index}",
-                )
-                if option_index < len(options):
-                    options[option_index] = edited_option
-                elif edited_option:
-                    options.append(edited_option)
-            question["options"] = options
+            question_type_options = list(_QUESTION_TYPE_LABELS)
+            current_question_type = _review_question_type(question)
+            if current_question_type not in question_type_options:
+                current_question_type = "single_choice"
+            selected_question_type = st.selectbox(
+                "題型",
+                question_type_options,
+                index=question_type_options.index(current_question_type),
+                format_func=lambda value: _QUESTION_TYPE_LABELS.get(value, value),
+                key=f"review_type_{review_key}",
+            )
+            question["question_type"] = selected_question_type
+            allow_choice_answer = selected_question_type in _CHOICE_QUESTION_TYPES
 
-            answer_col, difficulty_col = st.columns(2)
-            with answer_col:
-                answer_options = ["A", "B", "C", "D"]
-                current_answer = question.get("correct_answer", "A").upper()
-                answer_index = answer_options.index(current_answer) if current_answer in answer_options else 0
-                question["correct_answer"] = st.selectbox(
-                    "正確答案",
-                    answer_options,
-                    index=answer_index,
-                    key=f"review_ans_{review_key}",
+            if allow_choice_answer:
+                options = list(question.get("options", []) or [])
+                default_option_count = 2 if selected_question_type == "true_false" else 4
+                default_option_count = min(8, max(2, len(options) or default_option_count))
+                option_count = st.number_input(
+                    "選項數",
+                    min_value=2,
+                    max_value=8,
+                    value=default_option_count,
+                    step=1,
+                    key=f"review_option_count_{review_key}",
+                    disabled=(selected_question_type == "true_false"),
                 )
+                option_count = int(option_count)
+                for option_index in range(option_count):
+                    default_value = options[option_index] if option_index < len(options) else ""
+                    edited_option = st.text_input(
+                        f"選項 {chr(65 + option_index)}",
+                        value=default_value,
+                        key=f"review_opt_{review_key}_{option_index}",
+                    )
+                    if option_index < len(options):
+                        options[option_index] = edited_option
+                    elif edited_option:
+                        options.append(edited_option)
+                question["options"] = [option for option in options[:option_count] if str(option).strip()]
+
+                answer_options = [chr(65 + answer_index) for answer_index in range(option_count)]
+                normalized_correct = _normalize_answer_letters(question.get("correct_answer", ""), option_count=option_count)
+                allows_multiple = _question_allows_multiple(question, option_count=option_count)
+
+                answer_col, difficulty_col = st.columns(2)
+                with answer_col:
+                    if allows_multiple:
+                        selected_answers = st.multiselect(
+                            "正確答案（可複選）",
+                            answer_options,
+                            default=[answer for answer in normalized_correct if answer in answer_options],
+                            key=f"review_ans_{review_key}",
+                        )
+                        question["correct_answer"] = _format_answer_letters(selected_answers)
+                    else:
+                        current_answer = normalized_correct[0] if normalized_correct else "A"
+                        if current_answer not in answer_options:
+                            current_answer = "A"
+                        question["correct_answer"] = st.selectbox(
+                            "正確答案",
+                            answer_options,
+                            index=answer_options.index(current_answer),
+                            key=f"review_ans_{review_key}",
+                        )
+            else:
+                answer_col, difficulty_col = st.columns(2)
+                with answer_col:
+                    question["correct_answer"] = st.text_area(
+                        "正確答案",
+                        value=question.get("correct_answer", ""),
+                        key=f"review_ans_{review_key}",
+                    )
+
             with difficulty_col:
                 difficulty_options = ["easy", "medium", "hard"]
                 difficulty_labels = ["🟢 簡單", "🟡 中等", "🔴 困難"]

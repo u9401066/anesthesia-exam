@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from typing import Literal
 
 JobStatus = Literal["running", "done", "error", "cancelled"]
+TERMINAL_STATUSES = {"done", "error", "cancelled"}
 
 
 @dataclass
@@ -42,6 +43,22 @@ class ChatStreamJobStore:
         job_id = uuid.uuid4().hex
         with self._lock:
             self._prune_terminal_jobs_locked()
+            while len(self._jobs) >= self._max_jobs:
+                running_job_ids = [
+                    job_id for job_id, job in self._jobs.items() if job.status not in TERMINAL_STATUSES
+                ]
+                if not running_job_ids:
+                    break
+                oldest_running_job_id = sorted(
+                    running_job_ids,
+                    key=lambda running_job_id: self._jobs[running_job_id].updated_at,
+                )[0]
+                oldest_job = self._jobs.get(oldest_running_job_id)
+                if oldest_job is None:
+                    break
+                oldest_job.status = "cancelled"
+                oldest_job.error = "capacity_exceeded"
+                oldest_job.updated_at = time.monotonic()
             self._jobs[job_id] = ChatStreamJob(job_id=job_id)
 
         thread = threading.Thread(
@@ -115,7 +132,7 @@ class ChatStreamJobStore:
             return
 
         terminal_job_ids = [
-            job_id for job_id, job in self._jobs.items() if job.status in {"done", "error", "cancelled"}
+            job_id for job_id, job in self._jobs.items() if job.status in TERMINAL_STATUSES
         ]
         terminal_job_ids.sort(key=lambda job_id: self._jobs[job_id].updated_at)
 

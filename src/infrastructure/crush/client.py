@@ -1,16 +1,34 @@
 """Crush Client - 基本同步調用"""
 
+import os
+import shutil
 import subprocess
+from dataclasses import field
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
+
+
+def _resolve_crush_executable(explicit: str | None = None) -> str:
+    if explicit and explicit.strip():
+        return explicit.strip()
+
+    exe = shutil.which("crush")
+    if exe:
+        return exe
+
+    repo_root = Path(__file__).resolve().parents[3]
+    bundled = repo_root / "crush" / ("crush.exe" if os.name == "nt" else "crush")
+    if bundled.exists():
+        return str(bundled)
+    return "crush"
 
 
 @dataclass
 class CrushConfig:
     """Crush 配置"""
 
-    executable_path: str = r"D:\workspace260203\crush\crush.exe"
+    executable_path: str = field(default_factory=lambda: _resolve_crush_executable())
     working_dir: Optional[str] = None
     model: Optional[str] = None
     timeout: int = 120
@@ -25,7 +43,12 @@ class CrushClient:
 
     def _validate_executable(self) -> None:
         """驗證 Crush 執行檔存在"""
-        if not Path(self.config.executable_path).exists():
+        executable = self.config.executable_path
+        if executable and Path(executable).exists():
+            return
+        if executable and shutil.which(executable):
+            return
+        raise FileNotFoundError(f"Crush executable not found: {self.config.executable_path}")
             raise FileNotFoundError(f"Crush executable not found: {self.config.executable_path}")
 
     def run(self, prompt: str, quiet: bool = True) -> str:

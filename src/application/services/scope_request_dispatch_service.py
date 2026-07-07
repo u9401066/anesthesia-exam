@@ -12,6 +12,7 @@ from src.application.services.exam_tool_application_service import ExamToolAppli
 from src.application.services.heartbeat_service import CoverageGap, HeartbeatService
 from src.application.services.openclaw_session_keys import build_openclaw_session_key
 from src.domain.entities.scope_request import ScopeRequestStatus
+from src.domain.value_objects.answer import coerce_question_type
 from src.infrastructure.agent.provider import extract_last_json_object
 from src.infrastructure.logging import get_logger
 from src.infrastructure.persistence import get_question_repository
@@ -154,6 +155,8 @@ class ScopeRequestDispatchService:
             raise ValueError(f"需求 {request_id} 已被駁回，不能派工")
         if request.status == ScopeRequestStatus.FULFILLED:
             raise ValueError(f"需求 {request_id} 已完成，不能重複派工")
+        if request.status not in {ScopeRequestStatus.APPROVED, ScopeRequestStatus.IN_PROGRESS}:
+            raise ValueError(f"需求 {request_id} 當前狀態 {request.status.value} 不允許派工")
 
         previous_status = request.status
         prompt = self.build_dispatch_prompt(request_id)
@@ -164,9 +167,12 @@ class ScopeRequestDispatchService:
             raw_response = provider.run(prompt, session_key=resolved_session_key).strip()
             payload = self._extract_payload(raw_response)
             question_ids = self._extract_question_ids(payload)
+            embedded_question_payloads = self._extract_question_payloads(payload)
             if not question_ids:
                 question_ids = self._persist_question_payloads(payload, getattr(provider, "name", "unknown"))
-            generated_count = len(question_ids)
+            generated_count = self._extract_generated_count(payload, question_ids)
+            if embedded_question_payloads and not question_ids:
+                generated_count = 0
             remaining = max(request.target_count - request.fulfilled_count, 0)
             applied_count = min(generated_count, remaining)
             summary = self._extract_summary(payload, raw_response, generated_count)
@@ -268,6 +274,9 @@ class ScopeRequestDispatchService:
         return saved_ids
 
     def _extract_question_payloads(self, payload: dict) -> list[dict]:
+        if not isinstance(payload, dict):
+            return []
+
         candidates: list[dict] = []
 
         if self._looks_like_question_payload(payload):
@@ -286,25 +295,68 @@ class ScopeRequestDispatchService:
         question_text = payload.get("question_text") or payload.get("question")
         correct_answer = payload.get("correct_answer") or payload.get("answer")
         options = payload.get("options")
-        return bool(str(question_text or "").strip() and str(correct_answer or "").strip() and isinstance(options, list) and options)
+        if not (str(question_text or "").strip() and str(correct_answer or "").strip()):
+            return False
+
+        question_type = coerce_question_type(payload.get("question_type"), fallback_pattern=payload.get("pattern"))
+        if question_type in {"single_choice", "multiple_choice", "true_false", "image_based"}:
+            return isinstance(options, list) and len(options) >= 2
+
+        if question_type in {"fill_in_blank", "short_answer", "essay"}:
+            return True
+
+        # 保守退路：無法辨識題型時，仍需 options 存在才視為正式題目。
+        return bool(isinstance(options, list) and options)
 
     def _normalize_question_payload(self, payload: dict, provider_name: str) -> dict | None:
         if not self._looks_like_question_payload(payload):
+            return None
+
+        if payload.get("preview_only") is True:
+            logger.info(
+                "scope_request_dispatch_payload_skipped_preview_only",
+                request_id=payload.get("request_id") or payload.get("requestId"),
+                provider_name=provider_name,
+            )
+            return None
+
+        formal_save_ready = payload.get("formal_save_ready")
+        if formal_save_ready is False:
+            logger.info(
+                "scope_request_dispatch_payload_skipped_not_formal",
+                request_id=payload.get("request_id") or payload.get("requestId"),
+                provider_name=provider_name,
+            )
             return None
 
         source = payload.get("source") if isinstance(payload.get("source"), dict) else {}
         semantic_structure = payload.get("semantic_structure") if isinstance(payload.get("semantic_structure"), dict) else {}
         question_group = semantic_structure.get("question_group") if isinstance(semantic_structure.get("question_group"), dict) else {}
 
+        question_type = coerce_question_type(payload.get("question_type"), fallback_pattern=payload.get("pattern"))
+        difficulty = str(payload.get("difficulty") or "medium").strip().lower()
+        if difficulty not in {"easy", "medium", "hard"}:
+            difficulty = "medium"
+        raw_topic_value = payload.get("topics")
+        topics = [str(item).strip() for item in raw_topic_value if str(item).strip()] if isinstance(raw_topic_value, list) else []
+
+        raw_options = payload.get("options")
+        options = []
+        if question_type in {"single_choice", "multiple_choice", "true_false", "image_based"}:
+            if isinstance(raw_options, list):
+                options = [str(item).strip() for item in raw_options if str(item).strip()]
+        else:
+            options = []
+
         return {
             "question_text": str(payload.get("question_text") or payload.get("question") or "").strip(),
-            "options": [str(item).strip() for item in payload.get("options", []) if str(item).strip()],
+            "options": options,
             "correct_answer": str(payload.get("correct_answer") or payload.get("answer") or "").strip(),
             "explanation": str(payload.get("explanation") or "").strip(),
-            "difficulty": payload.get("difficulty") or "medium",
-            "topics": payload.get("topics") or [],
+            "difficulty": difficulty,
+            "topics": topics,
             "pattern": payload.get("pattern") or question_group.get("pattern"),
-            "question_type": payload.get("question_type") or question_group.get("pattern"),
+            "question_type": question_type,
             "source_doc": payload.get("source_doc") or source.get("document"),
             "source_chapter": payload.get("source_chapter") or source.get("chapter"),
             "source_section": payload.get("source_section") or source.get("section"),
