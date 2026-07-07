@@ -1,7 +1,15 @@
-# Progress (Updated: 2026-05-13)
+# Progress (Updated: 2026-07-07)
 
 ## Done
 
+- 完成 `codex/openclaw-telegram-admin` 分支整併回 `master` 並收斂本地分支（fast-forward，保留全部 openclaw/telegram/console/answer 工作）
+- 新增 OpenClaw 前端代理 `scripts/openclaw_front_proxy.py` 與 Streamlit 右側嵌入式 OpenClaw console `chat_panel.py`，並加入 `OPENCLAW_GATEWAY_PUBLIC_URL` 設定
+- 新增 Telegram 管理面：`telegram_admin_service.py`、`run_telegram_admin_bot.py`、`run_telegram_status_report.py` 與對應 systemd `anesthesia-exam-telegram-bot.service`、`anesthesia-exam-telegram-status.{service,timer}`
+- 新增 OpenClaw backlog worker：`openclaw_backlog_worker.py`、`openclaw_session_keys.py`、`run_openclaw_heartbeat_worker.py` 與 `anesthesia-exam-openclaw-worker.{service,timer}`，依 `job_id` 分流 session
+- 新增 domain `value_objects/answer.py`：答案字母正規化/格式化、單選/多選題型判定，供 exam 服務共用
+- 重構 `exam_tool_application_service`、MCP exam server/handlers 與 crush streaming
+- 補齊文件與 agent/skill：`AGENTS.md`、`TOOLS.md`、`USER.md`、asset-aware document agent、`pdf-asset-extractor` skill；更新 CHANGELOG 與 README 部署段
+- `.gitignore` 收斂 AI 工具本地執行狀態/備份（`.codex/`、`.openclaw/`、`.cline/` 等）與本地 symlink
 - 完成 asset-aware PyMuPDF figure extraction 修復：xobject 圖像現在會輸出 page-region display crop，保留 PDF text layer、label、vector overlay 與鄰近 caption，不再只存 raw embedded image
 - `FigureAsset` 已新增 `raw_path / figure_bbox / crop_bbox / caption_bbox / caption_confidence / extraction_strategy`，供 UX、考題圖像引用與後續 audit 使用
 - caption extraction 已支援 `Fig. 42.1` 這類 decimal figure number，並能回填 caption bbox；caption association 改成 spatial matching，而不是同頁 FIFO

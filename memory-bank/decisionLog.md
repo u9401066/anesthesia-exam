@@ -1,5 +1,16 @@
 # Decision Log
 
+## 2026-07-07
+
+### DEC-051: `codex/openclaw-telegram-admin` 整併回 master 採「commit 未提交工作 → fast-forward → 只收斂本地分支」
+
+| 項目 | 內容 |
+|------|------|
+| **決策** | 把 feature 分支 4 個既有 commit 加上工作區未提交的 openclaw console/telegram/answer 工作，先在 feature 分支 commit，再以 fast-forward 併入 `master`，刪除本地 feature 分支；遠端 push 於本輪完成。 |
+| **問題** | 工作區同時有大量未提交變更（22 追蹤檔 + 新原始碼/文件）與工具執行狀態雜項（`.codex/`、`.openclaw/` 等），直接切分支會遺失或污染；需區分「真正 feature 工作」與「工具本地狀態/junk」。 |
+| **解決方案** | 先只 commit 必要的 feature 檔（含被 `__init__.py`/`app.py` import 的 `answer.py`、`chat_panel.py`）；工具狀態/junk 改由 `.gitignore` 收斂，不進版控。分段提交 gitignore、專案文件、agent/skill、CHANGELOG+README、memory-bank，最後 push `master`。 |
+| **影響** | `master` 取得完整 openclaw 介面化工作且工作樹乾淨；本地只剩單一 `master`。工具本地狀態不再污染 `git status`。 |
+
 ## 2026-05-26
 
 ### DEC-050: 多人 Web 場景下維持單一 OpenClaw agent，但用 session-key 分流記憶與工具上下文
