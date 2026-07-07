@@ -105,6 +105,27 @@ systemd unit 預設使用 `EXAM_AGENT_PROVIDER=openclaw`、`EXAM_OPENCLAW_MODE=a
 
 若部署路徑不是目前 repo 位置，請先調整 unit 內的 `WorkingDirectory`、`ExecStart` 與 `User`。
 
+#### 選用：OpenClaw 背景 worker 與 Telegram 管理服務
+
+除了 Web 服務外，可另外安裝 OpenClaw backlog worker 與 Telegram 管理／狀態回報服務：
+
+```bash
+# OpenClaw backlog worker（timer 定時處理待辦，依 job_id 分流 session）
+./scripts/install_openclaw_worker_timer.sh
+
+# Telegram 管理 bot 與定時狀態回報
+./scripts/install_openclaw_telegram_services.sh
+```
+
+相關檔案：
+
+- `deploy/systemd/anesthesia-exam-openclaw-worker.service` / `.timer`
+- `deploy/systemd/anesthesia-exam-telegram-bot.service`
+- `deploy/systemd/anesthesia-exam-telegram-status.service` / `.timer`
+- `scripts/run_openclaw_heartbeat_worker.py`、`scripts/run_telegram_admin_bot.py`、`scripts/run_telegram_status_report.py`
+
+Telegram `/ask` 入口會依 `chat_id` 分流 OpenClaw session；相關環境變數見 `.env.example`（`TELEGRAM_*`、`OPENCLAW_GATEWAY_PUBLIC_URL`）。
+
 ### 重要：初始化子模組（asset-aware-mcp）
 
 `asset-aware-mcp` 為 Git submodule，若未初始化會導致 `ingest_documents` 無法使用。

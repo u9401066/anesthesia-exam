@@ -9,6 +9,18 @@
 
 ### Added
 
+- OpenClaw Telegram 管理整合
+  - `scripts/run_telegram_admin_bot.py` + `deploy/systemd/anesthesia-exam-telegram-bot.service`：Telegram `/ask` 管理入口，依 `chat_id` 分流 OpenClaw session
+  - `scripts/run_telegram_status_report.py` + `anesthesia-exam-telegram-status.{service,timer}`：定時 Telegram 狀態回報
+  - `src/application/services/telegram_admin_service.py`、`openclaw_backlog_worker.py`、`openclaw_session_keys.py`
+  - `anesthesia-exam-openclaw-worker.{service,timer}`：背景 backlog worker（依 `job_id` 分流）
+- OpenClaw 前端代理與嵌入式主控台
+  - `scripts/openclaw_front_proxy.py`：瀏覽器可見的 OpenClaw Gateway 前端代理
+  - Streamlit 右側嵌入式 OpenClaw console (`src/presentation/streamlit/chat_panel.py`)
+  - 新增 `OPENCLAW_GATEWAY_PUBLIC_URL` 環境變數
+- Answer 值物件輔助 (`src/domain/value_objects/answer.py`)：答案字母正規化/格式化、單選/多選題型判定
+- asset-aware document agent (`.github/agents/asset-aware-document.agent.md`) 與 `pdf-asset-extractor` skill
+- Repo agent 指南文件：`AGENTS.md`、`TOOLS.md`、`USER.md`
 - Web 啟動腳本 `scripts/run_web.sh`
 - Systemd unit `deploy/systemd/anesthesia-exam-web.service`
 - Systemd 安裝腳本 `scripts/install_systemd_service.sh`
@@ -36,6 +48,9 @@
 
 ### Changed
 
+- OpenClaw 多入口記憶隔離：Web 依 session/question、worker 依 `job_id`、scope 依 `scope_request_id`、Telegram 依 `chat_id` 分流 session key
+- repo-local OpenClaw config 改用 lean profile（`tools.toolSearch`、`localModelLean`、`contextInjection=continuation-skip`、bootstrap caps 與 skill allowlist）
+- 重構 `exam_tool_application_service`、MCP exam server/handlers 與 crush streaming
 - `main.py` 改為透過目前 Python interpreter 啟動 Streamlit，並固定使用 `8501` / `0.0.0.0`
 - README / ARCHITECTURE / SPEC / ROADMAP / instruction 對齊目前 Web 工作台、ETL 大檔控制與 systemd 部署方式
 - MCP Server 從 JSON 檔案儲存改為 SQLite Repository
